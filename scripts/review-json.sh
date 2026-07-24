@@ -16,7 +16,7 @@ Usage:
   review-json.sh report REPO REVIEW_ID TOKEN
   review-json.sh inspect REPO REVIEW_ID \
     [--exclude PATH] [--additional-input PATH] SCOPE...
-  review-json.sh template REPO REVIEW_ID TOKEN KIND ITERATION
+  review-json.sh template REPO REVIEW_ID TOKEN KIND
   review-json.sh snapshot REPO [--exclude PATH] [--additional-input PATH] SCOPE...
   review-json.sh lock acquire|status REPO REVIEW_ID
   review-json.sh lock release REPO REVIEW_ID TOKEN
@@ -28,7 +28,7 @@ and prints a short random REVIEW_ID. Artifacts are always stored in
 REPO/.local/reviews as REVIEW_ID.json, REVIEW_ID.latest.md, and
 REVIEW_ID.event.json.
 
-KIND is review, review_correction, owner_response, final_review,
+KIND is review, source_update, owner_reply, reviewer_update, final_review,
 reviewer_timeout, or owner_timeout.
 EOF
 }
@@ -212,7 +212,6 @@ template() {
     local review_id="$2"
     local token="$3"
     local kind="$4"
-    local iteration="$5"
     set_review_paths "${repo}" "${review_id}"
     validate_file "${REVIEW_JSON}" "${review_id}" >/dev/null
     python3 "${LOCK_SCRIPT}" verify \
@@ -224,7 +223,7 @@ template() {
     mkdir -p "${REVIEW_DIR}"
     local next_event
     next_event="$(secure_temp "${EVENT_JSON}")"
-    if ! python3 "${STATE_SCRIPT}" template "${kind}" "${iteration}" > "${next_event}"; then
+    if ! python3 "${STATE_SCRIPT}" template "${kind}" > "${next_event}"; then
         rm -f "${next_event}"
         return 1
     fi
@@ -390,7 +389,7 @@ main() {
             inspect "$@"
             ;;
         template)
-            [[ "$#" -eq 5 ]] || { usage >&2; return 2; }
+            [[ "$#" -eq 4 ]] || { usage >&2; return 2; }
             template "$@"
             ;;
         snapshot)
