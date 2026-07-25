@@ -6,46 +6,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
-def load_object(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text())
-    if not isinstance(value, dict):
-        raise TypeError(f"{path.name} must contain a JSON object")
-    return value
-
-
-def secure_write(path: Path, value: dict[str, Any]) -> None:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{path.name}.tmp.", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w") as handle:
-            json.dump(value, handle, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def require_secure_regular(path: Path, label: str) -> None:
-    if not path.is_file() or path.is_symlink():
-        raise ValueError(f"{label} must be a regular non-symlink file")
-    if path.stat().st_mode & 0o077:
-        raise ValueError(f"{label} permissions must be 0600")
+from review_io import (
+    load_object,
+    require_secure_regular,
+    secure_json,
+)
 
 
 def verify_lease(args: argparse.Namespace) -> dict[str, Any]:
@@ -99,7 +71,7 @@ def acquire_lease(args: argparse.Namespace) -> int:
         "token": lock["token"],
         "acquired_at": datetime.now(timezone.utc).isoformat(),
     }
-    secure_write(Path(args.lease), lease)
+    secure_json(Path(args.lease), lease)
     print(json.dumps({"status": "acquired", "lease": args.lease}, sort_keys=True))
     return 0
 
@@ -155,7 +127,7 @@ def refresh_guard(args: argparse.Namespace) -> int:
         "scope_args": args.scope_args,
         "inspected_at": datetime.now(timezone.utc).isoformat(),
     }
-    secure_write(Path(args.guard), guard)
+    secure_json(Path(args.guard), guard)
     print(json.dumps(guard, sort_keys=True))
     return 0
 
@@ -193,7 +165,7 @@ def add_check(args: argparse.Namespace) -> int:
         if args.artifact_digest:
             check["evidence"]["artifact_digest"] = args.artifact_digest
     validation["performed"].append(check)
-    secure_write(event_path, event)
+    secure_json(event_path, event)
     print(
         json.dumps({"status": "check_added", "draft": str(event_path)}, sort_keys=True)
     )
@@ -228,7 +200,7 @@ def add_gap(args: argparse.Namespace) -> int:
             "material": args.material,
         }
     )
-    secure_write(event_path, event)
+    secure_json(event_path, event)
     print(
         json.dumps(
             {"status": "gap_added", "gap_id": gap_id, "draft": str(event_path)},

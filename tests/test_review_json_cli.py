@@ -6,12 +6,13 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "review-json.sh"
+SCRIPT = Path(__file__).parents[1] / "scripts" / "review_cli.py"
 LOCK_SCRIPT = Path(__file__).parents[1] / "scripts" / "review_lock.py"
 
 
@@ -42,7 +43,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         run("git", "add", ".gitignore", "example.txt", cwd=self.repo)
         run("git", "commit", "-qm", "initial", cwd=self.repo)
         output = run(
-            "bash", str(SCRIPT), "init", str(self.repo), "review", cwd=self.repo
+            sys.executable, str(SCRIPT), "init", str(self.repo), "review", cwd=self.repo
         ).stdout
         self.review_id = next(
             line.split(": ", 1)[1]
@@ -61,7 +62,7 @@ class ReviewJsonCliTest(unittest.TestCase):
     def snapshot(self) -> dict[str, Any]:
         return json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "snapshot",
                 str(self.repo),
@@ -72,7 +73,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     def acquire(self) -> None:
         output = run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "lock",
             "acquire",
@@ -87,7 +88,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     def prepare_review(self, source: dict[str, Any]) -> str:
         run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "inspect",
             str(self.repo),
@@ -97,7 +98,7 @@ class ReviewJsonCliTest(unittest.TestCase):
             cwd=self.repo,
         )
         run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "template",
             str(self.repo),
@@ -128,7 +129,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     def publish(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "publish",
             str(self.repo),
@@ -152,7 +153,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         document = json.loads(self.review.read_text())
         self.assertEqual(document["state"]["workflow"]["phase"], "owner_response")
         inspected = run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "inspect",
             str(self.repo),
@@ -164,9 +165,11 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertIn('"status": "clean"', inspected)
         dashboard = json.loads(inspected)
         self.assertIn("lock acquire", dashboard["recommended_next_command"])
+        self.assertIn("review_cli.py", dashboard["recommended_next_command"])
+        self.assertNotIn("review-json.sh", dashboard["recommended_next_command"])
         conversations = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "threads",
                 str(self.repo),
@@ -223,7 +226,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertEqual(history, [])
         self.assertEqual(json.loads(self.event.read_text())["event_id"], event_id)
         run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "lock",
             "release",
@@ -237,7 +240,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         lease_path = self.repo / ".local" / "reviews" / f"{self.review_id}.lease.json"
         token = json.loads(lease_path.read_text())["token"]
         failed = run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "lock",
             "release",
@@ -261,6 +264,175 @@ class ReviewJsonCliTest(unittest.TestCase):
             cwd=self.repo,
         )
         self.assertIn("verified", verified.stdout)
+
+    def test_guarded_draft_helpers_preserve_cli_artifact_contract(self) -> None:
+        initial = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "inspect",
+                str(self.repo),
+                self.review_id,
+                "--json",
+                "example.txt",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(initial["workflow"]["phase"], "awaiting_initial_review")
+        self.assertEqual(initial["operation"]["status"], "clean")
+        self.assertEqual(initial["operation"]["lock_status"], "unlocked")
+        self.assertFalse(initial["operation"]["lease_present"])
+        self.assertFalse(initial["source"]["drift"])
+        self.assertIn("lock acquire", initial["recommended_next_command"])
+
+        self.acquire()
+        guarded = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "inspect",
+                str(self.repo),
+                self.review_id,
+                "--json",
+                "example.txt",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(guarded["operation"]["lock_status"], "locked")
+        self.assertTrue(guarded["operation"]["lease_present"])
+        self.assertIn("template", guarded["recommended_next_command"])
+
+        template_output = run(
+            sys.executable,
+            str(SCRIPT),
+            "template",
+            str(self.repo),
+            self.review_id,
+            "review",
+            cwd=self.repo,
+        ).stdout.strip()
+        self.assertEqual(Path(template_output), self.event)
+        self.assertEqual(self.event.stat().st_mode & 0o777, 0o600)
+
+        check_result = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "add-check",
+                str(self.repo),
+                self.review_id,
+                "passed",
+                "schema validation",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(check_result["status"], "check_added")
+        gap_result = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "add-gap",
+                str(self.repo),
+                self.review_id,
+                "live probe",
+                "service unavailable",
+                "--material",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(gap_result["status"], "gap_added")
+        self.assertEqual(gap_result["gap_id"], "G1")
+        draft = json.loads(self.event.read_text())
+        self.assertEqual(
+            draft["validation"]["performed"],
+            [{"check": "schema validation", "result": "passed"}],
+        )
+        self.assertEqual(
+            draft["validation"]["gaps"],
+            [
+                {
+                    "gap_id": "G1",
+                    "check": "live probe",
+                    "reason": "service unavailable",
+                    "material": True,
+                }
+            ],
+        )
+
+        aborted = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "abort-draft",
+                str(self.repo),
+                self.review_id,
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(aborted["status"], "draft_aborted")
+        self.assertFalse(self.event.exists())
+        released = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "lock",
+                "release",
+                str(self.repo),
+                self.review_id,
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(released["status"], "released")
+
+    def test_initial_final_review_and_source_drift_route_to_follow_up(self) -> None:
+        self.acquire()
+        source = self.snapshot()
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "--json",
+            "example.txt",
+            cwd=self.repo,
+        )
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "template",
+            str(self.repo),
+            self.review_id,
+            "final_review",
+            cwd=self.repo,
+        )
+        event = json.loads(self.event.read_text())
+        event["source_snapshot"] = source
+        event["decision"] = "LGTM"
+        event["validation"]["performed"] = [
+            {"check": "source inspection", "result": "passed"}
+        ]
+        write_json(self.event, event)
+        result = json.loads(self.publish().stdout)
+        self.assertTrue(result["committed"])
+
+        (self.repo / "example.txt").write_text("after\n")
+        dashboard = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "inspect",
+                str(self.repo),
+                self.review_id,
+                "--json",
+                "example.txt",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(dashboard["workflow"]["phase"], "terminal")
+        self.assertTrue(dashboard["source"]["drift"])
+        self.assertTrue(dashboard["source"]["approval_stale"])
+        self.assertIn("start-follow-up", dashboard["recommended_next_command"])
 
 
 if __name__ == "__main__":

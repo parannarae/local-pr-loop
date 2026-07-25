@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Create a deterministic fingerprint for a declared Git review scope."""
 
 from __future__ import annotations

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import unittest
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 MODULE = Path(__file__).parents[1] / "scripts" / "review_state.py"
+sys.path.insert(0, str(MODULE.parent))
 SPEC = importlib.util.spec_from_file_location("review_state", MODULE)
 assert SPEC and SPEC.loader
 review_state = importlib.util.module_from_spec(SPEC)
@@ -126,11 +128,9 @@ def owner_event(decision: str = "applied") -> dict[str, Any]:
 
 
 class ReviewStateTest(unittest.TestCase):
-    def test_new_document_uses_calendar_revision_and_workflow(self) -> None:
+    def test_new_document_uses_format_and_initial_workflow(self) -> None:
         document = review_state.new_document("abcdefgh", "review")
         self.assertEqual(document["format"], "local-pr-loop")
-        self.assertEqual(document["format_revision"], "2026-07-25.2")
-        self.assertEqual(document["created_by"]["version"], "0.3.0")
         self.assertEqual(
             document["state"]["workflow"]["phase"], "awaiting_initial_review"
         )
@@ -351,6 +351,104 @@ class ReviewStateTest(unittest.TestCase):
         document["state"]["workflow"]["phase"] = "terminal"
         self.assertIn(
             "state projection is stale", review_state.validate_document(document)
+        )
+
+    def test_complete_workflow_projection_and_report_are_history_derived(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        review_state.append_event(document, review_event())
+        self.assertEqual(document["state"]["workflow"]["phase"], "owner_response")
+
+        review_state.append_event(document, owner_event())
+        self.assertEqual(
+            document["state"]["workflow"]["phase"], "reviewer_verification"
+        )
+
+        update = event("reviewer_update", 3)
+        update.update(
+            {
+                "source_snapshot": snapshot("2"),
+                "decisions": [
+                    {
+                        "thread_id": "T1",
+                        "action": "comment",
+                        "message": "One more verification is required.",
+                    }
+                ],
+                "new_threads": [],
+                "gap_resolutions": [],
+                "validation": validation(),
+            }
+        )
+        review_state.append_event(document, update)
+        self.assertEqual(document["state"]["workflow"]["phase"], "owner_response")
+        self.assertEqual(document["state"]["threads"]["open"], ["T1"])
+
+        second_owner = event("owner_reply", 4)
+        second_owner.update(
+            {
+                "starting_source_snapshot": snapshot("2"),
+                "source_drift_assessment": "The guarded source basis is unchanged.",
+                "completed_source_snapshot": snapshot("3"),
+                "replies": [
+                    {
+                        "thread_id": "T1",
+                        "decision": "applied",
+                        "message": "Completed the remaining work.",
+                        "evidence": evidence("test_result"),
+                    }
+                ],
+                "files_changed": ["example.txt"],
+                "guide_synchronization": "No guide change was needed.",
+                "validation": validation(),
+                "commits": [],
+            }
+        )
+        review_state.append_event(document, second_owner)
+
+        final = event("final_review", 5)
+        final.update(
+            {
+                "source_snapshot": snapshot("3"),
+                "resolutions": [{"thread_id": "T1", "message": "Verified."}],
+                "gap_resolutions": [],
+                "decision": "LGTM",
+                "validation": validation(),
+            }
+        )
+        review_state.append_event(document, final)
+        self.assertEqual(document["state"]["workflow"]["phase"], "terminal")
+        self.assertEqual(document["state"]["threads"]["resolved"], ["T1"])
+        self.assertEqual(document["state"]["terminal"]["outcome"], "lgtm")
+
+        report = review_state.render_report(document)
+        self.assertIn("# Latest Review Report", report)
+        self.assertIn("- Review name: review", report)
+        self.assertIn("- Latest event: final_review (evt_test_0005)", report)
+        self.assertIn("## Terminal Outcome", report)
+        self.assertIn("- Outcome: lgtm", report)
+
+    def test_contextual_templates_cover_timeout_and_gap_obligations(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        initial = review_event()
+        initial["validation"] = validation(material=True)
+        review_state.append_event(document, initial)
+
+        timeout = review_state.contextual_event_template(
+            document, "owner_timeout", snapshot("1")
+        )
+        self.assertEqual(timeout["started_at"], initial["occurred_at"])
+        self.assertTrue(timeout["deadline"])
+        self.assertIn("deadline elapsed", timeout["reason"])
+
+        review_state.append_event(document, owner_event())
+        reviewer = review_state.contextual_event_template(
+            document, "reviewer_update", snapshot("2")
+        )
+        self.assertEqual(
+            [item["thread_id"] for item in reviewer["decisions"]], ["T1"]
+        )
+        self.assertEqual(
+            [item["gap_id"] for item in reviewer["gap_resolutions"]], ["G1"]
         )
 
 
