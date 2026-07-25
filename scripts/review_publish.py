@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from review_io import load_secure_object as load_secure_json
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
 
 def import_state(path: Path) -> Any:
     spec = importlib.util.spec_from_file_location("local_pr_loop_state", path)
@@ -526,34 +528,58 @@ def operation(args: argparse.Namespace) -> int:
         and args.current_source_fingerprint != document["state"]["source_fingerprint"]
     )
     approval_stale = workflow["phase"] == "terminal" and source_drift
-    command = f'bash "{args.command_path}"'
-    if approval_stale:
-        recommended = (
-            f"{command} start-follow-up {args.repo} {args.review_id} "
-            f"{document['name']}-follow-up"
+
+    def recommended_command(*arguments: str) -> str:
+        quoted_arguments = " ".join(shlex.quote(argument) for argument in arguments)
+        return f"{args.command_prefix} {quoted_arguments}"
+
+    if status == "committed_cleanup":
+        recommended = recommended_command(
+            "recover-publish", args.repo, args.review_id
         )
-    elif status == "committed_cleanup":
-        recommended = f"{command} recover-publish {args.repo} {args.review_id}"
     elif lock is not None and not args.lease_present:
-        recommended = f"{command} wait {args.repo} {args.review_id} 300"
+        recommended = recommended_command("wait", args.repo, args.review_id, "300")
     elif not args.lease_present and status != "clean":
-        recommended = f"{command} lock acquire {args.repo} {args.review_id}"
+        recommended = recommended_command(
+            "lock", "acquire", args.repo, args.review_id
+        )
     elif status == "prepared_precommit":
-        recommended = f"{command} recover-publish {args.repo} {args.review_id}"
+        recommended = recommended_command(
+            "recover-publish", args.repo, args.review_id
+        )
     elif status == "stale_report":
-        recommended = f"{command} regenerate-report {args.repo} {args.review_id}"
+        recommended = recommended_command(
+            "regenerate-report", args.repo, args.review_id
+        )
     elif status == "ready_to_publish":
-        recommended = f"{command} publish {args.repo} {args.review_id}"
+        recommended = recommended_command("publish", args.repo, args.review_id)
     elif status in {"editing_draft", "corrupt_artifact"}:
-        recommended = f"{command} abort-draft {args.repo} {args.review_id}"
+        recommended = recommended_command("abort-draft", args.repo, args.review_id)
+    elif approval_stale:
+        recommended = recommended_command(
+            "start-follow-up",
+            args.repo,
+            args.review_id,
+            f"{document['name']}-follow-up",
+        )
+    elif workflow["phase"] == "terminal":
+        recommended = "none"
     elif not args.lease_present:
-        recommended = f"{command} lock acquire {args.repo} {args.review_id}"
+        recommended = recommended_command(
+            "lock", "acquire", args.repo, args.review_id
+        )
     elif workflow["phase"] == "awaiting_initial_review":
-        recommended = f"{command} template {args.repo} {args.review_id} review"
+        recommended = recommended_command(
+            "template", args.repo, args.review_id, "review"
+        )
     elif workflow["phase"] == "owner_response":
-        recommended = f"{command} template {args.repo} {args.review_id} owner_reply"
+        recommended = recommended_command(
+            "template", args.repo, args.review_id, "owner_reply"
+        )
     elif workflow["phase"] == "reviewer_verification":
-        recommended = f"{command} template {args.repo} {args.review_id} reviewer_update"
+        recommended = recommended_command(
+            "template", args.repo, args.review_id, "reviewer_update"
+        )
     else:
         recommended = "none"
     operation_value = {
@@ -639,7 +665,7 @@ def main() -> int:
     operation_parser.add_argument("--current-source-fingerprint", required=True)
     operation_parser.add_argument("--lease-present", action="store_true")
     operation_parser.add_argument("--json", action="store_true")
-    operation_parser.add_argument("--command-path", required=True)
+    operation_parser.add_argument("--command-prefix", required=True)
     args = parser.parse_args()
     if args.command == "publish":
         if not args.token and not args.lease:

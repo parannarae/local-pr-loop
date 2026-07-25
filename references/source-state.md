@@ -8,7 +8,7 @@ inside the target Git worktree; the helper resolves its root.
 Ensure `REPO/.local/` is ignored, then initialize:
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" init REPO feature-review
+python3 "$SKILL_DIR/scripts/review_cli.py" init REPO feature-review
 ```
 
 `init` returns an eight-character random `REVIEW_ID` and creates canonical JSON
@@ -36,7 +36,7 @@ adding them to scope. Add relevant ignored or generated files with
 ## Inspect
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" inspect \
+python3 "$SKILL_DIR/scripts/review_cli.py" inspect \
   REPO REVIEW_ID \
   --additional-input path/to/ignored-generated-config \
   path/to/source path/to/tests path/to/guide.md
@@ -61,8 +61,8 @@ Acquire the cooperative lock before changing canonical state, creating an event,
 or changing declared source:
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" lock acquire REPO REVIEW_ID
-bash "$SKILL_DIR/scripts/review-json.sh" inspect REPO REVIEW_ID SCOPE...
+python3 "$SKILL_DIR/scripts/review_cli.py" lock acquire REPO REVIEW_ID
+python3 "$SKILL_DIR/scripts/review_cli.py" inspect REPO REVIEW_ID SCOPE...
 ```
 
 Acquisition creates a permission-restricted local lease and prints no token.
@@ -73,20 +73,20 @@ before `template`.
 ## Prepare and Validate an Event
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" template \
+python3 "$SKILL_DIR/scripts/review_cli.py" template \
   REPO REVIEW_ID owner_reply
 
-bash "$SKILL_DIR/scripts/review-json.sh" validate-event REPO REVIEW_ID
+python3 "$SKILL_DIR/scripts/review_cli.py" validate-event REPO REVIEW_ID
 ```
 
 The template prepopulates guarded snapshots and every role-required thread/gap
 entry. Populate only its remaining blanks. Use:
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" threads REPO REVIEW_ID --json
-bash "$SKILL_DIR/scripts/review-json.sh" add-check \
+python3 "$SKILL_DIR/scripts/review_cli.py" threads REPO REVIEW_ID --json
+python3 "$SKILL_DIR/scripts/review_cli.py" add-check \
   REPO REVIEW_ID passed "focused tests"
-bash "$SKILL_DIR/scripts/review-json.sh" add-gap \
+python3 "$SKILL_DIR/scripts/review_cli.py" add-gap \
   REPO REVIEW_ID "live probe" "service unavailable" --material
 ```
 
@@ -96,7 +96,7 @@ Use the event kind and fields defined in
 ## Guarded Publication
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" publish \
+python3 "$SKILL_DIR/scripts/review_cli.py" publish \
   REPO REVIEW_ID
 ```
 
@@ -114,7 +114,7 @@ reuse the unchanged draft or release the lock. For
 `published_cleanup_required`, never retry the old canonical SHA; recover:
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" recover-publish \
+python3 "$SKILL_DIR/scripts/review_cli.py" recover-publish \
   REPO REVIEW_ID
 ```
 
@@ -135,14 +135,14 @@ best-effort cleanup. Lock status omits the token; ask the user how to proceed.
 Wait without polling manually:
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" wait REPO REVIEW_ID 300
+python3 "$SKILL_DIR/scripts/review_cli.py" wait REPO REVIEW_ID 300
 ```
 
 The command returns on canonical change, the active handoff deadline, or its
 bounded timeout. Publish a timeout only when eligible:
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" publish-timeout \
+python3 "$SKILL_DIR/scripts/review_cli.py" publish-timeout \
   REPO REVIEW_ID --if-eligible
 ```
 

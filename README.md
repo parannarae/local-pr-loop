@@ -6,7 +6,7 @@
 
 Install or copy this repository as a skill named `local-pr-loop` in the directory your agent uses for Agent Skills. The repository root is the skill directory: it contains `SKILL.md`, `scripts/`, and `references/`.
 
-The package requires Bash, Git, and Python 3.9 or newer. Its Python helpers use only the standard library; it does not require an account, network access, a hosted pull request service, or an agent-vendor SDK.
+The package requires Git and Python 3.9 or newer. Its helpers use only the Python standard library; it does not require an account, network access, a hosted pull request service, or an agent-vendor SDK.
 
 ## Vendor-specific adapters
 

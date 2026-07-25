@@ -6,12 +6,13 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "review-json.sh"
+SCRIPT = Path(__file__).parents[1] / "scripts" / "review_cli.py"
 LOCK_SCRIPT = Path(__file__).parents[1] / "scripts" / "review_lock.py"
 
 
@@ -42,7 +43,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         run("git", "add", ".gitignore", "example.txt", cwd=self.repo)
         run("git", "commit", "-qm", "initial", cwd=self.repo)
         output = run(
-            "bash", str(SCRIPT), "init", str(self.repo), "review", cwd=self.repo
+            sys.executable, str(SCRIPT), "init", str(self.repo), "review", cwd=self.repo
         ).stdout
         self.review_id = next(
             line.split(": ", 1)[1]
@@ -61,7 +62,7 @@ class ReviewJsonCliTest(unittest.TestCase):
     def snapshot(self) -> dict[str, Any]:
         return json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "snapshot",
                 str(self.repo),
@@ -72,7 +73,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     def acquire(self) -> None:
         output = run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "lock",
             "acquire",
@@ -87,7 +88,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     def prepare_review(self, source: dict[str, Any]) -> str:
         run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "inspect",
             str(self.repo),
@@ -97,7 +98,7 @@ class ReviewJsonCliTest(unittest.TestCase):
             cwd=self.repo,
         )
         run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "template",
             str(self.repo),
@@ -128,7 +129,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     def publish(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "publish",
             str(self.repo),
@@ -152,7 +153,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         document = json.loads(self.review.read_text())
         self.assertEqual(document["state"]["workflow"]["phase"], "owner_response")
         inspected = run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "inspect",
             str(self.repo),
@@ -164,9 +165,11 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertIn('"status": "clean"', inspected)
         dashboard = json.loads(inspected)
         self.assertIn("lock acquire", dashboard["recommended_next_command"])
+        self.assertIn("review_cli.py", dashboard["recommended_next_command"])
+        self.assertNotIn("review-json.sh", dashboard["recommended_next_command"])
         conversations = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "threads",
                 str(self.repo),
@@ -223,7 +226,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertEqual(history, [])
         self.assertEqual(json.loads(self.event.read_text())["event_id"], event_id)
         run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "lock",
             "release",
@@ -237,7 +240,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         lease_path = self.repo / ".local" / "reviews" / f"{self.review_id}.lease.json"
         token = json.loads(lease_path.read_text())["token"]
         failed = run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "lock",
             "release",
@@ -265,7 +268,7 @@ class ReviewJsonCliTest(unittest.TestCase):
     def test_guarded_draft_helpers_preserve_cli_artifact_contract(self) -> None:
         initial = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "inspect",
                 str(self.repo),
@@ -285,7 +288,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.acquire()
         guarded = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "inspect",
                 str(self.repo),
@@ -300,7 +303,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertIn("template", guarded["recommended_next_command"])
 
         template_output = run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "template",
             str(self.repo),
@@ -313,7 +316,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
         check_result = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "add-check",
                 str(self.repo),
@@ -326,7 +329,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertEqual(check_result["status"], "check_added")
         gap_result = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "add-gap",
                 str(self.repo),
@@ -358,7 +361,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
         aborted = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "abort-draft",
                 str(self.repo),
@@ -370,7 +373,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertFalse(self.event.exists())
         released = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "lock",
                 "release",
@@ -385,7 +388,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.acquire()
         source = self.snapshot()
         run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "inspect",
             str(self.repo),
@@ -395,7 +398,7 @@ class ReviewJsonCliTest(unittest.TestCase):
             cwd=self.repo,
         )
         run(
-            "bash",
+            sys.executable,
             str(SCRIPT),
             "template",
             str(self.repo),
@@ -416,7 +419,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         (self.repo / "example.txt").write_text("after\n")
         dashboard = json.loads(
             run(
-                "bash",
+                sys.executable,
                 str(SCRIPT),
                 "inspect",
                 str(self.repo),

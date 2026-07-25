@@ -26,11 +26,11 @@ never hand-edit, the Markdown report.
 
 ## Dependencies
 
-Require Bash, Git, and Python 3.9 or newer; helpers use only the standard
-library. Run state operations through:
+Require Git and Python 3.9 or newer; helpers use only the standard library. Run
+all review operations through:
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" COMMAND ...
+python3 "$SKILL_DIR/scripts/review_cli.py" COMMAND ...
 ```
 
 Before mutation, read [review-schema.md](references/review-schema.md) for event

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import sys
 import tempfile
 import unittest
@@ -125,6 +126,7 @@ class ReviewPublishFaultTest(unittest.TestCase):
         self.assertEqual(len(json.loads(self.review.read_text())["history"]), 1)
 
     def test_operation_distinguishes_ready_and_prepared_states(self) -> None:
+        repository_path = "/tmp/review repo;unsafe"
         operation_args = Namespace(
             review=str(self.review),
             event=str(self.event),
@@ -132,16 +134,27 @@ class ReviewPublishFaultTest(unittest.TestCase):
             journal=str(self.journal),
             state_script=str(ROOT / "scripts" / "review_state.py"),
             lock_json='{"review_file": "review.json"}',
-            repo=str(self.review.parent),
+            repo=repository_path,
             review_id="abcdefgh",
             current_source_fingerprint="1" * 64,
             lease_present=True,
             json=True,
-            command_path="review-json.sh",
+            command_prefix="python3 review_cli.py",
         )
         with mock.patch("builtins.print") as output:
             self.assertEqual(publisher.operation(operation_args), 0)
-        self.assertIn('"status": "ready_to_publish"', output.call_args.args[0])
+        dashboard = json.loads(output.call_args.args[0])
+        self.assertEqual(dashboard["operation"]["status"], "ready_to_publish")
+        self.assertEqual(
+            shlex.split(dashboard["recommended_next_command"]),
+            [
+                "python3",
+                "review_cli.py",
+                "publish",
+                repository_path,
+                "abcdefgh",
+            ],
+        )
 
         real_atomic = publisher.atomic_bytes
 
@@ -164,6 +177,35 @@ class ReviewPublishFaultTest(unittest.TestCase):
             self.assertEqual(publisher.operation(operation_args), 0)
         self.assertIn('"status": "prepared_precommit"', output.call_args.args[0])
 
+    def test_clean_terminal_operation_recommends_no_command(self) -> None:
+        document = json.loads(self.review.read_text())
+        state.append_event(document, json.loads(self.event.read_text()))
+        self.review.write_text(json.dumps(document, indent=2) + "\n")
+        self.event.unlink()
+        publisher.write_report(state, document, self.report)
+        operation_args = Namespace(
+            review=str(self.review),
+            event=str(self.event),
+            report=str(self.report),
+            journal=str(self.journal),
+            state_script=str(ROOT / "scripts" / "review_state.py"),
+            lock_json="unlocked",
+            repo=str(self.review.parent),
+            review_id="abcdefgh",
+            current_source_fingerprint="1" * 64,
+            lease_present=False,
+            json=True,
+            command_prefix="python3 review_cli.py",
+        )
+
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(publisher.operation(operation_args), 0)
+
+        dashboard = json.loads(output.call_args.args[0])
+        self.assertEqual(dashboard["workflow"]["phase"], "terminal")
+        self.assertEqual(dashboard["operation"]["status"], "clean")
+        self.assertEqual(dashboard["recommended_next_command"], "none")
+
     def test_event_removal_failure_is_postcommit(self) -> None:
         real_unlink = Path.unlink
 
@@ -184,6 +226,36 @@ class ReviewPublishFaultTest(unittest.TestCase):
             self.assertEqual(publisher.publish(self.args), 1)
         self.assertEqual(len(json.loads(self.review.read_text())["history"]), 1)
         self.assertTrue(self.journal.exists())
+
+        operation_args = Namespace(
+            review=str(self.review),
+            event=str(self.event),
+            report=str(self.report),
+            journal=str(self.journal),
+            state_script=str(ROOT / "scripts" / "review_state.py"),
+            lock_json="unlocked",
+            repo=str(self.review.parent),
+            review_id="abcdefgh",
+            current_source_fingerprint="2" * 64,
+            lease_present=False,
+            json=True,
+            command_prefix="python3 review_cli.py",
+        )
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(publisher.operation(operation_args), 0)
+
+        dashboard = json.loads(output.call_args.args[0])
+        self.assertTrue(dashboard["source"]["approval_stale"])
+        self.assertEqual(
+            shlex.split(dashboard["recommended_next_command"]),
+            [
+                "python3",
+                "review_cli.py",
+                "recover-publish",
+                str(self.review.parent),
+                "abcdefgh",
+            ],
+        )
 
     def test_receipt_phase_update_failure_remains_recoverable(self) -> None:
         real_atomic_json = publisher.atomic_json
@@ -228,7 +300,7 @@ class ReviewPublishFaultTest(unittest.TestCase):
             current_source_fingerprint=None,
             lease_present=False,
             json=True,
-            command_path="review-json.sh",
+            command_prefix="python3 review_cli.py",
         )
         with mock.patch("builtins.print") as output:
             self.assertEqual(publisher.operation(operation_args), 0)
