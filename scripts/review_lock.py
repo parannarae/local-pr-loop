@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ def repository_root(value: str) -> Path:
 
 def lock_directory(repo: Path, review_file: str) -> Path:
     # Keep lock identity stable even if a damaged review path becomes a symlink.
-    identity = os.path.abspath(review_file).encode()
+    identity = str(Path(review_file).resolve(strict=False)).encode()
     suffix = hashlib.sha256(identity).hexdigest()[:16]
     git_dir = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--git-path", "codex-review-locks"],
@@ -43,7 +44,7 @@ def lock_directory(repo: Path, review_file: str) -> Path:
 def read_owner(path: Path) -> dict[str, object]:
     owner = json.loads((path / "owner.json").read_text())
     if not isinstance(owner, dict):
-        raise ValueError("review lock holder record must be a JSON object")
+        raise TypeError("review lock holder record must be a JSON object")
     if not isinstance(owner.get("token"), str) or not owner["token"]:
         raise ValueError("review lock holder token is missing")
     return owner
@@ -92,17 +93,28 @@ def acquire(path: Path, review_file: str) -> int:
 
 
 def release(path: Path, token: str) -> int:
-    owner_path = path / "owner.json"
     try:
         owner = read_owner(path)
-    except (FileNotFoundError, json.JSONDecodeError) as error:
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError) as error:
         print(f"cannot read review lock holder: {error}", file=sys.stderr)
         return 1
     if not secrets.compare_digest(owner.get("token", ""), token):
         print("review lock token does not match", file=sys.stderr)
         return 1
-    owner_path.unlink()
-    path.rmdir()
+    tombstone = path.with_name(f"{path.name}.released-{secrets.token_hex(8)}")
+    try:
+        os.replace(path, tombstone)
+    except OSError as error:
+        print(f"cannot deactivate review lock: {error}", file=sys.stderr)
+        return 1
+    try:
+        shutil.rmtree(tombstone)
+    except OSError as error:
+        # The active lock path is already available. Tombstone cleanup is
+        # intentionally a warning rather than a false lock-release failure.
+        print(
+            f"warning: inactive lock tombstone needs cleanup: {error}", file=sys.stderr
+        )
     return 0
 
 
@@ -137,7 +149,13 @@ def main() -> int:
             return 0
         print("unlocked")
         return 0
-    except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.CalledProcessError,
+    ) as error:
         print(f"review lock operation failed: {error}", file=sys.stderr)
         return 1
 

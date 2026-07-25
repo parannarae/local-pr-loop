@@ -1,44 +1,62 @@
 #!/usr/bin/env python3
-"""Validate local review JSON and render its latest report."""
+"""Validate and project local-pr-loop calendar-revision artifacts."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import secrets
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-STATUS_BY_KIND = {
-    "review": "REVIEW SUBMITTED",
-    "review_correction": "REVIEW SUBMITTED",
-    "owner_response": "PR COMPLETED",
-    "final_review": "LGTM",
-    "reviewer_timeout": "REVIEWER TIMED OUT",
-    "owner_timeout": "OWNER TIMED OUT",
+FORMAT = "local-pr-loop"
+FORMAT_REVISION = "2026-07-25.2"
+CREATOR_VERSION = "0.3.0"
+
+ACTOR_BY_KIND = {
+    "review": "reviewer",
+    "source_update": "reviewer",
+    "owner_reply": "owner",
+    "reviewer_update": "reviewer",
+    "final_review": "reviewer",
+    "reviewer_timeout": "owner",
+    "owner_timeout": "reviewer",
 }
-TERMINAL_KINDS = {"final_review", "reviewer_timeout", "owner_timeout"}
 SOURCE_FIELD_BY_KIND = {
     "review": "source_snapshot",
-    "review_correction": "source_snapshot",
-    "owner_response": "completed_source_snapshot",
+    "source_update": "source_snapshot",
+    "owner_reply": "completed_source_snapshot",
+    "reviewer_update": "source_snapshot",
     "final_review": "source_snapshot",
 }
-TIME_FIELD_BY_KIND = {
-    "review": "submitted_at",
-    "review_correction": "submitted_at",
-    "owner_response": "completed_at",
-    "final_review": "completed_at",
-    "reviewer_timeout": "timed_out_at",
-    "owner_timeout": "timed_out_at",
+TERMINAL_OUTCOME_BY_KIND = {
+    "final_review": "lgtm",
+    "reviewer_timeout": "reviewer_timeout",
+    "owner_timeout": "owner_timeout",
 }
 TIMEOUT_DURATION_BY_KIND = {
     "reviewer_timeout": timedelta(minutes=30),
     "owner_timeout": timedelta(hours=2),
 }
-FINDING_ID_PATTERN = re.compile(r"^I([1-9][0-9]*)-F([1-9][0-9]*)$")
+THREAD_PRIORITIES = {"P0", "P1", "P2", "P3"}
+EVIDENCE_BASES = {
+    "source_inspection",
+    "test_result",
+    "live_probe",
+    "captured_fixture",
+    "authoritative_contract",
+}
+EXTERNAL_EVIDENCE_BASES = {
+    "live_probe",
+    "captured_fixture",
+    "authoritative_contract",
+}
+THREAD_ID_PATTERN = re.compile(r"^T([1-9][0-9]*)$")
+GAP_ID_PATTERN = re.compile(r"^G([1-9][0-9]*)$")
+EVENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{11,63}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 MODE_PATTERN = re.compile(r"^[0-7]{4}$")
@@ -66,31 +84,20 @@ def load_json() -> Any:
     return json.load(sys.stdin, object_pairs_hook=reject_duplicate_keys)
 
 
-def event_time(event: dict[str, Any]) -> str:
-    key = TIME_FIELD_BY_KIND.get(event.get("kind"))
-    value = event.get(key) if key else None
-    return value if isinstance(value, str) else ""
-
-
 def require(errors: list[str], condition: bool, message: str) -> None:
     if not condition:
         errors.append(message)
 
 
-def validate_string_list(
-    errors: list[str],
-    value: Any,
-    prefix: str,
-    *,
-    unique: bool = False,
+def reject_unknown(
+    errors: list[str], value: dict[str, Any], allowed: set[str], prefix: str
 ) -> None:
-    valid = (
-        isinstance(value, list)
-        and all(isinstance(item, str) and bool(item) for item in value)
-        and (not unique or len(value) == len(set(value)))
+    unknown = sorted(set(value) - allowed)
+    require(
+        errors,
+        not unknown,
+        f"{prefix} contains unknown fields: {', '.join(unknown)}",
     )
-    suffix = "unique non-empty strings" if unique else "non-empty strings"
-    require(errors, valid, f"{prefix} must be a list of {suffix}")
 
 
 def parse_timestamp(errors: list[str], value: Any, prefix: str) -> datetime | None:
@@ -108,98 +115,141 @@ def parse_timestamp(errors: list[str], value: Any, prefix: str) -> datetime | No
     return parsed
 
 
-def validate_finding(
-    errors: list[str], finding: Any, prefix: str, iteration: int
+def validate_string_list(
+    errors: list[str], value: Any, prefix: str, *, unique: bool = False
 ) -> None:
-    require(errors, isinstance(finding, dict), f"{prefix} must be a mapping")
-    if not isinstance(finding, dict):
-        return
-    for key in ("id", "priority", "title", "risk", "evidence", "required_behavior"):
-        require(
-            errors,
-            isinstance(finding.get(key), str) and bool(finding[key]),
-            f"{prefix}.{key} must be a non-empty string",
-        )
-    finding_id = finding.get("id")
-    match = FINDING_ID_PATTERN.fullmatch(finding_id) if isinstance(finding_id, str) else None
-    require(
-        errors,
-        bool(match) and int(match.group(1)) == iteration,
-        f"{prefix}.id must match I{iteration}-F<M>",
+    valid = isinstance(value, list) and all(
+        isinstance(item, str) and bool(item) for item in value
     )
+    valid = valid and (not unique or len(value) == len(set(value)))
+    suffix = "unique non-empty strings" if unique else "non-empty strings"
+    require(errors, valid, f"{prefix} must be a list of {suffix}")
 
 
 def validate_snapshot(
-    errors: list[str], snapshot: Any, prefix: str, require_fingerprint: bool = True
+    errors: list[str], snapshot: Any, prefix: str, *, fingerprint: bool = True
 ) -> None:
     require(errors, isinstance(snapshot, dict), f"{prefix} must be a mapping")
     if not isinstance(snapshot, dict):
         return
+    reject_unknown(
+        errors,
+        snapshot,
+        {
+            "revision",
+            "scope",
+            "fingerprint",
+            "exclusions",
+            "additional_inputs",
+            "staged_sha256",
+            "unstaged_sha256",
+            "untracked",
+        },
+        prefix,
+    )
     require(
         errors,
         isinstance(snapshot.get("revision"), str)
         and bool(REVISION_PATTERN.fullmatch(snapshot["revision"])),
         f"{prefix}.revision must be a full Git object ID",
     )
-    scope = snapshot.get("scope")
-    validate_string_list(errors, scope, f"{prefix}.scope", unique=True)
-    require(errors, bool(scope), f"{prefix}.scope must not be empty")
-    validate_string_list(errors, snapshot.get("exclusions"), f"{prefix}.exclusions", unique=True)
-    additional_inputs = snapshot.get("additional_inputs", [])
-    require(
-        errors,
-        isinstance(additional_inputs, list),
-        f"{prefix}.additional_inputs must be a list",
+    validate_string_list(errors, snapshot.get("scope"), f"{prefix}.scope", unique=True)
+    require(errors, bool(snapshot.get("scope")), f"{prefix}.scope must not be empty")
+    validate_string_list(
+        errors, snapshot.get("exclusions"), f"{prefix}.exclusions", unique=True
     )
-    if isinstance(additional_inputs, list):
-        paths = []
-        for index, item in enumerate(additional_inputs):
+    inputs = snapshot.get("additional_inputs")
+    require(
+        errors, isinstance(inputs, list), f"{prefix}.additional_inputs must be a list"
+    )
+    paths: list[str] = []
+    if isinstance(inputs, list):
+        for index, item in enumerate(inputs):
             item_prefix = f"{prefix}.additional_inputs[{index}]"
             require(errors, isinstance(item, dict), f"{item_prefix} must be a mapping")
-            if isinstance(item, dict):
+            if not isinstance(item, dict):
+                continue
+            reject_unknown(
+                errors,
+                item,
+                {"path", "kind", "mode", "sha256", "link_target"},
+                item_prefix,
+            )
+            path = item.get("path")
+            require(
+                errors,
+                isinstance(path, str) and bool(path),
+                f"{item_prefix}.path must be a non-empty string",
+            )
+            if isinstance(path, str):
+                paths.append(path)
+            require(
+                errors,
+                item.get("kind") in {"file", "symlink"},
+                f"{item_prefix}.kind is invalid",
+            )
+            require(
+                errors,
+                isinstance(item.get("mode"), str)
+                and bool(MODE_PATTERN.fullmatch(item["mode"])),
+                f"{item_prefix}.mode must be four octal digits",
+            )
+            require(
+                errors,
+                isinstance(item.get("sha256"), str)
+                and bool(SHA256_PATTERN.fullmatch(item["sha256"])),
+                f"{item_prefix}.sha256 must be lowercase SHA-256",
+            )
+            if item.get("kind") == "symlink":
                 require(
                     errors,
-                    isinstance(item.get("path"), str) and bool(item["path"]),
-                    f"{item_prefix}.path must be a non-empty string",
+                    isinstance(item.get("link_target"), str)
+                    and bool(item["link_target"]),
+                    f"{item_prefix}.link_target is required for a symlink",
                 )
-                if isinstance(item.get("path"), str):
-                    paths.append(item["path"])
-                require(
-                    errors,
-                    item.get("kind") in {"file", "symlink"},
-                    f"{item_prefix}.kind is invalid",
-                )
-                require(
-                    errors,
-                    isinstance(item.get("mode"), str)
-                    and bool(MODE_PATTERN.fullmatch(item["mode"])),
-                    f"{item_prefix}.mode must be four octal digits",
-                )
-                require(
-                    errors,
-                    isinstance(item.get("sha256"), str)
-                    and bool(SHA256_PATTERN.fullmatch(item["sha256"])),
-                    f"{item_prefix}.sha256 must be lowercase SHA-256",
-                )
-                if item.get("kind") == "symlink":
-                    require(
-                        errors,
-                        isinstance(item.get("link_target"), str)
-                        and bool(item["link_target"]),
-                        f"{item_prefix}.link_target is required for a symlink",
-                    )
         require(
             errors,
             len(paths) == len(set(paths)),
             f"{prefix}.additional_inputs paths must be unique",
         )
-    if require_fingerprint:
+    if fingerprint:
         require(
             errors,
             isinstance(snapshot.get("fingerprint"), str)
             and bool(SHA256_PATTERN.fullmatch(snapshot["fingerprint"])),
             f"{prefix}.fingerprint must be lowercase SHA-256",
         )
+        for key in ("staged_sha256", "unstaged_sha256"):
+            require(
+                errors,
+                isinstance(snapshot.get(key), str)
+                and bool(SHA256_PATTERN.fullmatch(snapshot[key])),
+                f"{prefix}.{key} must be lowercase SHA-256",
+            )
+        untracked = snapshot.get("untracked")
+        require(
+            errors, isinstance(untracked, list), f"{prefix}.untracked must be a list"
+        )
+        if isinstance(untracked, list):
+            for index, item in enumerate(untracked):
+                item_prefix = f"{prefix}.untracked[{index}]"
+                require(
+                    errors, isinstance(item, dict), f"{item_prefix} must be a mapping"
+                )
+                if not isinstance(item, dict):
+                    continue
+                reject_unknown(
+                    errors,
+                    item,
+                    {"path", "kind", "mode", "sha256", "link_target"},
+                    item_prefix,
+                )
+                for key in ("path", "kind", "mode", "sha256"):
+                    require(
+                        errors,
+                        isinstance(item.get(key), str) and bool(item[key]),
+                        f"{item_prefix}.{key} must be a non-empty string",
+                    )
 
 
 def snapshot_identity(snapshot: Any) -> dict[str, Any] | None:
@@ -208,17 +258,237 @@ def snapshot_identity(snapshot: Any) -> dict[str, Any] | None:
     return {field: snapshot.get(field) for field in SNAPSHOT_IDENTITY_FIELDS}
 
 
+def snapshot_scope_basis(snapshot: Any) -> dict[str, Any] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    inputs = snapshot.get("additional_inputs")
+    if not isinstance(inputs, list):
+        return None
+    return {
+        "scope": snapshot.get("scope"),
+        "exclusions": snapshot.get("exclusions"),
+        "additional_input_paths": [
+            item.get("path") for item in inputs if isinstance(item, dict)
+        ],
+    }
+
+
+def validate_evidence(errors: list[str], value: Any, prefix: str) -> None:
+    require(errors, isinstance(value, dict), f"{prefix} must be a mapping")
+    if not isinstance(value, dict):
+        return
+    reject_unknown(
+        errors,
+        value,
+        {"basis", "provenance", "observed_at", "sanitized_result", "artifact_digest"},
+        prefix,
+    )
+    require(
+        errors,
+        value.get("basis") in EVIDENCE_BASES,
+        f"{prefix}.basis must be a supported evidence basis",
+    )
+    for key in ("provenance", "sanitized_result"):
+        require(
+            errors,
+            isinstance(value.get(key), str) and bool(value[key]),
+            f"{prefix}.{key} must be a non-empty string",
+        )
+    parse_timestamp(errors, value.get("observed_at"), f"{prefix}.observed_at")
+    digest = value.get("artifact_digest")
+    require(
+        errors,
+        digest is None
+        or (isinstance(digest, str) and bool(SHA256_PATTERN.fullmatch(digest))),
+        f"{prefix}.artifact_digest must be lowercase SHA-256 when present",
+    )
+    if value.get("basis") == "captured_fixture":
+        require(
+            errors,
+            isinstance(digest, str) and bool(SHA256_PATTERN.fullmatch(digest)),
+            f"{prefix}.artifact_digest is required for captured_fixture",
+        )
+
+
 def validate_validation(errors: list[str], value: Any, prefix: str) -> None:
     require(errors, isinstance(value, dict), f"{prefix} must be a mapping")
     if not isinstance(value, dict):
         return
-    for key in ("performed", "unavailable", "remaining_gaps"):
-        validate_string_list(errors, value.get(key), f"{prefix}.{key}")
+    reject_unknown(errors, value, {"performed", "gaps"}, prefix)
+    performed = value.get("performed")
+    gaps = value.get("gaps")
+    require(errors, isinstance(performed, list), f"{prefix}.performed must be a list")
+    if isinstance(performed, list):
+        for index, check in enumerate(performed):
+            item_prefix = f"{prefix}.performed[{index}]"
+            require(errors, isinstance(check, dict), f"{item_prefix} must be a mapping")
+            if not isinstance(check, dict):
+                continue
+            reject_unknown(errors, check, {"check", "result", "evidence"}, item_prefix)
+            require(
+                errors,
+                isinstance(check.get("check"), str) and bool(check["check"]),
+                f"{item_prefix}.check must be a non-empty string",
+            )
+            require(
+                errors,
+                check.get("result") in {"passed", "failed"},
+                f"{item_prefix}.result must be passed or failed",
+            )
+            if "evidence" in check:
+                validate_evidence(errors, check["evidence"], f"{item_prefix}.evidence")
+    require(errors, isinstance(gaps, list), f"{prefix}.gaps must be a list")
+    if isinstance(gaps, list):
+        for index, gap in enumerate(gaps):
+            item_prefix = f"{prefix}.gaps[{index}]"
+            require(errors, isinstance(gap, dict), f"{item_prefix} must be a mapping")
+            if not isinstance(gap, dict):
+                continue
+            reject_unknown(
+                errors, gap, {"gap_id", "check", "reason", "material"}, item_prefix
+            )
+            require(
+                errors,
+                isinstance(gap.get("gap_id"), str)
+                and bool(GAP_ID_PATTERN.fullmatch(gap["gap_id"])),
+                f"{item_prefix}.gap_id must match G<N>",
+            )
+            for key in ("check", "reason"):
+                require(
+                    errors,
+                    isinstance(gap.get(key), str) and bool(gap[key]),
+                    f"{item_prefix}.{key} must be a non-empty string",
+                )
+            require(
+                errors,
+                type(gap.get("material")) is bool,
+                f"{item_prefix}.material must be boolean",
+            )
+    if isinstance(performed, list) and isinstance(gaps, list):
+        material_checks = {
+            gap.get("check")
+            for gap in gaps
+            if isinstance(gap, dict) and gap.get("material") is True
+        }
+        for index, check in enumerate(performed):
+            if isinstance(check, dict) and check.get("result") == "failed":
+                require(
+                    errors,
+                    check.get("check") in material_checks,
+                    f"{prefix}.performed[{index}]: failed check requires a matching "
+                    "material validation gap",
+                )
 
 
-def event_findings(event: dict[str, Any]) -> list[dict[str, Any]]:
-    findings = event.get("findings", [])
-    return findings if isinstance(findings, list) else []
+def validate_thread(errors: list[str], thread: Any, prefix: str) -> None:
+    require(errors, isinstance(thread, dict), f"{prefix} must be a mapping")
+    if not isinstance(thread, dict):
+        return
+    reject_unknown(
+        errors,
+        thread,
+        {
+            "id",
+            "priority",
+            "contract",
+            "title",
+            "risk",
+            "evidence",
+            "required_behavior",
+        },
+        prefix,
+    )
+    thread_id = thread.get("id")
+    require(
+        errors,
+        isinstance(thread_id, str) and bool(THREAD_ID_PATTERN.fullmatch(thread_id)),
+        f"{prefix}.id must match T<N>",
+    )
+    require(
+        errors,
+        thread.get("priority") in THREAD_PRIORITIES,
+        f"{prefix}.priority must be one of {', '.join(sorted(THREAD_PRIORITIES))}",
+    )
+    require(
+        errors,
+        thread.get("contract") in {"internal", "external"},
+        f"{prefix}.contract must be internal or external",
+    )
+    for key in ("title", "risk", "required_behavior"):
+        require(
+            errors,
+            isinstance(thread.get(key), str) and bool(thread[key]),
+            f"{prefix}.{key} must be a non-empty string",
+        )
+    validate_evidence(errors, thread.get("evidence"), f"{prefix}.evidence")
+    evidence = thread.get("evidence")
+    if (
+        thread.get("priority") in {"P1", "P2"}
+        and thread.get("contract") == "external"
+        and isinstance(evidence, dict)
+    ):
+        require(
+            errors,
+            evidence.get("basis") in EXTERNAL_EVIDENCE_BASES,
+            f"{prefix}: external-contract P1/P2 evidence must use "
+            "live_probe, captured_fixture, or authoritative_contract",
+        )
+
+
+def validate_action(
+    errors: list[str],
+    action: Any,
+    prefix: str,
+    allowed: set[str],
+    *,
+    resolution: bool = False,
+) -> None:
+    require(errors, isinstance(action, dict), f"{prefix} must be a mapping")
+    if not isinstance(action, dict):
+        return
+    allowed_fields = {"thread_id", "message", "action"}
+    if resolution:
+        allowed_fields.add("verification")
+    reject_unknown(errors, action, allowed_fields, prefix)
+    thread_id = action.get("thread_id")
+    require(
+        errors,
+        isinstance(thread_id, str) and bool(THREAD_ID_PATTERN.fullmatch(thread_id)),
+        f"{prefix}.thread_id must match T<N>",
+    )
+    if "action" in action:
+        require(
+            errors,
+            action.get("action") in allowed,
+            f"{prefix}.action must be one of {', '.join(sorted(allowed))}",
+        )
+    require(
+        errors,
+        isinstance(action.get("message"), str) and bool(action["message"]),
+        f"{prefix}.message must be a non-empty string",
+    )
+    if resolution and "verification" in action:
+        verification = action["verification"]
+        require(
+            errors,
+            isinstance(verification, dict),
+            f"{prefix}.verification must be a mapping",
+        )
+        if isinstance(verification, dict):
+            reject_unknown(
+                errors,
+                verification,
+                {"independent", "evidence"},
+                f"{prefix}.verification",
+            )
+            require(
+                errors,
+                verification.get("independent") is True,
+                f"{prefix}.verification.independent must be true",
+            )
+            validate_evidence(
+                errors, verification.get("evidence"), f"{prefix}.verification.evidence"
+            )
 
 
 def validate_event(event: Any) -> list[str]:
@@ -226,184 +496,687 @@ def validate_event(event: Any) -> list[str]:
     require(errors, isinstance(event, dict), "event must be a mapping")
     if not isinstance(event, dict):
         return errors
-
     kind = event.get("kind")
-    require(errors, kind in STATUS_BY_KIND, f"unsupported event kind: {kind}")
-    if kind not in STATUS_BY_KIND:
+    require(errors, kind in ACTOR_BY_KIND, f"unsupported event kind: {kind}")
+    if kind not in ACTOR_BY_KIND:
         return errors
-    require(errors, event.get("status") == STATUS_BY_KIND[kind], f"{kind} status is invalid")
-    valid_iteration = type(event.get("iteration")) is int and event["iteration"] >= 0
+    allowed_by_kind = {
+        "review": {"source_snapshot", "threads", "validation"},
+        "source_update": {
+            "source_snapshot",
+            "reason",
+            "thread_impacts",
+            "new_threads",
+            "validation",
+        },
+        "owner_reply": {
+            "starting_source_snapshot",
+            "source_drift_assessment",
+            "completed_source_snapshot",
+            "replies",
+            "files_changed",
+            "guide_synchronization",
+            "validation",
+            "commits",
+        },
+        "reviewer_update": {
+            "source_snapshot",
+            "decisions",
+            "new_threads",
+            "gap_resolutions",
+            "validation",
+        },
+        "final_review": {
+            "source_snapshot",
+            "resolutions",
+            "gap_resolutions",
+            "decision",
+            "validation",
+        },
+        "reviewer_timeout": {"reason", "started_at", "deadline"},
+        "owner_timeout": {"reason", "started_at", "deadline"},
+    }
+    reject_unknown(
+        errors,
+        event,
+        {"event_id", "kind", "occurred_at"} | allowed_by_kind[kind],
+        "event",
+    )
     require(
         errors,
-        valid_iteration,
-        "event.iteration must be a non-negative integer",
+        isinstance(event.get("event_id"), str)
+        and bool(EVENT_ID_PATTERN.fullmatch(event["event_id"])),
+        "event_id must be 12-64 lowercase identifier characters",
     )
-    expected_role = (
-        "Owner"
-        if kind in {"owner_response", "reviewer_timeout"}
-        else "Reviewer"
-    )
-    require(errors, event.get("role") == expected_role, f"{kind} role must be {expected_role}")
-    time_field = TIME_FIELD_BY_KIND[kind]
-    event_timestamp = parse_timestamp(errors, event.get(time_field), time_field)
-    if not valid_iteration:
-        return errors
-    if kind != "final_review":
-        require(errors, event["iteration"] >= 1, f"{kind}.iteration must be at least 1")
-
+    parse_timestamp(errors, event.get("occurred_at"), "occurred_at")
     source_field = SOURCE_FIELD_BY_KIND.get(kind)
     if source_field:
         validate_snapshot(errors, event.get(source_field), source_field)
 
     if kind == "review":
-        findings = event_findings(event)
-        require(errors, bool(findings), "review must contain at least one finding")
-        for index, finding in enumerate(findings):
-            validate_finding(errors, finding, f"findings[{index}]", event["iteration"])
-        validate_validation(errors, event.get("validation"), "validation")
-
-    elif kind == "review_correction":
+        threads = event.get("threads")
         require(
             errors,
-            isinstance(event.get("affected_findings"), list) and bool(event["affected_findings"]),
-            "review_correction.affected_findings must be a non-empty string list",
+            isinstance(threads, list) and bool(threads),
+            "review must open threads",
         )
-        validate_string_list(
+        if isinstance(threads, list):
+            for index, thread in enumerate(threads):
+                validate_thread(errors, thread, f"threads[{index}]")
+        validate_validation(errors, event.get("validation"), "validation")
+    elif kind == "source_update":
+        require(
             errors,
-            event.get("affected_findings"),
-            "review_correction.affected_findings",
-            unique=True,
+            isinstance(event.get("reason"), str) and bool(event["reason"]),
+            "source_update.reason must be a non-empty string",
         )
-        affected_findings = event.get("affected_findings", [])
-        if isinstance(affected_findings, list):
+        impacts = event.get("thread_impacts")
+        require(errors, isinstance(impacts, list), "thread_impacts must be a list")
+        if isinstance(impacts, list):
+            for index, impact in enumerate(impacts):
+                validate_action(
+                    errors,
+                    impact,
+                    f"thread_impacts[{index}]",
+                    {"comment", "reopen"},
+                )
+        new_threads = event.get("new_threads")
+        require(errors, isinstance(new_threads, list), "new_threads must be a list")
+        if isinstance(new_threads, list):
+            for index, thread in enumerate(new_threads):
+                validate_thread(errors, thread, f"new_threads[{index}]")
+        validate_validation(errors, event.get("validation"), "validation")
+    elif kind == "owner_reply":
+        validate_snapshot(
+            errors, event.get("starting_source_snapshot"), "starting_source_snapshot"
+        )
+        for key in ("source_drift_assessment", "guide_synchronization"):
             require(
                 errors,
-                all(
-                    isinstance(identifier, str)
-                    and bool(
-                        (match := FINDING_ID_PATTERN.fullmatch(identifier))
-                        and int(match.group(1)) == event["iteration"]
-                    )
-                    for identifier in affected_findings
-                ),
-                f"review_correction.affected_findings must match I{event['iteration']}-F<M>",
+                isinstance(event.get(key), str) and bool(event[key]),
+                f"{key} must be a non-empty string",
             )
+        replies = event.get("replies")
         require(
             errors,
-            isinstance(event.get("source_drift"), str) and bool(event["source_drift"]),
-            "review_correction.source_drift must be a non-empty string",
+            isinstance(replies, list) and bool(replies),
+            "owner_reply must have replies",
         )
-        require(
-            errors,
-            isinstance(event.get("correction"), str) and bool(event["correction"]),
-            "review_correction.correction must be a non-empty string",
-        )
-        for index, finding in enumerate(event_findings(event)):
-            validate_finding(errors, finding, f"findings[{index}]", event["iteration"])
-
-    elif kind == "owner_response":
-        validate_snapshot(errors, event.get("starting_source_snapshot"), "starting_source_snapshot")
-        require(
-            errors,
-            isinstance(event.get("source_drift_assessment"), str)
-            and bool(event["source_drift_assessment"]),
-            "source drift assessment must be a non-empty string",
-        )
-        dispositions = event.get("dispositions")
-        require(errors, isinstance(dispositions, list), "dispositions must be a list")
-        if isinstance(dispositions, list):
-            disposition_ids = []
-            for index, disposition in enumerate(dispositions):
-                prefix = f"dispositions[{index}]"
-                require(errors, isinstance(disposition, dict), f"{prefix} must be a mapping")
-                if isinstance(disposition, dict):
-                    disposition_id = disposition.get("id")
-                    require(
-                        errors,
-                        isinstance(disposition_id, str) and bool(disposition_id),
-                        f"{prefix}.id must be a non-empty string",
-                    )
-                    if isinstance(disposition_id, str):
-                        disposition_ids.append(disposition_id)
-                        match = FINDING_ID_PATTERN.fullmatch(disposition_id)
+        if isinstance(replies, list):
+            for index, reply in enumerate(replies):
+                prefix = f"replies[{index}]"
+                require(errors, isinstance(reply, dict), f"{prefix} must be a mapping")
+                if not isinstance(reply, dict):
+                    continue
+                reject_unknown(
+                    errors,
+                    reply,
+                    {
+                        "thread_id",
+                        "decision",
+                        "message",
+                        "evidence",
+                        "blocker",
+                        "completed_work",
+                        "remaining_work",
+                        "validation_gap",
+                    },
+                    prefix,
+                )
+                thread_id = reply.get("thread_id")
+                require(
+                    errors,
+                    isinstance(thread_id, str)
+                    and bool(THREAD_ID_PATTERN.fullmatch(thread_id)),
+                    f"{prefix}.thread_id must match T<N>",
+                )
+                require(
+                    errors,
+                    isinstance(reply.get("message"), str) and bool(reply["message"]),
+                    f"{prefix}.message must be a non-empty string",
+                )
+                require(
+                    errors,
+                    reply.get("decision")
+                    in {"applied", "declined", "deferred/blocked"},
+                    f"{prefix}.decision is invalid",
+                )
+                validate_evidence(errors, reply.get("evidence"), f"{prefix}.evidence")
+                if reply.get("decision") == "deferred/blocked":
+                    for key in (
+                        "blocker",
+                        "completed_work",
+                        "remaining_work",
+                        "validation_gap",
+                    ):
                         require(
                             errors,
-                            bool(match) and int(match.group(1)) == event["iteration"],
-                            f"{prefix}.id must match I{event['iteration']}-F<M>",
+                            isinstance(reply.get(key), str) and bool(reply[key]),
+                            f"{prefix}.{key} must be a non-empty string",
                         )
-                    require(
-                        errors,
-                        disposition.get("decision") in {"applied", "declined", "deferred/blocked"},
-                        f"{prefix}.decision is invalid",
-                    )
-                    require(
-                        errors,
-                        isinstance(disposition.get("rationale"), str)
-                        and bool(disposition["rationale"]),
-                        f"{prefix}.rationale must be a non-empty string",
-                    )
-                    if disposition.get("decision") == "deferred/blocked":
-                        required_details = (
-                            "blocker",
-                            "completed_work",
-                            "remaining_work",
-                            "validation_gap",
-                        )
-                        for key in required_details:
-                            require(
-                                errors,
-                                isinstance(disposition.get(key), str) and bool(disposition[key]),
-                                f"{prefix}.{key} must be a non-empty string",
-                            )
-            require(
-                errors,
-                len(disposition_ids) == len(set(disposition_ids)),
-                "disposition IDs must be unique",
-            )
-        validate_string_list(errors, event.get("files_changed"), "files_changed", unique=True)
-        require(
-            errors,
-            isinstance(event.get("guide_synchronization"), str)
-            and bool(event["guide_synchronization"]),
-            "guide_synchronization must be a non-empty string",
+        validate_string_list(
+            errors, event.get("files_changed"), "files_changed", unique=True
         )
         validate_string_list(errors, event.get("commits"), "commits", unique=True)
         validate_validation(errors, event.get("validation"), "validation")
-
-    elif kind == "final_review":
-        reviewed_through = event.get("reviewed_through")
+    elif kind == "reviewer_update":
+        decisions = event.get("decisions")
         require(
             errors,
-            reviewed_through == "initial_review"
-            or (type(reviewed_through) is int and reviewed_through >= 1),
-            "reviewed_through must be initial_review or a positive integer",
+            isinstance(decisions, list) and bool(decisions),
+            "reviewer_update must decide every open thread",
         )
-        validate_string_list(errors, event.get("resolutions"), "final_review.resolutions")
+        if isinstance(decisions, list):
+            for index, decision in enumerate(decisions):
+                validate_action(
+                    errors,
+                    decision,
+                    f"decisions[{index}]",
+                    {"comment", "reopen", "resolve"},
+                    resolution=decision.get("action") == "resolve"
+                    if isinstance(decision, dict)
+                    else False,
+                )
+        new_threads = event.get("new_threads")
+        require(errors, isinstance(new_threads, list), "new_threads must be a list")
+        if isinstance(new_threads, list):
+            for index, thread in enumerate(new_threads):
+                validate_thread(errors, thread, f"new_threads[{index}]")
+        validate_validation(errors, event.get("validation"), "validation")
+    elif kind == "final_review":
+        resolutions = event.get("resolutions")
+        require(errors, isinstance(resolutions, list), "resolutions must be a list")
+        if isinstance(resolutions, list):
+            for index, resolution in enumerate(resolutions):
+                validate_action(
+                    errors,
+                    resolution,
+                    f"resolutions[{index}]",
+                    set(),
+                    resolution=True,
+                )
         require(
             errors,
             isinstance(event.get("decision"), str) and bool(event["decision"]),
-            "final_review.decision must be a non-empty string",
+            "decision must be a non-empty string",
         )
         validate_validation(errors, event.get("validation"), "validation")
-
-    elif kind in {"reviewer_timeout", "owner_timeout"}:
+    else:
         require(
             errors,
             isinstance(event.get("reason"), str) and bool(event["reason"]),
             f"{kind}.reason must be a non-empty string",
         )
-        started_at = parse_timestamp(errors, event.get("started_at"), f"{kind}.started_at")
-        deadline = parse_timestamp(errors, event.get("deadline"), f"{kind}.deadline")
-        if started_at and deadline:
+        started = parse_timestamp(errors, event.get("started_at"), "started_at")
+        deadline = parse_timestamp(errors, event.get("deadline"), "deadline")
+        occurred = parse_timestamp(errors, event.get("occurred_at"), "occurred_at")
+        if started and deadline:
             require(
                 errors,
-                deadline == started_at + TIMEOUT_DURATION_BY_KIND[kind],
+                deadline == started + TIMEOUT_DURATION_BY_KIND[kind],
                 f"{kind}.deadline has the wrong duration",
             )
-        if event_timestamp and deadline:
-            require(errors, event_timestamp >= deadline, f"{kind} occurred before its deadline")
+        if occurred and deadline:
+            require(
+                errors, occurred >= deadline, f"{kind} occurred before its deadline"
+            )
+    if kind in {"reviewer_update", "final_review"}:
+        gap_resolutions = event.get("gap_resolutions")
+        require(
+            errors,
+            isinstance(gap_resolutions, list),
+            "gap_resolutions must be a list",
+        )
+        if isinstance(gap_resolutions, list):
+            for index, resolution in enumerate(gap_resolutions):
+                prefix = f"gap_resolutions[{index}]"
+                require(
+                    errors, isinstance(resolution, dict), f"{prefix} must be a mapping"
+                )
+                if not isinstance(resolution, dict):
+                    continue
+                reject_unknown(
+                    errors, resolution, {"gap_id", "message", "evidence"}, prefix
+                )
+                require(
+                    errors,
+                    isinstance(resolution.get("gap_id"), str)
+                    and bool(GAP_ID_PATTERN.fullmatch(resolution["gap_id"])),
+                    f"{prefix}.gap_id must match G<N>",
+                )
+                require(
+                    errors,
+                    isinstance(resolution.get("message"), str)
+                    and bool(resolution["message"]),
+                    f"{prefix}.message must be a non-empty string",
+                )
+                validate_evidence(
+                    errors, resolution.get("evidence"), f"{prefix}.evidence"
+                )
 
+    event_timestamp = parse_timestamp(errors, event.get("occurred_at"), "occurred_at")
+
+    def check_evidence_times(value: Any, prefix: str) -> None:
+        if isinstance(value, dict):
+            if {"basis", "provenance", "observed_at", "sanitized_result"} <= set(value):
+                observed = parse_timestamp(
+                    errors, value.get("observed_at"), f"{prefix}.observed_at"
+                )
+                if observed and event_timestamp:
+                    require(
+                        errors,
+                        observed <= event_timestamp,
+                        f"{prefix}.observed_at must not follow event.occurred_at",
+                    )
+            for key, item in value.items():
+                check_evidence_times(item, f"{prefix}.{key}")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                check_evidence_times(item, f"{prefix}[{index}]")
+
+    check_evidence_times(event, "event")
     return errors
+
+
+def workflow_for(kind: str | None, terminal: dict[str, Any] | None) -> dict[str, Any]:
+    if terminal:
+        return {
+            "phase": "terminal",
+            "primary_actor": None,
+            "primary_action": None,
+            "allowed_events_by_actor": {},
+        }
+    if kind is None:
+        return {
+            "phase": "awaiting_initial_review",
+            "primary_actor": "reviewer",
+            "primary_action": {"kind": "publish_initial_review"},
+            "allowed_events_by_actor": {"reviewer": ["review", "final_review"]},
+        }
+    if kind in {"review", "source_update", "reviewer_update"}:
+        return {
+            "phase": "owner_response",
+            "primary_actor": "owner",
+            "primary_action": {"kind": "reply_to_open_threads"},
+            "allowed_events_by_actor": {
+                "owner": ["owner_reply"],
+                "reviewer": ["source_update", "owner_timeout"],
+            },
+        }
+    return {
+        "phase": "reviewer_verification",
+        "primary_actor": "reviewer",
+        "primary_action": {"kind": "verify_owner_reply"},
+        "allowed_events_by_actor": {
+            "reviewer": ["reviewer_update", "final_review", "source_update"],
+            "owner": ["reviewer_timeout"],
+        },
+    }
+
+
+def default_state() -> dict[str, Any]:
+    return {
+        "workflow": workflow_for(None, None),
+        "source_fingerprint": None,
+        "threads": {"open": [], "resolved": []},
+        "validation_gaps": {"open": [], "resolved": []},
+        "latest_event": None,
+        "terminal": None,
+    }
+
+
+def sorted_thread_ids(values: set[str]) -> list[str]:
+    return sorted(
+        values, key=lambda value: int(THREAD_ID_PATTERN.fullmatch(value).group(1))
+    )
+
+
+def material_gaps(event: dict[str, Any]) -> bool:
+    validation = event.get("validation")
+    gaps = validation.get("gaps") if isinstance(validation, dict) else None
+    return isinstance(gaps, list) and any(
+        isinstance(gap, dict) and gap.get("material") is True for gap in gaps
+    )
+
+
+def project_history(
+    history: list[Any],
+) -> tuple[list[str], dict[str, Any], dict[str, dict[str, Any]]]:
+    errors: list[str] = []
+    threads: dict[str, dict[str, Any]] = {}
+    current_snapshot: dict[str, Any] | None = None
+    latest_reply: dict[str, dict[str, Any]] = {}
+    next_thread = 1
+    previous_time: datetime | None = None
+    handoff_started_at: str | None = None
+    terminal: dict[str, Any] | None = None
+    latest_kind: str | None = None
+    latest_event: dict[str, Any] | None = None
+    event_ids: set[str] = set()
+    gaps: dict[str, dict[str, Any]] = {}
+    next_gap = 1
+
+    def add_threads(items: Any, prefix: str) -> None:
+        nonlocal next_thread
+        if not isinstance(items, list):
+            return
+        for index, thread in enumerate(items):
+            if not isinstance(thread, dict):
+                continue
+            expected = f"T{next_thread}"
+            thread_id = thread.get("id")
+            require(
+                errors,
+                thread_id == expected,
+                f"{prefix}[{index}].id must be {expected}",
+            )
+            if isinstance(thread_id, str) and THREAD_ID_PATTERN.fullmatch(thread_id):
+                require(
+                    errors,
+                    thread_id not in threads,
+                    f"{prefix}[{index}].id is duplicated",
+                )
+                threads[thread_id] = {**thread, "status": "open"}
+                next_thread += 1
+
+    for index, event in enumerate(history):
+        prefix = f"history[{index}]"
+        errors.extend(f"{prefix}: {error}" for error in validate_event(event))
+        if not isinstance(event, dict) or event.get("kind") not in ACTOR_BY_KIND:
+            continue
+        kind = event["kind"]
+        event_id = event.get("event_id")
+        if isinstance(event_id, str):
+            require(
+                errors, event_id not in event_ids, f"{prefix}: event_id is duplicated"
+            )
+            event_ids.add(event_id)
+        occurred = parse_timestamp(
+            errors, event.get("occurred_at"), f"{prefix}.occurred_at"
+        )
+        if occurred:
+            require(
+                errors,
+                occurred <= datetime.now(timezone.utc) + timedelta(minutes=5),
+                f"{prefix}: timestamp is unreasonably in the future",
+            )
+            if previous_time:
+                require(
+                    errors,
+                    occurred > previous_time,
+                    f"{prefix}: occurred_at must increase",
+                )
+            previous_time = occurred
+        require(errors, terminal is None, f"{prefix}: event follows a terminal event")
+        workflow = workflow_for(latest_kind, terminal)
+        allowed = workflow["allowed_events_by_actor"].get(ACTOR_BY_KIND[kind], [])
+        require(
+            errors,
+            kind in allowed,
+            f"{prefix}: {kind} is not allowed in {workflow['phase']}",
+        )
+
+        open_ids = {key for key, value in threads.items() if value["status"] == "open"}
+        resolved_ids = set(threads) - open_ids
+        validation = event.get("validation")
+        event_gaps = validation.get("gaps") if isinstance(validation, dict) else []
+        if isinstance(event_gaps, list):
+            for gap_index, gap in enumerate(event_gaps):
+                if not isinstance(gap, dict):
+                    continue
+                gap_id = gap.get("gap_id")
+                expected = f"G{next_gap}"
+                require(
+                    errors,
+                    gap_id == expected,
+                    f"{prefix}.validation.gaps[{gap_index}].gap_id must be {expected}",
+                )
+                if isinstance(gap_id, str) and GAP_ID_PATTERN.fullmatch(gap_id):
+                    require(
+                        errors,
+                        gap_id not in gaps,
+                        f"{prefix}.validation.gaps[{gap_index}].gap_id is duplicated",
+                    )
+                    gaps[gap_id] = {**gap, "status": "open"}
+                    next_gap += 1
+        if kind in {"reviewer_update", "final_review"}:
+            resolutions = event.get("gap_resolutions", [])
+            resolution_ids = [
+                item.get("gap_id") for item in resolutions if isinstance(item, dict)
+            ]
+            require(
+                errors,
+                len(resolution_ids) == len(set(resolution_ids)),
+                f"{prefix}: gap resolution IDs must be unique",
+            )
+            for gap_id in resolution_ids:
+                require(
+                    errors,
+                    gap_id in gaps and gaps[gap_id]["status"] == "open",
+                    f"{prefix}: gap resolution references a non-open gap",
+                )
+                if gap_id in gaps:
+                    gaps[gap_id]["status"] = "resolved"
+        if kind == "review":
+            add_threads(event.get("threads"), f"{prefix}.threads")
+            current_snapshot = event.get("source_snapshot")
+            handoff_started_at = event.get("occurred_at")
+        elif kind == "source_update":
+            seen: set[str] = set()
+            for action_index, action in enumerate(event.get("thread_impacts", [])):
+                if not isinstance(action, dict):
+                    continue
+                action_prefix = f"{prefix}.thread_impacts[{action_index}]"
+                thread_id = action.get("thread_id")
+                require(
+                    errors,
+                    thread_id in threads,
+                    f"{action_prefix} references unknown thread",
+                )
+                require(
+                    errors,
+                    thread_id not in seen,
+                    f"{action_prefix} duplicates a thread",
+                )
+                if not isinstance(thread_id, str) or thread_id not in threads:
+                    continue
+                seen.add(thread_id)
+                if action.get("action") == "reopen":
+                    require(
+                        errors,
+                        thread_id in resolved_ids,
+                        f"{action_prefix} can reopen only resolved",
+                    )
+                    threads[thread_id]["status"] = "open"
+                else:
+                    require(
+                        errors,
+                        thread_id in open_ids,
+                        f"{action_prefix} can comment only open",
+                    )
+            add_threads(event.get("new_threads"), f"{prefix}.new_threads")
+            current_snapshot = event.get("source_snapshot")
+            handoff_started_at = event.get("occurred_at")
+        elif kind == "owner_reply":
+            require(
+                errors,
+                snapshot_identity(event.get("starting_source_snapshot"))
+                == snapshot_identity(current_snapshot),
+                f"{prefix}: starting snapshot does not match current source",
+            )
+            require(
+                errors,
+                snapshot_scope_basis(event.get("completed_source_snapshot"))
+                == snapshot_scope_basis(current_snapshot),
+                f"{prefix}: completed snapshot changes guarded source basis; use source_update",
+            )
+            replies = event.get("replies", [])
+            ids = [
+                reply.get("thread_id") for reply in replies if isinstance(reply, dict)
+            ]
+            require(
+                errors, len(ids) == len(set(ids)), f"{prefix}: reply IDs must be unique"
+            )
+            require(
+                errors,
+                set(ids) == open_ids,
+                f"{prefix}: replies must address every open thread",
+            )
+            latest_reply = {
+                reply["thread_id"]: reply
+                for reply in replies
+                if isinstance(reply, dict) and isinstance(reply.get("thread_id"), str)
+            }
+            current_snapshot = event.get("completed_source_snapshot")
+            handoff_started_at = event.get("occurred_at")
+        elif kind in {"reviewer_update", "final_review"}:
+            if latest_kind is None and kind == "final_review":
+                current_snapshot = event.get("source_snapshot")
+            else:
+                require(
+                    errors,
+                    snapshot_identity(event.get("source_snapshot"))
+                    == snapshot_identity(current_snapshot),
+                    f"{prefix}: reviewer snapshot does not match current source",
+                )
+            actions = event.get(
+                "decisions" if kind == "reviewer_update" else "resolutions", []
+            )
+            ids = [
+                action.get("thread_id")
+                for action in actions
+                if isinstance(action, dict)
+            ]
+            require(
+                errors,
+                len(ids) == len(set(ids)),
+                f"{prefix}: thread IDs must be unique",
+            )
+            addressed = {
+                action.get("thread_id")
+                for action in actions
+                if isinstance(action, dict)
+                and action.get("thread_id") in open_ids
+                and (
+                    kind == "final_review"
+                    or action.get("action") in {"comment", "resolve"}
+                )
+            }
+            require(
+                errors,
+                addressed == open_ids,
+                f"{prefix}: must address every open thread",
+            )
+            for action_index, action in enumerate(actions):
+                if not isinstance(action, dict):
+                    continue
+                thread_id = action.get("thread_id")
+                action_prefix = f"{prefix}.{('decisions' if kind == 'reviewer_update' else 'resolutions')}[{action_index}]"
+                require(
+                    errors,
+                    thread_id in threads,
+                    f"{action_prefix} references unknown thread",
+                )
+                if thread_id not in threads:
+                    continue
+                resolving = kind == "final_review" or action.get("action") == "resolve"
+                if resolving:
+                    prior = latest_reply.get(thread_id)
+                    if isinstance(prior, dict) and prior.get("decision") == "declined":
+                        require(
+                            errors,
+                            isinstance(action.get("verification"), dict)
+                            and action["verification"].get("independent") is True,
+                            f"{action_prefix}: declined thread requires independent verification",
+                        )
+                    threads[thread_id]["status"] = "resolved"
+                elif action.get("action") == "reopen":
+                    require(
+                        errors,
+                        thread_id in resolved_ids,
+                        f"{action_prefix} can reopen only resolved",
+                    )
+                    threads[thread_id]["status"] = "open"
+            if kind == "reviewer_update":
+                add_threads(event.get("new_threads"), f"{prefix}.new_threads")
+                require(
+                    errors,
+                    any(value["status"] == "open" for value in threads.values()),
+                    f"{prefix}: use final_review when every thread is resolved",
+                )
+                handoff_started_at = event.get("occurred_at")
+            else:
+                failed_checks = [
+                    item
+                    for item in event.get("validation", {}).get("performed", [])
+                    if isinstance(item, dict) and item.get("result") == "failed"
+                ]
+                require(
+                    errors, not failed_checks, f"{prefix}: LGTM forbids failed checks"
+                )
+                open_material_gaps = {
+                    gap_id
+                    for gap_id, gap in gaps.items()
+                    if gap["status"] == "open" and gap.get("material") is True
+                }
+                require(
+                    errors,
+                    not open_material_gaps,
+                    f"{prefix}: LGTM forbids unresolved material gaps",
+                )
+                require(
+                    errors,
+                    not any(value["status"] == "open" for value in threads.values()),
+                    f"{prefix}: final_review leaves open threads",
+                )
+                terminal = {
+                    "outcome": TERMINAL_OUTCOME_BY_KIND[kind],
+                    "occurred_at": event.get("occurred_at"),
+                }
+        else:
+            require(
+                errors,
+                event.get("started_at") == handoff_started_at,
+                f"{prefix}: timeout start does not match active handoff",
+            )
+            terminal = {
+                "outcome": TERMINAL_OUTCOME_BY_KIND[kind],
+                "occurred_at": event.get("occurred_at"),
+            }
+        latest_kind = kind
+        latest_event = {
+            "event_id": event.get("event_id"),
+            "kind": kind,
+            "occurred_at": event.get("occurred_at"),
+        }
+
+    open_ids = {key for key, value in threads.items() if value["status"] == "open"}
+    fingerprint = (
+        current_snapshot.get("fingerprint")
+        if isinstance(current_snapshot, dict)
+        else None
+    )
+    state = {
+        "workflow": workflow_for(latest_kind, terminal),
+        "source_fingerprint": fingerprint,
+        "threads": {
+            "open": sorted_thread_ids(open_ids),
+            "resolved": sorted_thread_ids(set(threads) - open_ids),
+        },
+        "validation_gaps": {
+            "open": sorted(
+                (gap_id for gap_id, gap in gaps.items() if gap["status"] == "open"),
+                key=lambda value: int(GAP_ID_PATTERN.fullmatch(value).group(1)),
+            ),
+            "resolved": sorted(
+                (gap_id for gap_id, gap in gaps.items() if gap["status"] == "resolved"),
+                key=lambda value: int(GAP_ID_PATTERN.fullmatch(value).group(1)),
+            ),
+        },
+        "latest_event": latest_event,
+        "terminal": terminal,
+    }
+    return errors, state, threads
 
 
 def validate_document(document: Any) -> list[str]:
@@ -411,16 +1184,55 @@ def validate_document(document: Any) -> list[str]:
     require(errors, isinstance(document, dict), "document must be a mapping")
     if not isinstance(document, dict):
         return errors
+    reject_unknown(
+        errors,
+        document,
+        {
+            "format",
+            "format_revision",
+            "created_by",
+            "review_id",
+            "prior_review_id",
+            "name",
+            "state",
+            "history",
+        },
+        "document",
+    )
+    revision = document.get("format_revision")
+    require(errors, document.get("format") == FORMAT, f"format must be {FORMAT}")
     require(
         errors,
-        type(document.get("schema_version")) is int and document["schema_version"] == 1,
-        "schema_version must be integer 1",
+        revision == FORMAT_REVISION,
+        f"unsupported format_revision {revision!r}; current revision is "
+        f"{FORMAT_REVISION}; preserve this artifact and start a new loop",
     )
+    creator = document.get("created_by")
+    require(
+        errors,
+        isinstance(creator, dict)
+        and isinstance(creator.get("version"), str)
+        and bool(creator["version"]),
+        "created_by.version is required",
+    )
+    if isinstance(creator, dict):
+        reject_unknown(errors, creator, {"version"}, "created_by")
     require(
         errors,
         isinstance(document.get("review_id"), str)
         and bool(REVIEW_ID_PATTERN.fullmatch(document["review_id"])),
         "review_id must be an eight-character review ID",
+    )
+    prior_review_id = document.get("prior_review_id")
+    require(
+        errors,
+        prior_review_id is None
+        or (
+            isinstance(prior_review_id, str)
+            and bool(REVIEW_ID_PATTERN.fullmatch(prior_review_id))
+            and prior_review_id != document.get("review_id")
+        ),
+        "prior_review_id must be null or a different review ID",
     )
     require(
         errors,
@@ -428,229 +1240,15 @@ def validate_document(document: Any) -> list[str]:
         and bool(REVIEW_NAME_PATTERN.fullmatch(document["name"])),
         "name must contain lowercase letters, digits, and single hyphens",
     )
-    state = document.get("state")
     history = document.get("history")
-    require(errors, isinstance(state, dict), "state must be a mapping")
+    state = document.get("state")
     require(errors, isinstance(history, list), "history must be a list")
-    if not isinstance(state, dict) or not isinstance(history, list):
-        return errors
-
-    if not history:
-        require(errors, state.get("marker") == "AWAITING REVIEW", "empty history must await review")
-        require(
-            errors,
-            type(state.get("latest_iteration")) is int
-            and state["latest_iteration"] == 0,
-            "empty history iteration must be integer 0",
-        )
-        require(
-            errors,
-            state.get("latest_event_kind") is None,
-            "empty history event kind must be null",
-        )
-        require(errors, state.get("updated_at") is None, "empty history update time must be null")
-        return errors
-
-    review_findings: dict[int, list[str]] = {}
-    review_source_snapshots: dict[int, dict[str, Any]] = {}
-    responded: set[int] = set()
-    review_iterations: set[int] = set()
-    terminal_seen = False
-    latest_response_iteration: int | None = None
-    previous_timestamp: datetime | None = None
-
-    for index, event in enumerate(history):
-        prefix = f"history[{index}]"
-        for error in validate_event(event):
-            errors.append(f"{prefix}: {error}")
-        if not isinstance(event, dict):
-            continue
-        kind = event.get("kind")
-        iteration = event.get("iteration")
-        if type(iteration) is not int:
-            continue
-        previous = history[index - 1] if index > 0 and isinstance(history[index - 1], dict) else {}
-        current_timestamp = parse_timestamp(errors, event_time(event), f"{prefix}.timestamp")
-        if current_timestamp:
-            require(
-                errors,
-                current_timestamp <= datetime.now(timezone.utc) + timedelta(minutes=5),
-                f"{prefix}: timestamp is unreasonably in the future",
-            )
-            if previous_timestamp:
-                require(
-                    errors,
-                    current_timestamp >= previous_timestamp,
-                    f"{prefix}: timestamp precedes the previous event",
-                )
-            previous_timestamp = current_timestamp
-        require(errors, not terminal_seen, f"{prefix}: event follows a terminal event")
-        if kind == "review":
-            open_iterations = review_iterations - responded
-            require(errors, not open_iterations, f"{prefix}: another review is still open")
-            expected_iteration = max(review_iterations, default=0) + 1
-            require(
-                errors,
-                iteration == expected_iteration,
-                f"{prefix}: expected review iteration {expected_iteration}",
-            )
-            require(
-                errors,
-                iteration not in review_iterations,
-                f"{prefix}: duplicate review iteration",
-            )
-            review_iterations.add(iteration)
-            ids = [item.get("id") for item in event_findings(event) if isinstance(item, dict)]
-            review_findings[iteration] = [item for item in ids if isinstance(item, str)]
-            source_snapshot = event.get("source_snapshot")
-            if isinstance(source_snapshot, dict):
-                review_source_snapshots[iteration] = source_snapshot
-        elif kind == "review_correction":
-            require(errors, iteration in review_iterations, f"{prefix}: correction has no review")
-            require(errors, iteration not in responded, f"{prefix}: correction follows response")
-            additions = [item.get("id") for item in event_findings(event) if isinstance(item, dict)]
-            affected = event.get("affected_findings", [])
-            known_ids = set(review_findings.get(iteration, []))
-            require(
-                errors,
-                isinstance(affected, list)
-                and all(isinstance(item, str) for item in affected)
-                and set(affected).issubset(known_ids),
-                f"{prefix}: correction references an unknown finding",
-            )
-            review_findings.setdefault(iteration, []).extend(
-                item for item in additions if isinstance(item, str)
-            )
-            source_snapshot = event.get("source_snapshot")
-            if isinstance(source_snapshot, dict):
-                review_source_snapshots[iteration] = source_snapshot
-        elif kind == "owner_response":
-            require(errors, iteration in review_iterations, f"{prefix}: response has no review")
-            require(errors, iteration not in responded, f"{prefix}: duplicate response")
-            require(
-                errors,
-                iteration == max(review_iterations, default=0),
-                f"{prefix}: response does not match the latest review",
-            )
-            require(
-                errors,
-                snapshot_identity(event.get("starting_source_snapshot"))
-                == snapshot_identity(review_source_snapshots.get(iteration)),
-                f"{prefix}: starting snapshot does not match the latest review",
-            )
-            responded.add(iteration)
-            latest_response_iteration = iteration
-            dispositions = event.get("dispositions", [])
-            ids = [
-                item.get("id")
-                for item in dispositions
-                if isinstance(item, dict) and isinstance(item.get("id"), str)
-            ]
-            require(
-                errors,
-                sorted(ids) == sorted(review_findings.get(iteration, [])),
-                f"{prefix}: dispositions must match every finding exactly once",
-            )
-        elif kind == "final_review":
-            require(errors, not (review_iterations - responded), f"{prefix}: review is still open")
-            reviewed_through = event.get("reviewed_through")
-            expected = max(review_iterations, default=0)
-            expected_reviewed_through: int | str = (
-                expected if expected else "initial_review"
-            )
-            require(
-                errors,
-                type(reviewed_through) is type(expected_reviewed_through)
-                and reviewed_through == expected_reviewed_through,
-                f"{prefix}: reviewed_through does not match completed history",
-            )
-        elif kind == "reviewer_timeout":
-            require(
-                errors,
-                index > 0
-                and previous.get("kind") == "owner_response"
-                and previous.get("iteration") == iteration
-                and latest_response_iteration == iteration,
-                f"{prefix}: reviewer timeout must follow its completed response",
-            )
-            expected_start = parse_timestamp(
-                errors, previous.get("completed_at"), f"{prefix}.expected_start"
-            )
-            actual_start = parse_timestamp(
-                errors, event.get("started_at"), f"{prefix}.started_at"
-            )
-            if expected_start and actual_start:
-                require(
-                    errors,
-                    actual_start == expected_start,
-                    f"{prefix}: reviewer timeout start does not match the response",
-                )
-        elif kind == "owner_timeout":
-            require(
-                errors,
-                index > 0
-                and previous.get("kind") in {"review", "review_correction"}
-                and previous.get("iteration") == iteration
-                and iteration in (review_iterations - responded),
-                f"{prefix}: owner timeout must follow its open review",
-            )
-            expected_start = parse_timestamp(
-                errors, previous.get("submitted_at"), f"{prefix}.expected_start"
-            )
-            actual_start = parse_timestamp(
-                errors, event.get("started_at"), f"{prefix}.started_at"
-            )
-            if expected_start and actual_start:
-                require(
-                    errors,
-                    actual_start == expected_start,
-                    f"{prefix}: owner timeout start does not match the submission",
-                )
-        if kind in TERMINAL_KINDS:
-            terminal_seen = True
-
-    all_finding_ids = [item for values in review_findings.values() for item in values]
-    require(
-        errors,
-        len(all_finding_ids) == len(set(all_finding_ids)),
-        "finding IDs must be globally unique",
-    )
-    for iteration, identifiers in review_findings.items():
-        sequences = []
-        for identifier in identifiers:
-            match = FINDING_ID_PATTERN.fullmatch(identifier)
-            if match and int(match.group(1)) == iteration:
-                sequences.append(int(match.group(2)))
-        require(
-            errors,
-            sorted(sequences) == list(range(1, len(identifiers) + 1)),
-            f"iteration {iteration} finding IDs must be sequential",
-        )
-    latest = history[-1]
-    if isinstance(latest, dict):
-        require(errors, state.get("marker") == latest.get("status"), "state marker is stale")
-        require(
-            errors,
-            type(state.get("latest_iteration")) is int
-            and state["latest_iteration"] == latest.get("iteration"),
-            "state latest_iteration is stale",
-        )
-        require(
-            errors,
-            state.get("latest_event_kind") == latest.get("kind"),
-            "state latest_event_kind is stale",
-        )
-        require(errors, state.get("updated_at") == event_time(latest), "state updated_at is stale")
+    require(errors, isinstance(state, dict), "state must be a mapping")
+    if isinstance(history, list) and isinstance(state, dict):
+        history_errors, expected, _ = project_history(history)
+        errors.extend(history_errors)
+        require(errors, state == expected, "state projection is stale")
     return errors
-
-
-def emit_validation(errors: list[str]) -> int:
-    if errors:
-        for error in errors:
-            print(f"- {error}", file=sys.stderr)
-        return 1
-    print("valid")
-    return 0
 
 
 def blank_snapshot() -> dict[str, Any]:
@@ -660,253 +1258,386 @@ def blank_snapshot() -> dict[str, Any]:
         "fingerprint": "",
         "exclusions": [],
         "additional_inputs": [],
+        "staged_sha256": "",
+        "unstaged_sha256": "",
+        "untracked": [],
     }
 
 
-def new_document(review_id: str, name: str) -> dict[str, Any]:
+def blank_evidence() -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "basis": "source_inspection",
+        "provenance": "",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "sanitized_result": "",
+    }
+
+
+def blank_validation() -> dict[str, list[Any]]:
+    return {"performed": [], "gaps": []}
+
+
+def blank_thread() -> dict[str, Any]:
+    return {
+        "id": "T1",
+        "priority": "P1",
+        "contract": "internal",
+        "title": "",
+        "risk": "",
+        "evidence": blank_evidence(),
+        "required_behavior": "",
+    }
+
+
+def new_document(
+    review_id: str, name: str, prior_review_id: str | None = None
+) -> dict[str, Any]:
+    return {
+        "format": FORMAT,
+        "format_revision": FORMAT_REVISION,
+        "created_by": {"version": CREATOR_VERSION},
         "review_id": review_id,
+        "prior_review_id": prior_review_id,
         "name": name,
-        "state": {
-            "marker": "AWAITING REVIEW",
-            "latest_iteration": 0,
-            "latest_event_kind": None,
-            "updated_at": None,
-        },
+        "state": default_state(),
         "history": [],
     }
 
 
-def event_template(kind: str, iteration: int) -> dict[str, Any]:
-    now = datetime.now(timezone.utc).isoformat()
+def event_template(kind: str) -> dict[str, Any]:
     base: dict[str, Any] = {
+        "event_id": f"evt_{secrets.token_hex(12)}",
         "kind": kind,
-        "iteration": iteration,
-        "status": STATUS_BY_KIND[kind],
-        "role": "Owner" if kind in {"owner_response", "reviewer_timeout"} else "Reviewer",
     }
-    if kind in {"review", "review_correction"}:
-        base["submitted_at"] = now
-    elif kind in {"owner_response", "final_review"}:
-        base["completed_at"] = now
-    else:
-        base["timed_out_at"] = now
-
     if kind == "review":
         base.update(
             {
                 "source_snapshot": blank_snapshot(),
-                "findings": [
-                    {
-                        "id": f"I{iteration}-F1",
-                        "priority": "P1",
-                        "title": "",
-                        "risk": "",
-                        "evidence": "",
-                        "required_behavior": "",
-                    }
-                ],
-                "validation": {"performed": [], "unavailable": [], "remaining_gaps": []},
+                "threads": [blank_thread()],
+                "validation": blank_validation(),
             }
         )
-    elif kind == "review_correction":
+    elif kind == "source_update":
         base.update(
             {
                 "source_snapshot": blank_snapshot(),
-                "source_drift": "",
-                "correction": "",
-                "affected_findings": [],
-                "findings": [],
+                "reason": "",
+                "thread_impacts": [],
+                "new_threads": [],
+                "gap_resolutions": [],
+                "validation": blank_validation(),
             }
         )
-    elif kind == "owner_response":
+    elif kind == "owner_reply":
         base.update(
             {
                 "starting_source_snapshot": blank_snapshot(),
                 "source_drift_assessment": "",
                 "completed_source_snapshot": blank_snapshot(),
-                "dispositions": [],
+                "replies": [],
                 "files_changed": [],
                 "guide_synchronization": "",
-                "validation": {"performed": [], "unavailable": [], "remaining_gaps": []},
+                "validation": blank_validation(),
                 "commits": [],
+            }
+        )
+    elif kind == "reviewer_update":
+        base.update(
+            {
+                "source_snapshot": blank_snapshot(),
+                "decisions": [],
+                "new_threads": [],
+                "validation": blank_validation(),
             }
         )
     elif kind == "final_review":
         base.update(
             {
-                "reviewed_through": iteration if iteration else "initial_review",
                 "source_snapshot": blank_snapshot(),
                 "resolutions": [],
+                "gap_resolutions": [],
                 "decision": "",
-                "validation": {"performed": [], "unavailable": [], "remaining_gaps": []},
+                "validation": blank_validation(),
             }
         )
     else:
         base.update({"reason": "", "started_at": "", "deadline": ""})
+    base["occurred_at"] = datetime.now(timezone.utc).isoformat()
     return base
 
 
-def markdown_list(values: Any, empty: str = "None") -> list[str]:
-    if not isinstance(values, list) or not values:
-        return [f"- {empty}"]
-    return [f"- {value}" for value in values]
+def current_snapshot(document: dict[str, Any]) -> dict[str, Any] | None:
+    for event in reversed(document.get("history", [])):
+        if not isinstance(event, dict):
+            continue
+        field = SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        value = event.get(field) if field else None
+        if isinstance(value, dict):
+            return value
+    return None
 
 
-def render_findings(findings: Any) -> list[str]:
-    lines: list[str] = []
-    for finding in findings if isinstance(findings, list) else []:
+def latest_owner_replies(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    for event in reversed(document.get("history", [])):
+        if isinstance(event, dict) and event.get("kind") == "owner_reply":
+            return {
+                item["thread_id"]: item
+                for item in event.get("replies", [])
+                if isinstance(item, dict) and isinstance(item.get("thread_id"), str)
+            }
+    return {}
+
+
+def contextual_event_template(
+    document: dict[str, Any], kind: str, guarded_snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    template = event_template(kind)
+    open_threads = document["state"]["threads"]["open"]
+    open_gaps = document["state"]["validation_gaps"]["open"]
+    prior_snapshot = current_snapshot(document)
+    if kind in SOURCE_FIELD_BY_KIND:
+        template[SOURCE_FIELD_BY_KIND[kind]] = guarded_snapshot
+    if kind == "review":
+        template["threads"][0]["id"] = "T1"
+    elif kind == "owner_reply":
+        template["starting_source_snapshot"] = prior_snapshot or guarded_snapshot
+        template["completed_source_snapshot"] = guarded_snapshot
+        template["replies"] = [
+            {
+                "thread_id": thread_id,
+                "decision": "applied",
+                "message": "",
+                "evidence": blank_evidence(),
+            }
+            for thread_id in open_threads
+        ]
+    elif kind in {"reviewer_update", "final_review"}:
+        replies = latest_owner_replies(document)
+        action_key = "decisions" if kind == "reviewer_update" else "resolutions"
+        actions = []
+        for thread_id in open_threads:
+            action: dict[str, Any] = {
+                "thread_id": thread_id,
+                "message": "",
+            }
+            if kind == "reviewer_update":
+                action["action"] = "comment"
+            if replies.get(thread_id, {}).get("decision") == "declined":
+                action["verification"] = {
+                    "independent": True,
+                    "evidence": blank_evidence(),
+                }
+            actions.append(action)
+        template[action_key] = actions
+        template["gap_resolutions"] = [
+            {
+                "gap_id": gap_id,
+                "message": "",
+                "evidence": blank_evidence(),
+            }
+            for gap_id in open_gaps
+        ]
+    elif kind in {"owner_timeout", "reviewer_timeout"}:
+        latest = document["state"].get("latest_event")
+        if isinstance(latest, dict):
+            started = datetime.fromisoformat(
+                latest["occurred_at"].replace("Z", "+00:00")
+            )
+            template["started_at"] = started.isoformat()
+            template["deadline"] = (
+                started + TIMEOUT_DURATION_BY_KIND[kind]
+            ).isoformat()
+        template["reason"] = "The active handoff deadline elapsed without a response."
+    template["occurred_at"] = datetime.now(timezone.utc).isoformat()
+    return template
+
+
+def thread_conversations(document: dict[str, Any]) -> list[dict[str, Any]]:
+    conversations: dict[str, dict[str, Any]] = {}
+    for event in document.get("history", []):
+        if not isinstance(event, dict):
+            continue
+        for thread in [*event.get("threads", []), *event.get("new_threads", [])]:
+            if isinstance(thread, dict):
+                conversations[thread["id"]] = {
+                    "thread": thread,
+                    "status": "open",
+                    "conversation": [],
+                }
+        action_groups = (
+            event.get("replies", []),
+            event.get("decisions", []),
+            event.get("resolutions", []),
+            event.get("thread_impacts", []),
+        )
+        for actions in action_groups:
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                thread_id = action.get("thread_id")
+                if thread_id in conversations:
+                    conversations[thread_id]["conversation"].append(
+                        {
+                            "event_id": event.get("event_id"),
+                            "kind": event.get("kind"),
+                            "occurred_at": event.get("occurred_at"),
+                            "entry": action,
+                        }
+                    )
+                    action_name = action.get("action")
+                    if event.get("kind") == "final_review" or action_name == "resolve":
+                        conversations[thread_id]["status"] = "resolved"
+                    elif action_name == "reopen":
+                        conversations[thread_id]["status"] = "open"
+    return [
+        conversations[key]
+        for key in sorted(
+            conversations,
+            key=lambda value: int(THREAD_ID_PATTERN.fullmatch(value).group(1)),
+        )
+    ]
+
+
+def render_conversations(document: dict[str, Any]) -> str:
+    lines = ["# Current Review Threads", ""]
+    for item in thread_conversations(document):
+        thread = item["thread"]
         lines.extend(
             [
-                f"### {finding['id']} [{finding['priority']}]: {finding['title']}",
+                f"## {thread['id']} [{thread['priority']}] {thread['title']}",
                 "",
-                finding["risk"],
-                "",
-                f"Evidence: {finding['evidence']}",
-                "",
-                f"Required behavior: {finding['required_behavior']}",
+                f"- Status: {item['status']}",
+                f"- Required behavior: {thread['required_behavior']}",
+                f"- Original evidence: {evidence_summary(thread['evidence'])}",
                 "",
             ]
         )
-    return lines
+        for entry in item["conversation"]:
+            action = entry["entry"]
+            label = action.get("decision") or action.get("action") or "resolved"
+            lines.extend(
+                [
+                    f"### {entry['kind']} — {label}",
+                    "",
+                    action.get("message", ""),
+                    "",
+                ]
+            )
+    if len(lines) == 2:
+        lines.append("No threads.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def append_event(document: Any, event: Any) -> dict[str, Any]:
+    if not isinstance(document, dict) or not isinstance(document.get("history"), list):
+        raise TypeError("review document has invalid history")
+    if not isinstance(event, dict):
+        raise TypeError("event must be a JSON object")
+    next_history = [*document["history"], event]
+    errors, state, _ = project_history(next_history)
+    if errors:
+        raise ValueError("; ".join(errors))
+    document["history"] = next_history
+    document["state"] = state
+    return document
+
+
+def evidence_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "Unavailable"
+    return f"{value.get('basis', 'unknown')}: {value.get('sanitized_result', '')}"
 
 
 def render_report(document: dict[str, Any]) -> str:
-    history = document.get("history", [])
-    if not history:
-        return (
-            "# Latest Review Report\n\n"
-            f"- Review ID: {document['review_id']}\n"
-            f"- Review name: {document['name']}\n"
-            "- Status: AWAITING REVIEW\n"
-        )
-    event = history[-1]
-    kind = event["kind"]
+    state = document["state"]
+    workflow = state["workflow"]
     lines = [
         "# Latest Review Report",
         "",
         f"- Review ID: {document['review_id']}",
         f"- Review name: {document['name']}",
-        f"- Status: {event['status']}",
-        f"- Iteration: {event['iteration']}",
-        f"- Role: {event['role']}",
-        f"- Recorded at: {event_time(event)}",
+        f"- Workflow phase: {workflow['phase']}",
+        f"- Primary actor: {workflow['primary_actor'] or 'None'}",
+        f"- Primary action: {(workflow['primary_action'] or {}).get('kind', 'None')}",
+        f"- Open threads: {', '.join(state['threads']['open']) or 'None'}",
+        f"- Resolved threads: {', '.join(state['threads']['resolved']) or 'None'}",
+        f"- Open validation gaps: {', '.join(state['validation_gaps']['open']) or 'None'}",
+        f"- Resolved validation gaps: {', '.join(state['validation_gaps']['resolved']) or 'None'}",
+        f"- Source fingerprint: {state['source_fingerprint'] or 'Unavailable'}",
     ]
-    source_field = SOURCE_FIELD_BY_KIND.get(kind)
-    if source_field:
-        source = event.get(source_field, {})
-        lines.append(f"- Source fingerprint: {source.get('fingerprint', 'Unavailable')}")
-
-    if kind == "review":
-        lines.extend(["", "## Findings", "", *render_findings(event.get("findings"))])
-    elif kind == "review_correction":
-        lines.extend(
-            [
-                "",
-                "## Correction",
-                "",
-                f"- Affected findings: {', '.join(event.get('affected_findings', []))}",
-                f"- Correction: {event.get('correction', '')}",
-                f"- Source drift: {event.get('source_drift', '')}",
-            ]
-        )
-        if event.get("findings"):
-            lines.extend(["", "## Added Findings", "", *render_findings(event["findings"])])
-    elif kind == "owner_response":
-        lines.extend(
-            [
-                "",
-                "## Source State",
-                "",
-                f"- Starting fingerprint: {event['starting_source_snapshot']['fingerprint']}",
-                f"- Completed fingerprint: {event['completed_source_snapshot']['fingerprint']}",
-                f"- Drift assessment: {event.get('source_drift_assessment', '')}",
-            ]
-        )
-        lines.extend(["", "## Decisions", ""])
-        for disposition in event.get("dispositions", []):
+    if not document["history"]:
+        return "\n".join(lines) + "\n"
+    event = document["history"][-1]
+    lines.extend(
+        [
+            f"- Latest event: {event['kind']} ({event['event_id']})",
+            f"- Recorded at: {event['occurred_at']}",
+            "",
+        ]
+    )
+    threads = event.get("threads", []) or event.get("new_threads", [])
+    if threads:
+        lines.extend(["## Threads", ""])
+        for thread in threads:
             lines.extend(
                 [
-                    f"### {disposition['id']}: {disposition['decision']}",
+                    f"### {thread['id']} [{thread['priority']}]: {thread['title']}",
                     "",
-                    disposition["rationale"],
+                    thread["risk"],
+                    "",
+                    f"Evidence: {evidence_summary(thread['evidence'])}",
+                    "",
+                    f"Required behavior: {thread['required_behavior']}",
                     "",
                 ]
             )
-            if disposition.get("decision") == "deferred/blocked":
-                lines.extend(
-                    [
-                        f"- Blocker: {disposition.get('blocker', '')}",
-                        f"- Completed work: {disposition.get('completed_work', '')}",
-                        f"- Remaining work: {disposition.get('remaining_work', '')}",
-                        f"- Validation gap: {disposition.get('validation_gap', '')}",
-                        "",
-                    ]
-                )
-        lines.extend(["## Files Changed", "", *markdown_list(event.get("files_changed")), ""])
-        lines.extend(
-            [
-                "## Guide Synchronization",
-                "",
-                event.get("guide_synchronization", ""),
-                "",
-            ]
-        )
-        lines.extend(["## Resulting Revisions", "", *markdown_list(event.get("commits")), ""])
-    elif kind == "final_review":
-        lines.append(f"- Reviewed through: {event.get('reviewed_through', '')}")
-        lines.extend(["", "## Decision", "", event.get("decision", ""), ""])
-        lines.extend(["## Resolutions", "", *markdown_list(event.get("resolutions")), ""])
-    else:
-        lines.extend(
-            [
-                "",
-                "## Timeout",
-                "",
-                f"- Started at: {event.get('started_at', '')}",
-                f"- Deadline: {event.get('deadline', '')}",
-                f"- Timed out at: {event.get('timed_out_at', '')}",
-                "",
-                event.get("reason", ""),
-                "",
-            ]
-        )
-
+    actions = (
+        event.get("replies")
+        or event.get("decisions")
+        or event.get("resolutions")
+        or event.get("thread_impacts")
+        or []
+    )
+    if actions:
+        lines.extend(["## Thread Actions", ""])
+        for action in actions:
+            label = action.get("decision") or action.get("action") or "resolved"
+            lines.extend(
+                [f"### {action['thread_id']}: {label}", "", action["message"], ""]
+            )
     validation = event.get("validation")
     if isinstance(validation, dict):
-        if lines and lines[-1]:
-            lines.append("")
-        lines.extend(["## Validation", "", *markdown_list(validation.get("performed")), ""])
+        lines.extend(["## Validation", ""])
+        for check in validation.get("performed", []):
+            lines.append(f"- {check.get('result')}: {check.get('check')}")
+        if not validation.get("performed"):
+            lines.append("- None")
+        lines.extend(["", "## Validation Gaps", ""])
+        for gap in validation.get("gaps", []):
+            material = "material" if gap.get("material") else "non-material"
+            lines.append(f"- [{material}] {gap.get('check')}: {gap.get('reason')}")
+        if not validation.get("gaps"):
+            lines.append("- None")
+    if state["terminal"]:
         lines.extend(
-            ["## Unavailable Checks", "", *markdown_list(validation.get("unavailable")), ""]
-        )
-        lines.extend(
-            ["## Remaining Gaps", "", *markdown_list(validation.get("remaining_gaps")), ""]
+            [
+                "",
+                "## Terminal Outcome",
+                "",
+                f"- Outcome: {state['terminal']['outcome']}",
+                f"- Occurred at: {state['terminal']['occurred_at']}",
+            ]
         )
     return "\n".join(lines).rstrip() + "\n"
 
 
-def append_event(document: Any, event: Any) -> dict[str, Any]:
-    if not isinstance(document, dict):
-        raise ValueError("review document must be a JSON object")
-    history = document.get("history")
-    state = document.get("state")
-    if not isinstance(history, list) or not isinstance(state, dict):
-        raise ValueError("review document has invalid history or state")
-    if not isinstance(event, dict):
-        raise ValueError("event must be a JSON object")
-
-    history.append(event)
-    state.update(
-        {
-            "marker": event.get("status"),
-            "latest_iteration": event.get("iteration"),
-            "latest_event_kind": event.get("kind"),
-            "updated_at": event_time(event),
-        }
-    )
-    return document
+def emit_validation(errors: list[str]) -> int:
+    if errors:
+        for error in errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
+    print("valid")
+    return 0
 
 
 def main() -> int:
@@ -920,26 +1651,37 @@ def main() -> int:
     init_parser = subparsers.add_parser("init")
     init_parser.add_argument("review_id")
     init_parser.add_argument("name")
+    init_parser.add_argument("--prior-review-id")
     snapshot_parser = subparsers.add_parser("source-snapshot")
     snapshot_parser.add_argument("--kind")
     append_parser = subparsers.add_parser("append-event")
     append_parser.add_argument("event_json")
     template_parser = subparsers.add_parser("template")
-    template_parser.add_argument("kind", choices=STATUS_BY_KIND)
-    template_parser.add_argument("iteration", type=int)
+    template_parser.add_argument("kind", choices=ACTOR_BY_KIND)
+    contextual_parser = subparsers.add_parser("context-template")
+    contextual_parser.add_argument("kind", choices=ACTOR_BY_KIND)
+    contextual_parser.add_argument("snapshot_json")
+    threads_parser = subparsers.add_parser("threads")
+    threads_parser.add_argument("--json", action="store_true")
+    evidence_parser = subparsers.add_parser("evidence-template")
+    evidence_parser.add_argument("basis", choices=EVIDENCE_BASES)
+    subparsers.add_parser("eligible-timeout")
     args = parser.parse_args()
-
     if args.command == "template":
-        print(json.dumps(event_template(args.kind, args.iteration), indent=2))
+        print(json.dumps(event_template(args.kind), indent=2))
+        return 0
+    if args.command == "evidence-template":
+        value = blank_evidence()
+        value["basis"] = args.basis
+        print(json.dumps(value, indent=2))
         return 0
     if args.command == "init":
-        document = new_document(args.review_id, args.name)
+        document = new_document(args.review_id, args.name, args.prior_review_id)
         errors = validate_document(document)
         if errors:
             return emit_validation(errors)
-        print(json.dumps(document, ensure_ascii=True, indent=2))
+        print(json.dumps(document, indent=2))
         return 0
-
     try:
         value = load_json()
     except (ValueError, json.JSONDecodeError) as error:
@@ -957,17 +1699,60 @@ def main() -> int:
     if args.command == "validate-event":
         return emit_validation(validate_event(value))
     if args.command == "source-snapshot":
-        kind = args.kind or value.get("kind")
+        kind = args.kind or (value.get("kind") if isinstance(value, dict) else None)
         field = SOURCE_FIELD_BY_KIND.get(kind)
-        print(json.dumps(value.get(field)) if field else "null")
+        print(
+            json.dumps(value.get(field))
+            if field and isinstance(value, dict)
+            else "null"
+        )
         return 0
     if args.command == "report":
         print(render_report(value), end="")
         return 0
-    if args.command == "state":
-        if not isinstance(value, dict) or not isinstance(value.get("state"), dict):
-            print("review document has invalid state", file=sys.stderr)
+    if args.command == "context-template":
+        try:
+            snapshot = json.loads(Path(args.snapshot_json).read_text())
+            if isinstance(snapshot, dict) and isinstance(
+                snapshot.get("source_snapshot"), dict
+            ):
+                snapshot = snapshot["source_snapshot"]
+            print(
+                json.dumps(
+                    contextual_event_template(value, args.kind, snapshot), indent=2
+                )
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"cannot build contextual event: {error}", file=sys.stderr)
             return 1
+        return 0
+    if args.command == "eligible-timeout":
+        workflow = value["state"]["workflow"]
+        latest = value["state"].get("latest_event")
+        if workflow["phase"] not in {"owner_response", "reviewer_verification"}:
+            print("no timeout is structurally allowed", file=sys.stderr)
+            return 1
+        kind = (
+            "owner_timeout"
+            if workflow["phase"] == "owner_response"
+            else "reviewer_timeout"
+        )
+        started = datetime.fromisoformat(latest["occurred_at"].replace("Z", "+00:00"))
+        deadline = started + TIMEOUT_DURATION_BY_KIND[kind]
+        if datetime.now(timezone.utc) < deadline:
+            print(
+                f"timeout is not eligible until {deadline.isoformat()}", file=sys.stderr
+            )
+            return 1
+        print(kind)
+        return 0
+    if args.command == "threads":
+        if args.json:
+            print(json.dumps(thread_conversations(value), indent=2))
+        else:
+            print(render_conversations(value), end="")
+        return 0
+    if args.command == "state":
         print(json.dumps(value["state"], indent=2))
         return 0
     if args.command == "append-event":
@@ -977,10 +1762,10 @@ def main() -> int:
                 object_pairs_hook=reject_duplicate_keys,
             )
             updated = append_event(value, event)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             print(f"cannot append review event: {error}", file=sys.stderr)
             return 1
-        print(json.dumps(updated, ensure_ascii=True, indent=2))
+        print(json.dumps(updated, indent=2))
         return 0
     return 2
 

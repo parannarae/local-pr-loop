@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local PR Loop"
+  short_description: "Run local PR reviews with durable conversation threads."
+  default_prompt: "Use $local-pr-loop as the requested owner or reviewer, keep stable review threads and guarded source snapshots in immutable local JSON history, and continue until every thread is resolved at LGTM or a recorded timeout."
