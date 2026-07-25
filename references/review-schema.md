@@ -1,169 +1,171 @@
-# Review JSON Schema v2
+# Review Artifact Format
 
-Schema v2 models findings as durable conversation threads. The owner replies;
-the reviewer alone resolves or reopens. Source updates are independent events.
-
-## Canonical Document
+The skill version is `0.3.0`. Persisted compatibility uses an independent
+calendar revision:
 
 ```json
 {
-  "schema_version": 2,
+  "format": "local-pr-loop",
+  "format_revision": "2026-07-25.1",
+  "created_by": {"version": "0.3.0"},
   "review_id": "k7m3q9wx",
   "name": "feature-review",
   "state": {
-    "marker": "AWAITING REVIEW",
-    "latest_event_kind": null,
-    "updated_at": null,
-    "current_source_fingerprint": null,
-    "open_threads": [],
-    "resolved_threads": []
+    "workflow": {
+      "phase": "awaiting_initial_review",
+      "primary_actor": "reviewer",
+      "primary_action": {"kind": "publish_initial_review"},
+      "allowed_events_by_actor": {
+        "reviewer": ["review", "final_review"]
+      }
+    },
+    "source_fingerprint": null,
+    "threads": {"open": [], "resolved": []},
+    "latest_event": null,
+    "terminal": null
   },
   "history": []
 }
 ```
 
-Never edit `state` or `history` directly. `publish` appends one validated event
-and derives the complete state projection.
+Canonical state is a pure projection of immutable history. Operation state,
+deadlines becoming eligible, drafts, locks, reports, and publication recovery
+never enter canonical history. Old revisions are preserved but rejected; create
+a new loop rather than migrating them.
 
-## Thread Contract
+## Event Envelope and Routing
 
-New threads use globally unique, gap-free IDs: `T1`, `T2`, and so on.
+Every event contains a unique `event_id`, `kind`, and timezone-aware
+`occurred_at`. Timestamps strictly increase. Event kind determines actor:
+
+- Reviewer: `review`, `source_update`, `reviewer_update`, `final_review`,
+  `owner_timeout`.
+- Owner: `owner_reply`, `reviewer_timeout`.
+
+Valid workflow phases are `awaiting_initial_review`, `owner_response`,
+`reviewer_verification`, and `terminal`. `allowed_events_by_actor` is
+authoritative; `primary_actor` describes the main handoff without excluding
+other allowed events.
+
+Timeout events contain `started_at`, exact `deadline`, `reason`, and
+`occurred_at`. `inspect` computes whether a structurally allowed timeout has
+become eligible. Wall-clock eligibility never changes canonical state.
+
+## Threads and Evidence
+
+Thread IDs are globally gap-free `T<N>` values and remain stable:
 
 ```json
 {
   "id": "T1",
   "priority": "P1",
+  "contract": "external",
   "title": "Reject malformed input",
   "risk": "Malformed input reaches persistence.",
-  "evidence": "The handler passes the value without validation.",
-  "required_behavior": "Validate before calling the repository."
+  "evidence": {
+    "basis": "captured_fixture",
+    "provenance": "sanitized fixture fixtures/rejection.json",
+    "observed_at": "2026-07-25T03:00:00+00:00",
+    "sanitized_result": "The service accepted the malformed field.",
+    "artifact_digest": "lowercase-sha256-when-present"
+  },
+  "required_behavior": "Reject before persistence."
 }
 ```
 
-Thread IDs remain stable for the entire conversation. Owner replies, reviewer
-decisions, resolutions, and reopenings reference `thread_id`.
+Evidence bases are `source_inspection`, `test_result`, `live_probe`,
+`captured_fixture`, and `authoritative_contract`. External-contract P1/P2
+threads require one of the last three; a synthetic counterexample is not enough.
+Never record credentials, signed URLs, query tokens, cookies, raw responses, raw
+headers, or unredacted commands.
 
-## Event Types
-
-- `review`: reviewer records the initial guarded snapshot, validation, and one or
-  more newly opened threads; routes to the owner.
-- `source_update`: reviewer replaces the guarded snapshot and explains why.
-  `thread_impacts` may be empty, comment on open threads, or reopen resolved
-  threads; `new_threads` may add sequential findings discovered in the new
-  source; routes to the owner.
-- `owner_reply`: owner supplies starting and completed snapshots, one reply for
-  every open thread, changed files, guide synchronization, and validation;
-  routes to the reviewer.
-- `reviewer_update`: reviewer decides every open thread using `resolve` or
-  `comment`, may `reopen` resolved threads, and may open sequential new threads;
-  at least one thread must remain open, then routing returns to the owner.
-- `final_review`: reviewer resolves every remaining open thread and approves the
-  current snapshot. With empty history, it may approve with no resolutions.
-- `owner_timeout`: reviewer records a missing owner reply two hours after the
-  latest reviewer event routing to the owner.
-- `reviewer_timeout`: owner records a missing reviewer decision 30 minutes after
-  the latest owner reply.
-
-### Owner Reply
-
-Every open thread appears exactly once:
+## Validation
 
 ```json
 {
-  "thread_id": "T1",
-  "decision": "applied",
-  "message": "Added validation before persistence.",
-  "evidence": "The focused validation test passes."
+  "performed": [
+    {
+      "check": "bounded metadata probe",
+      "result": "passed",
+      "evidence": {
+        "basis": "live_probe",
+        "provenance": "resource video-14195539; ffprobe 8.0",
+        "observed_at": "2026-07-25T03:00:00+00:00",
+        "sanitized_result": "One video and one audio representation observed."
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "check": "full media download",
+      "reason": "Intentionally bounded to ten seconds.",
+      "material": false
+    }
+  ]
 }
 ```
 
-`decision` is `applied`, `declined`, or `deferred/blocked`. A blocked reply also
-requires `blocker`, `completed_work`, `remaining_work`, and `validation_gap`.
-Owner replies never change thread resolution state.
+Record only checks actually performed. LGTM is invalid while any gap is
+material.
 
-### Reviewer Decision
+## Conversation Events
 
-`reviewer_update.decisions` addresses every currently open thread exactly once:
+- `review` opens initial sequential threads and routes to the owner.
+- `source_update` replaces the guarded snapshot, may comment/reopen threads or
+  add sequential threads, and routes to the owner.
+- `owner_reply` records starting/completed snapshots and replies exactly once to
+  every open thread; it never resolves.
+- `reviewer_update` comments on or resolves every open thread, may reopen
+  resolved threads or add new threads, and leaves at least one thread open.
+- `final_review` resolves every remaining open thread, or initially approves
+  with none.
+- `owner_timeout` and `reviewer_timeout` terminate their active handoff.
+
+An owner reply decision is `applied`, `declined`, or `deferred/blocked`.
+Blocked replies also require `blocker`, `completed_work`, `remaining_work`, and
+`validation_gap`.
+
+A reviewer may resolve a declined reply only with:
 
 ```json
 {
   "thread_id": "T1",
   "action": "resolve",
-  "message": "Verified through the public behavior test."
-}
-```
-
-Use `resolve` or `comment` for open threads. Use `reopen` only for an already
-resolved thread. When every open thread can be resolved, publish `final_review`
-instead of `reviewer_update`.
-
-### Source Update
-
-The reviewer may update source during either active routing state:
-
-```json
-{
-  "kind": "source_update",
-  "status": "OWNER ACTION REQUIRED",
-  "role": "Reviewer",
-  "submitted_at": "2026-07-24T03:00:00+00:00",
-  "source_snapshot": {},
-  "reason": "Added an omitted changed configuration file.",
-  "thread_impacts": [],
-  "new_threads": [],
-  "validation": {
-    "performed": [],
-    "unavailable": [],
-    "remaining_gaps": []
+  "message": "Verified through a different interface.",
+  "verification": {
+    "independent": true,
+    "evidence": {
+      "basis": "live_probe",
+      "provenance": "sanitized bounded probe",
+      "observed_at": "2026-07-25T03:05:00+00:00",
+      "sanitized_result": "The declined behavior is correct."
+    }
   }
 }
 ```
 
-An empty `thread_impacts` list is correct when the source basis changes without
-altering any conversation. A `reopen` impact must reference a resolved thread; a
-`comment` impact must reference an open thread. Use `new_threads` for findings
-discovered while inspecting the replacement source; IDs continue the global
-gap-free `T<N>` sequence.
+If independent verification is unavailable, use `comment`, record the exact
+unavailable check as a validation gap, and keep the thread open.
 
-## Source Snapshots and Validation
+## Publication and Operation
 
-Every guarded snapshot contains `revision`, `scope`, `fingerprint`,
-`exclusions`, and `additional_inputs`. Additional inputs record path, kind,
-mode, digest, and symlink target when applicable.
+`publish` writes a durable receipt before replacing canonical JSON. The receipt
+contains event ID, draft digest, base and intended canonical SHA-256, source
+fingerprint, and commit phase. Atomic canonical replacement is the sole commit
+point. Report generation, draft removal, lock release, and receipt removal are
+cleanup.
 
-Validation has this shape:
+Every publication result includes `status`, `committed`, current
+`canonical_sha256`, `event_id`, `lock_state`, and exact `recovery_action`.
+`precommit_failed` means canonical history did not change.
+`published_cleanup_required` means it did change. After any nonzero result,
+inspect canonical history first. Never retry an old SHA when the event is
+already present; run `recover-publish`. Recovery identifies the publication by
+event ID and receipt digest, regenerates the report, cleans the matching draft,
+and never appends a duplicate event.
 
-```json
-{
-  "performed": ["command and result"],
-  "unavailable": ["check and reason"],
-  "remaining_gaps": []
-}
-```
-
-Never claim checks that were not run.
-
-## State and Approval Invariants
-
-- `OWNER ACTION REQUIRED` always has at least one open thread.
-- `owner_reply` addresses every open thread but leaves them open.
-- `REVIEWER ACTION REQUIRED` follows a complete owner reply.
-- `source_update` may preserve, reopen, or add threads and routes to the owner.
-- `reviewer_update` addresses every open thread and leaves at least one open.
-- `final_review` resolves every remaining open thread against the current source.
-- `LGTM` has no open threads.
-- No event may follow LGTM or a timeout.
-
-## Latest Markdown Report
-
-Generate `.latest.md` from `.history[-1]` plus the derived open/resolved thread
-lists. Include event metadata, source identity, event-specific messages, and
-validation. Canonical JSON retains the complete conversation history.
-
-While holding the lock, regenerate a stale report with:
-
-```bash
-bash "$SKILL_DIR/scripts/review-json.sh" report REPO REVIEW_ID TOKEN
-```
-
-`report` retains the lock. Release it explicitly if no mutation follows.
+`inspect` derives one operation status: `clean`, `editing_draft`,
+`publication_committed`, `cleanup_required`, or `locked`. Without a matching
+token it reports `locked`, not ownership-specific assumptions. `clean` means
+canonical validation passes, report matches canonical, and no draft, receipt, or
+active lock exists.

@@ -1,9 +1,10 @@
-"""End-to-end test for the guarded schema-v2 command workflow."""
+"""End-to-end tests for publication, recovery, and lock behavior."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -11,17 +12,18 @@ from pathlib import Path
 from typing import Any
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "review-json.sh"
+LOCK_SCRIPT = Path(__file__).parents[1] / "scripts" / "review_lock.py"
 
 
-def run(*args: str, cwd: Path) -> str:
-    result = subprocess.run(
+def run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         [*args],
         cwd=cwd,
-        check=True,
+        check=check,
         capture_output=True,
         text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
-    return result.stdout
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -29,211 +31,216 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 class ReviewJsonCliTest(unittest.TestCase):
-    def test_review_owner_reply_and_final_approval(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            repo = Path(temporary)
-            run("git", "init", "-q", cwd=repo)
-            run("git", "config", "user.email", "review@example.com", cwd=repo)
-            run("git", "config", "user.name", "Review Test", cwd=repo)
-            (repo / ".gitignore").write_text(".local/\n")
-            source = repo / "example.txt"
-            source.write_text("before\n")
-            run("git", "add", ".gitignore", "example.txt", cwd=repo)
-            run("git", "commit", "-qm", "initial", cwd=repo)
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary.name)
+        run("git", "init", "-q", cwd=self.repo)
+        run("git", "config", "user.email", "review@example.com", cwd=self.repo)
+        run("git", "config", "user.name", "Review Test", cwd=self.repo)
+        (self.repo / ".gitignore").write_text(".local/\n")
+        (self.repo / "example.txt").write_text("before\n")
+        run("git", "add", ".gitignore", "example.txt", cwd=self.repo)
+        run("git", "commit", "-qm", "initial", cwd=self.repo)
+        output = run(
+            "bash", str(SCRIPT), "init", str(self.repo), "review", cwd=self.repo
+        ).stdout
+        self.review_id = next(
+            line.split(": ", 1)[1]
+            for line in output.splitlines()
+            if line.startswith("review_id: ")
+        )
+        base = self.repo / ".local" / "reviews" / self.review_id
+        self.review = base.with_suffix(".json").resolve()
+        self.event = base.with_suffix(".event.json").resolve()
+        self.report = base.with_suffix(".latest.md").resolve()
+        self.journal = base.with_suffix(".publish.json").resolve()
 
-            init_output = run(
-                "bash",
-                str(SCRIPT),
-                "init",
-                str(repo),
-                "thread-review",
-                cwd=repo,
-            )
-            review_id = next(
-                line.split(": ", 1)[1]
-                for line in init_output.splitlines()
-                if line.startswith("review_id: ")
-            )
-            review_path = repo / ".local" / "reviews" / f"{review_id}.json"
-            event_path = repo / ".local" / "reviews" / f"{review_id}.event.json"
-            report_path = repo / ".local" / "reviews" / f"{review_id}.latest.md"
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
 
-            initial_snapshot = json.loads(
-                run(
-                    "bash",
-                    str(SCRIPT),
-                    "snapshot",
-                    str(repo),
-                    "example.txt",
-                    cwd=repo,
-                )
-            )
-            token = self._acquire(repo, review_id)
+    def snapshot(self) -> dict[str, Any]:
+        return json.loads(
             run(
                 "bash",
                 str(SCRIPT),
-                "template",
-                str(repo),
-                review_id,
-                token,
-                "review",
-                cwd=repo,
-            )
-            review_event = json.loads(event_path.read_text())
-            review_event["source_snapshot"] = initial_snapshot
-            review_event["threads"][0].update(
-                {
-                    "title": "Update the example",
-                    "risk": "The old example remains visible.",
-                    "evidence": "example.txt still contains before.",
-                    "required_behavior": "Change the example to after.",
-                }
-            )
-            review_event["validation"]["performed"] = ["Initial inspection completed."]
-            write_json(event_path, review_event)
-            self._publish(
-                repo,
-                review_id,
-                token,
-                review_path,
-                initial_snapshot["fingerprint"],
-            )
-            document = json.loads(review_path.read_text())
-            self.assertEqual(document["state"]["marker"], "OWNER ACTION REQUIRED")
-            self.assertEqual(document["state"]["open_threads"], ["T1"])
+                "snapshot",
+                str(self.repo),
+                "example.txt",
+                cwd=self.repo,
+            ).stdout
+        )
 
-            token = self._acquire(repo, review_id)
-            source.write_text("after\n")
-            completed_snapshot = json.loads(
-                run(
-                    "bash",
-                    str(SCRIPT),
-                    "snapshot",
-                    str(repo),
-                    "example.txt",
-                    cwd=repo,
-                )
-            )
-            run(
-                "bash",
-                str(SCRIPT),
-                "template",
-                str(repo),
-                review_id,
-                token,
-                "owner_reply",
-                cwd=repo,
-            )
-            owner_event = json.loads(event_path.read_text())
-            owner_event.update(
-                {
-                    "starting_source_snapshot": initial_snapshot,
-                    "source_drift_assessment": "Only example.txt changed.",
-                    "completed_source_snapshot": completed_snapshot,
-                    "replies": [
-                        {
-                            "thread_id": "T1",
-                            "decision": "applied",
-                            "message": "Updated the example.",
-                            "evidence": "example.txt now contains after.",
-                        }
-                    ],
-                    "files_changed": ["example.txt"],
-                    "guide_synchronization": "No guide synchronization was needed.",
-                    "commits": [],
-                }
-            )
-            owner_event["validation"]["performed"] = ["Verified the updated content."]
-            write_json(event_path, owner_event)
-            self._publish(
-                repo,
-                review_id,
-                token,
-                review_path,
-                completed_snapshot["fingerprint"],
-            )
-            document = json.loads(review_path.read_text())
-            self.assertEqual(document["state"]["marker"], "REVIEWER ACTION REQUIRED")
-            self.assertEqual(document["state"]["open_threads"], ["T1"])
-
-            token = self._acquire(repo, review_id)
-            run(
-                "bash",
-                str(SCRIPT),
-                "template",
-                str(repo),
-                review_id,
-                token,
-                "final_review",
-                cwd=repo,
-            )
-            final_event = json.loads(event_path.read_text())
-            final_event.update(
-                {
-                    "source_snapshot": completed_snapshot,
-                    "resolutions": [
-                        {
-                            "thread_id": "T1",
-                            "message": "The updated source satisfies the requirement.",
-                        }
-                    ],
-                    "decision": "LGTM",
-                }
-            )
-            final_event["validation"]["performed"] = ["Final source inspection passed."]
-            write_json(event_path, final_event)
-            self._publish(
-                repo,
-                review_id,
-                token,
-                review_path,
-                completed_snapshot["fingerprint"],
-            )
-
-            document = json.loads(review_path.read_text())
-            self.assertEqual(document["schema_version"], 2)
-            self.assertEqual(document["state"]["marker"], "LGTM")
-            self.assertEqual(document["state"]["open_threads"], [])
-            self.assertEqual(document["state"]["resolved_threads"], ["T1"])
-            self.assertFalse(event_path.exists())
-            report = report_path.read_text()
-            self.assertIn("- Status: LGTM", report)
-            self.assertIn("- Resolved threads: T1", report)
-
-    @staticmethod
-    def _acquire(repo: Path, review_id: str) -> str:
+    def acquire(self) -> str:
         output = run(
             "bash",
             str(SCRIPT),
             "lock",
             "acquire",
-            str(repo),
-            review_id,
-            cwd=repo,
-        )
+            str(self.repo),
+            self.review_id,
+            cwd=self.repo,
+        ).stdout
         return json.loads(output)["token"]
 
-    @staticmethod
-    def _publish(
-        repo: Path,
-        review_id: str,
-        token: str,
-        review_path: Path,
-        source_fingerprint: str,
-    ) -> None:
-        review_sha = hashlib.sha256(review_path.read_bytes()).hexdigest()
+    def prepare_review(self, token: str, source: dict[str, Any]) -> str:
         run(
             "bash",
             str(SCRIPT),
-            "publish",
-            str(repo),
-            review_id,
+            "template",
+            str(self.repo),
+            self.review_id,
             token,
-            review_sha,
-            source_fingerprint,
-            "example.txt",
-            cwd=repo,
+            "review",
+            cwd=self.repo,
         )
+        event = json.loads(self.event.read_text())
+        event["source_snapshot"] = source
+        event["threads"][0].update(
+            {
+                "title": "Update example",
+                "risk": "Old result remains.",
+                "required_behavior": "Use the new result.",
+            }
+        )
+        event["threads"][0]["evidence"].update(
+            {
+                "provenance": "example.txt",
+                "sanitized_result": "The file contains the old value.",
+            }
+        )
+        event["validation"]["performed"] = [
+            {"check": "source inspection", "result": "passed"}
+        ]
+        write_json(self.event, event)
+        return event["event_id"]
+
+    def publish(
+        self, token: str, fingerprint: str, *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        digest = hashlib.sha256(self.review.read_bytes()).hexdigest()
+        return run(
+            "bash",
+            str(SCRIPT),
+            "publish",
+            str(self.repo),
+            self.review_id,
+            token,
+            digest,
+            fingerprint,
+            "example.txt",
+            cwd=self.repo,
+            check=check,
+        )
+
+    def test_publish_is_clean_and_inspect_exposes_workflow_and_operation(self) -> None:
+        source = self.snapshot()
+        token = self.acquire()
+        event_id = self.prepare_review(token, source)
+        result = json.loads(self.publish(token, source["fingerprint"]).stdout)
+        self.assertTrue(result["committed"])
+        self.assertEqual(result["event_id"], event_id)
+        self.assertFalse(self.event.exists())
+        self.assertFalse(self.journal.exists())
+        document = json.loads(self.review.read_text())
+        self.assertEqual(document["state"]["workflow"]["phase"], "owner_response")
+        inspected = run(
+            "bash",
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "example.txt",
+            cwd=self.repo,
+        ).stdout
+        self.assertIn('"status": "clean"', inspected)
+
+    def test_postcommit_cleanup_failure_is_recoverable_without_duplicate_append(
+        self,
+    ) -> None:
+        source = self.snapshot()
+        token = self.acquire()
+        event_id = self.prepare_review(token, source)
+        # Keep the lock active but make the publisher's token fail only at release.
+        # The canonical commit happens before release; recovery uses the true token.
+        owner_output = run(
+            "python3",
+            str(LOCK_SCRIPT),
+            "status",
+            "--repo",
+            str(self.repo),
+            "--review-file",
+            str(self.review),
+            cwd=self.repo,
+        ).stdout
+        self.assertIn("acquired_at", owner_output)
+        publisher = Path(__file__).parents[1] / "scripts" / "review_publish.py"
+        failed = run(
+            "python3",
+            str(publisher),
+            "publish",
+            "--repo",
+            str(self.repo),
+            "--review",
+            str(self.review),
+            "--event",
+            str(self.event),
+            "--report",
+            str(self.report),
+            "--journal",
+            str(self.journal),
+            "--state-script",
+            str(Path(__file__).parents[1] / "scripts" / "review_state.py"),
+            "--lock-script",
+            str(LOCK_SCRIPT),
+            "--token",
+            "wrong-token",
+            cwd=self.repo,
+            check=False,
+        )
+        result = json.loads(failed.stdout)
+        self.assertEqual(result["status"], "published_cleanup_required")
+        self.assertTrue(result["committed"])
+        self.assertTrue(self.journal.exists())
+        recovered = run(
+            "bash",
+            str(SCRIPT),
+            "recover-publish",
+            str(self.repo),
+            self.review_id,
+            token,
+            cwd=self.repo,
+        )
+        self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
+        history = json.loads(self.review.read_text())["history"]
+        self.assertEqual([item["event_id"] for item in history], [event_id])
+
+    def test_wrong_lock_token_does_not_damage_active_lock(self) -> None:
+        token = self.acquire()
+        failed = run(
+            "bash",
+            str(SCRIPT),
+            "lock",
+            "release",
+            str(self.repo),
+            self.review_id,
+            "wrong-token",
+            cwd=self.repo,
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        verified = run(
+            "python3",
+            str(LOCK_SCRIPT),
+            "verify",
+            "--repo",
+            str(self.repo),
+            "--review-file",
+            str(self.review),
+            "--token",
+            token,
+            cwd=self.repo,
+        )
+        self.assertIn("verified", verified.stdout)
 
 
 if __name__ == "__main__":

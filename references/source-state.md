@@ -42,8 +42,8 @@ bash "$SKILL_DIR/scripts/review-json.sh" inspect \
   path/to/source path/to/tests path/to/guide.md
 ```
 
-`inspect` prints artifact paths, derived routing state, canonical SHA-256, lock
-status, Git revision, and source fingerprint. The snapshot covers scoped staged
+`inspect` leads with projected workflow and derived operation status, then
+prints canonical SHA-256 and the source snapshot. The snapshot covers scoped staged
 and unstaged diffs, non-ignored untracked contents, and additional-input
 metadata. A symlink digest covers its resolved regular-file content and records
 its link target.
@@ -91,18 +91,38 @@ bash "$SKILL_DIR/scripts/review-json.sh" publish \
 ```
 
 `publish` verifies lock ownership, canonical and source identities, validates
-the event against immutable history, appends it, derives thread state,
-regenerates the report, removes the temporary event, and releases the lock.
+the event against immutable history, writes a durable receipt, and atomically
+replaces canonical JSON. Canonical replacement is the sole commit point. Report
+generation, draft removal, receipt removal, and tombstoned lock release are
+recoverable cleanup.
 
-If publication fails, preserve the event, release the held lock, and reassess:
+Every result reports `committed`. After any nonzero result, inspect canonical
+state before doing anything else. For `precommit_failed`, fix the problem and
+reuse the unchanged draft or release the lock. For
+`published_cleanup_required`, never retry the old canonical SHA; recover:
 
 ```bash
-bash "$SKILL_DIR/scripts/review-json.sh" lock release \
+bash "$SKILL_DIR/scripts/review-json.sh" recover-publish \
   REPO REVIEW_ID TOKEN
 ```
 
-Never remove another agent's lock or infer staleness from elapsed time. Lock
-status omits the release token; ask the user how to proceed.
+Recovery verifies the receipt event is already in canonical history, regenerates
+the report, removes only a matching draft, releases the matching lock, and
+removes the receipt without appending another event. If cleanup had already
+released the lock, omit `TOKEN`.
+
+Never remove another agent's lock or infer staleness from PID or elapsed time.
+Release atomically renames the active lock to a unique inactive tombstone before
+best-effort cleanup. Lock status omits the token; ask the user how to proceed.
+
+## Safe External Validation
+
+Prefer bounded metadata, HEAD/range, or short `ffprobe` probes. Record stable
+resource identity, observation time, tool version, and sanitized fields, counts,
+and outcome. A sanitized fixture may be an additional input; a raw signed
+response must not be. Never persist signed URLs, query tokens, cookies, raw
+headers or bodies, or an unredacted command in the event, report, receipt, or
+source snapshot.
 
 ## Source Changes After a Terminal Event
 

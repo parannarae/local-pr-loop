@@ -6,6 +6,7 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SNAPSHOT_SCRIPT="${SCRIPT_DIR}/source_snapshot.py"
 LOCK_SCRIPT="${SCRIPT_DIR}/review_lock.py"
 STATE_SCRIPT="${SCRIPT_DIR}/review_state.py"
+PUBLISH_SCRIPT="${SCRIPT_DIR}/review_publish.py"
 
 usage() {
     cat <<'EOF'
@@ -22,11 +23,12 @@ Usage:
   review-json.sh lock release REPO REVIEW_ID TOKEN
   review-json.sh publish REPO REVIEW_ID TOKEN REVIEW_SHA SOURCE_FINGERPRINT \
     [--exclude PATH] [--additional-input PATH] SCOPE...
+  review-json.sh recover-publish REPO REVIEW_ID [TOKEN]
 
 NAME must contain only lowercase letters, digits, and hyphens. init generates
 and prints a short random REVIEW_ID. Artifacts are always stored in
-REPO/.local/reviews as REVIEW_ID.json, REVIEW_ID.latest.md, and
-REVIEW_ID.event.json.
+REPO/.local/reviews as REVIEW_ID.json, REVIEW_ID.latest.md,
+REVIEW_ID.event.json, and a temporary REVIEW_ID.publish.json receipt.
 
 KIND is review, source_update, owner_reply, reviewer_update, final_review,
 reviewer_timeout, or owner_timeout.
@@ -78,6 +80,7 @@ set_review_paths() {
     REVIEW_JSON="${REVIEW_DIR}/${review_id}.json"
     LATEST_REPORT="${REVIEW_DIR}/${review_id}.latest.md"
     EVENT_JSON="${REVIEW_DIR}/${review_id}.event.json"
+    JOURNAL_JSON="${REVIEW_DIR}/${review_id}.publish.json"
 }
 
 new_review_id() {
@@ -162,7 +165,8 @@ init_review() {
         set_review_paths "${REPO_ROOT}" "${review_id}"
         if [[ ! -e "${REVIEW_JSON}" && ! -L "${REVIEW_JSON}" \
             && ! -e "${LATEST_REPORT}" && ! -L "${LATEST_REPORT}" \
-            && ! -e "${EVENT_JSON}" && ! -L "${EVENT_JSON}" ]]; then
+            && ! -e "${EVENT_JSON}" && ! -L "${EVENT_JSON}" \
+            && ! -e "${JOURNAL_JSON}" && ! -L "${JOURNAL_JSON}" ]]; then
             break
         fi
     done
@@ -195,14 +199,24 @@ inspect() {
     shift 2
     set_review_paths "${repo}" "${review_id}"
     validate_file "${REVIEW_JSON}" "${review_id}" >/dev/null
-    printf 'review_json: %s\nlatest_report: %s\nevent_json: %s\n' \
-        "${REVIEW_JSON}" "${LATEST_REPORT}" "${EVENT_JSON}"
-    printf '%s\n' 'state:'
+    printf 'review_json: %s\nlatest_report: %s\nevent_json: %s\njournal_json: %s\n' \
+        "${REVIEW_JSON}" "${LATEST_REPORT}" "${EVENT_JSON}" "${JOURNAL_JSON}"
+    printf '%s\n' 'workflow:'
     python3 "${STATE_SCRIPT}" state < "${REVIEW_JSON}"
     printf 'review_sha256: %s\n' "$(sha256_file "${REVIEW_JSON}")"
-    printf '%s\n' 'review_lock:'
-    python3 "${LOCK_SCRIPT}" status \
-        --repo "${REPO_ROOT}" --review-file "${REVIEW_JSON}"
+    local lock_status
+    lock_status="$(
+        python3 "${LOCK_SCRIPT}" status \
+            --repo "${REPO_ROOT}" --review-file "${REVIEW_JSON}"
+    )"
+    printf '%s\n' 'operation:'
+    python3 "${PUBLISH_SCRIPT}" operation \
+        --review "${REVIEW_JSON}" \
+        --event "${EVENT_JSON}" \
+        --report "${LATEST_REPORT}" \
+        --journal "${JOURNAL_JSON}" \
+        --state-script "${STATE_SCRIPT}" \
+        --lock-json "${lock_status}"
     printf '%s\n' 'source_snapshot:'
     snapshot "${REPO_ROOT}" "$@"
 }
@@ -218,6 +232,10 @@ template() {
         --repo "${REPO_ROOT}" --review-file "${REVIEW_JSON}" --token "${token}" >/dev/null
     if [[ -e "${EVENT_JSON}" || -L "${EVENT_JSON}" ]]; then
         printf 'event file already exists: %s\n' "${EVENT_JSON}" >&2
+        return 1
+    fi
+    if [[ -e "${JOURNAL_JSON}" || -L "${JOURNAL_JSON}" ]]; then
+        printf 'publication recovery is required first: %s\n' "${JOURNAL_JSON}" >&2
         return 1
     fi
     mkdir -p "${REVIEW_DIR}"
@@ -329,28 +347,36 @@ sys.exit(0 if matches else 1)
         fi
     fi
 
-    local next_review
-    local next_report
-    next_review="$(secure_temp "${REVIEW_JSON}")"
-    next_report="$(secure_temp "${LATEST_REPORT}")"
-    if ! python3 "${STATE_SCRIPT}" append-event "${EVENT_JSON}" \
-        < "${REVIEW_JSON}" > "${next_review}"; then
-        rm -f "${next_review}" "${next_report}"
-        return 1
+    python3 "${PUBLISH_SCRIPT}" publish \
+        --repo "${REPO_ROOT}" \
+        --review "${REVIEW_JSON}" \
+        --event "${EVENT_JSON}" \
+        --report "${LATEST_REPORT}" \
+        --journal "${JOURNAL_JSON}" \
+        --state-script "${STATE_SCRIPT}" \
+        --lock-script "${LOCK_SCRIPT}" \
+        --token "${token}"
+}
+
+recover_publish() {
+    local repo="$1"
+    local review_id="$2"
+    local token="${3:-}"
+    set_review_paths "${repo}" "${review_id}"
+    local arguments=(
+        recover
+        --repo "${REPO_ROOT}"
+        --review "${REVIEW_JSON}"
+        --event "${EVENT_JSON}"
+        --report "${LATEST_REPORT}"
+        --journal "${JOURNAL_JSON}"
+        --state-script "${STATE_SCRIPT}"
+        --lock-script "${LOCK_SCRIPT}"
+    )
+    if [[ -n "${token}" ]]; then
+        arguments+=(--token "${token}")
     fi
-    if ! validate_file "${next_review}" "${review_id}" >/dev/null; then
-        rm -f "${next_review}" "${next_report}"
-        return 1
-    fi
-    if ! python3 "${STATE_SCRIPT}" report < "${next_review}" > "${next_report}"; then
-        rm -f "${next_review}" "${next_report}"
-        return 1
-    fi
-    mv "${next_review}" "${REVIEW_JSON}"
-    mv "${next_report}" "${LATEST_REPORT}"
-    rm -f "${EVENT_JSON}"
-    python3 "${LOCK_SCRIPT}" release \
-        --repo "${REPO_ROOT}" --review-file "${REVIEW_JSON}" --token "${token}"
+    python3 "${PUBLISH_SCRIPT}" "${arguments[@]}"
 }
 
 main() {
@@ -403,6 +429,10 @@ main() {
         publish)
             [[ "$#" -ge 6 ]] || { usage >&2; return 2; }
             publish "$@"
+            ;;
+        recover-publish)
+            [[ "$#" -ge 2 && "$#" -le 3 ]] || { usage >&2; return 2; }
+            recover_publish "$@"
             ;;
         *)
             usage >&2

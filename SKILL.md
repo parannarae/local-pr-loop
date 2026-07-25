@@ -3,7 +3,7 @@ name: local-pr-loop
 description: Run owner or reviewer role in a repository-local JSON PR loop with durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and latest-event Markdown reports. Use for review exchanges without hosted PR comments that continue until every thread is resolved and the current source reaches LGTM.
 license: MIT
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Local PR Loop
@@ -12,9 +12,11 @@ Store each loop under the target repository's `.local/reviews/`. `init` returns
 a random `REVIEW_ID`. Each loop uses:
 
 - `REVIEW_ID.json`: canonical state and immutable event history;
-- `REVIEW_ID.latest.md`: generated report for the latest event; and
+- `REVIEW_ID.latest.md`: regenerable report cache;
 - `REVIEW_ID.event.json`: temporary event created by `template` and removed by
-  `publish`.
+  `publish`; and
+- `REVIEW_ID.publish.json`: durable publication receipt, present only while
+  cleanup or recovery remains.
 
 Keep the ID through handoffs. Never reuse another repository or worktree's
 artifacts or guess an ambiguous ID. Treat only canonical JSON as state; generate,
@@ -73,18 +75,15 @@ findings discovered in the replacement source as sequential new threads.
 
 ## Role and Routing
 
-Route strictly on `.state.marker`:
+Run `inspect` and route on `.state.workflow`. Read `phase`, `primary_actor`,
+`primary_action`, and `allowed_events_by_actor` together. The primary actor owns
+the main handoff, but another actor may still publish an explicitly allowed
+`source_update` or timeout event. Never infer exclusivity from `primary_actor`.
 
-| Marker | Next action |
-| --- | --- |
-| `AWAITING REVIEW` | Reviewer: publish `review` or an initial `final_review`. |
-| `OWNER ACTION REQUIRED` | Owner: reply to every open thread. |
-| `REVIEWER ACTION REQUIRED` | Reviewer: verify source and decide every open thread. |
-| `LGTM` or either timeout | Stop. |
-
-Wait unless the assigned role owns the turn. A reviewer may publish
-`source_update` during either active marker when the reviewed source basis must
-change.
+Treat `awaiting_initial_review`, `owner_response`, `reviewer_verification`, and
+`terminal` as the only workflow phases. Treat `operation.status` as local
+artifact condition, not workflow state. Operation status is derived and never
+written to canonical history.
 
 After a terminal event, treat later source changes as unreviewed. Leave terminal
 history immutable, start a new review ID, and mention the prior ID in the
@@ -100,8 +99,11 @@ handoff.
 5. Create the event with `template REPO REVIEW_ID TOKEN KIND`.
 6. Populate the event, run `validate-event`, then repeat `inspect` under lock.
 7. Run `publish` with the final inspection's exact hashes and unchanged scope.
-8. Check the latest report. Release a retained lock after failures, and reinspect
-   every five minutes while following the recorded timeout clock.
+8. Read the structured publication result. After any nonzero result, inspect
+   canonical state first. If `committed` is true or the event is latest, never
+   retry the old SHA; run `recover-publish`.
+9. Check the latest report. Release a retained lock only after a precommit
+   failure. Reinspect every five minutes while following the recorded timeout.
 
 Use priorities consistently:
 
@@ -120,15 +122,35 @@ Use priorities consistently:
 - Record timezone-aware ISO 8601 timestamps. Base owner timeout on the latest
   reviewer event routing to the owner and reviewer timeout on the latest owner
   reply.
+- Keep `event_id` unique and `occurred_at` strictly increasing.
+- For external-contract P1/P2 findings, record `live_probe`,
+  `captured_fixture`, or `authoritative_contract` evidence with provenance,
+  observation time, and sanitized result. A synthetic counterexample alone is
+  insufficient.
+- Mark every validation gap `material: true|false`. Never publish LGTM with a
+  material gap.
+- Resolve an owner's declined thread only after independent reviewer
+  verification. If that check is unavailable, comment with the exact unavailable
+  check and leave the thread open.
+- Bound network and media probes by metadata, HEAD/range, or short `ffprobe`
+  checks. Record stable resource IDs, observation time, tool version, and
+  sanitized fields/counts/results. Never persist signed URLs, query tokens,
+  cookies, raw headers or bodies, or unredacted commands.
 - Include relevant ignored or generated source inputs with `--additional-input`.
 - Never run loops with overlapping guarded scopes concurrently in one worktree.
 - Preserve unrelated changes; lock before changing state, event, or source.
 - Never publish stale hashes, claim unperformed validation, expose secrets, or
-  continue after a terminal marker.
+  continue after a terminal phase.
+- Treat canonical JSON as authoritative if it disagrees with a draft, receipt,
+  report, terminal output, or another agent. The report is only a cache.
+- Never break a lock using PID or elapsed age. Lock status deliberately omits its
+  token.
 - On ambiguity, another agent's lock, or material unexplained drift, stop rather
   than guessing or repairing canonical JSON manually.
 
-## Legacy Reviews
+## Unsupported Revisions
 
-Preserve existing Markdown or YAML reviews verbatim. Do not translate legacy
-history or start a competing overlapping loop without user authorization.
+Preserve old artifacts verbatim but do not migrate or edit them. This
+pre-1.0 skill accepts only its current calendar `format_revision`; initialize a
+new review ID when validation reports an unsupported revision. Do not start a
+competing overlapping loop without user authorization.
