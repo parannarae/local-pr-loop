@@ -42,8 +42,9 @@ bash "$SKILL_DIR/scripts/review-json.sh" inspect \
   path/to/source path/to/tests path/to/guide.md
 ```
 
-`inspect` leads with projected workflow and derived operation status, then
-prints canonical SHA-256 and the source snapshot. The snapshot covers scoped staged
+`inspect` leads with a role-aware action dashboard and one exact recommended
+command. Add `--json` immediately after `REVIEW_ID` for the equivalent stable
+agent view. The snapshot covers scoped staged
 and unstaged diffs, non-ignored untracked contents, and additional-input
 metadata. A symlink digest covers its resolved regular-file content and records
 its link target.
@@ -61,22 +62,33 @@ or changing declared source:
 
 ```bash
 bash "$SKILL_DIR/scripts/review-json.sh" lock acquire REPO REVIEW_ID
+bash "$SKILL_DIR/scripts/review-json.sh" inspect REPO REVIEW_ID SCOPE...
 ```
 
-A reviewer making no source change may analyze first, but must acquire the lock
+Acquisition creates a permission-restricted local lease and prints no token.
+The second inspection creates an opaque guard containing the canonical and
+source identities. A reviewer may analyze first, but must acquire and inspect
 before `template`.
 
 ## Prepare and Validate an Event
 
 ```bash
 bash "$SKILL_DIR/scripts/review-json.sh" template \
-  REPO REVIEW_ID TOKEN owner_reply
+  REPO REVIEW_ID owner_reply
 
 bash "$SKILL_DIR/scripts/review-json.sh" validate-event REPO REVIEW_ID
 ```
 
-Populate only the generated `.event.json`. Repeat `inspect` while holding the
-lock and retain its exact canonical hash and source fingerprint.
+The template prepopulates guarded snapshots and every role-required thread/gap
+entry. Populate only its remaining blanks. Use:
+
+```bash
+bash "$SKILL_DIR/scripts/review-json.sh" threads REPO REVIEW_ID --json
+bash "$SKILL_DIR/scripts/review-json.sh" add-check \
+  REPO REVIEW_ID passed "focused tests"
+bash "$SKILL_DIR/scripts/review-json.sh" add-gap \
+  REPO REVIEW_ID "live probe" "service unavailable" --material
+```
 
 Use the event kind and fields defined in
 [review-schema.md](review-schema.md).
@@ -85,14 +97,14 @@ Use the event kind and fields defined in
 
 ```bash
 bash "$SKILL_DIR/scripts/review-json.sh" publish \
-  REPO REVIEW_ID TOKEN REVIEW_SHA SOURCE_FINGERPRINT \
-  --additional-input path/to/ignored-generated-config \
-  path/to/source path/to/tests path/to/guide.md
+  REPO REVIEW_ID
 ```
 
-`publish` verifies lock ownership, canonical and source identities, validates
-the event against immutable history, writes a durable receipt, and atomically
-replaces canonical JSON. Canonical replacement is the sole commit point. Report
+`publish` returns structured results for lock, canonical/source drift, draft,
+snapshot, commit, and cleanup failures. It verifies lock ownership before
+preflight and again immediately before writing, validates canonical and source
+identities and the event against immutable history, writes a durable receipt,
+and atomically replaces canonical JSON. Canonical replacement is the sole commit point. Report
 generation, draft removal, receipt removal, and tombstoned lock release are
 recoverable cleanup.
 
@@ -103,17 +115,40 @@ reuse the unchanged draft or release the lock. For
 
 ```bash
 bash "$SKILL_DIR/scripts/review-json.sh" recover-publish \
-  REPO REVIEW_ID TOKEN
+  REPO REVIEW_ID
 ```
 
-Recovery verifies the receipt event is already in canonical history, regenerates
-the report, removes only a matching draft, releases the matching lock, and
-removes the receipt without appending another event. If cleanup had already
-released the lock, omit `TOKEN`.
+For a prepared precommit receipt, recovery verifies the base canonical SHA and
+draft digest, then aborts the preparation without publishing; retain the lock,
+reinspect, and publish with fresh guards. For a committed receipt, recovery
+verifies the event in canonical history, regenerates the report, removes only a
+matching draft, releases the matching lock, and removes the receipt without
+appending another event. If cleanup had already released the lock, recovery
+detects the unlocked state without requiring a lease.
 
 Never remove another agent's lock or infer staleness from PID or elapsed time.
 Release atomically renames the active lock to a unique inactive tombstone before
 best-effort cleanup. Lock status omits the token; ask the user how to proceed.
+
+## Waiting, Timeouts, and Follow-ups
+
+Wait without polling manually:
+
+```bash
+bash "$SKILL_DIR/scripts/review-json.sh" wait REPO REVIEW_ID 300
+```
+
+The command returns on canonical change, the active handoff deadline, or its
+bounded timeout. Publish a timeout only when eligible:
+
+```bash
+bash "$SKILL_DIR/scripts/review-json.sh" publish-timeout \
+  REPO REVIEW_ID --if-eligible
+```
+
+Terminal inspection compares current source with the approved fingerprint. When
+`approval_stale` is true, use its recommended `start-follow-up` command. The new
+canonical document records `prior_review_id`; terminal history remains immutable.
 
 ## Safe External Validation
 

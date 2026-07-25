@@ -70,7 +70,7 @@ class ReviewJsonCliTest(unittest.TestCase):
             ).stdout
         )
 
-    def acquire(self) -> str:
+    def acquire(self) -> None:
         output = run(
             "bash",
             str(SCRIPT),
@@ -80,16 +80,28 @@ class ReviewJsonCliTest(unittest.TestCase):
             self.review_id,
             cwd=self.repo,
         ).stdout
-        return json.loads(output)["token"]
+        self.assertNotIn("token", output)
+        self.assertEqual(json.loads(output)["status"], "acquired")
+        lease = self.repo / ".local" / "reviews" / f"{self.review_id}.lease.json"
+        self.assertEqual(lease.stat().st_mode & 0o777, 0o600)
 
-    def prepare_review(self, token: str, source: dict[str, Any]) -> str:
+    def prepare_review(self, source: dict[str, Any]) -> str:
+        run(
+            "bash",
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "--json",
+            "example.txt",
+            cwd=self.repo,
+        )
         run(
             "bash",
             str(SCRIPT),
             "template",
             str(self.repo),
             self.review_id,
-            token,
             "review",
             cwd=self.repo,
         )
@@ -114,33 +126,29 @@ class ReviewJsonCliTest(unittest.TestCase):
         write_json(self.event, event)
         return event["event_id"]
 
-    def publish(
-        self, token: str, fingerprint: str, *, check: bool = True
-    ) -> subprocess.CompletedProcess[str]:
-        digest = hashlib.sha256(self.review.read_bytes()).hexdigest()
+    def publish(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return run(
             "bash",
             str(SCRIPT),
             "publish",
             str(self.repo),
             self.review_id,
-            token,
-            digest,
-            fingerprint,
-            "example.txt",
             cwd=self.repo,
             check=check,
         )
 
     def test_publish_is_clean_and_inspect_exposes_workflow_and_operation(self) -> None:
         source = self.snapshot()
-        token = self.acquire()
-        event_id = self.prepare_review(token, source)
-        result = json.loads(self.publish(token, source["fingerprint"]).stdout)
+        self.acquire()
+        event_id = self.prepare_review(source)
+        result = json.loads(self.publish().stdout)
         self.assertTrue(result["committed"])
         self.assertEqual(result["event_id"], event_id)
         self.assertFalse(self.event.exists())
         self.assertFalse(self.journal.exists())
+        self.assertFalse(
+            (self.repo / ".local" / "reviews" / f"{self.review_id}.lease.json").exists()
+        )
         document = json.loads(self.review.read_text())
         self.assertEqual(document["state"]["workflow"]["phase"], "owner_response")
         inspected = run(
@@ -149,30 +157,32 @@ class ReviewJsonCliTest(unittest.TestCase):
             "inspect",
             str(self.repo),
             self.review_id,
+            "--json",
             "example.txt",
             cwd=self.repo,
         ).stdout
         self.assertIn('"status": "clean"', inspected)
+        dashboard = json.loads(inspected)
+        self.assertIn("lock acquire", dashboard["recommended_next_command"])
+        conversations = json.loads(
+            run(
+                "bash",
+                str(SCRIPT),
+                "threads",
+                str(self.repo),
+                self.review_id,
+                "--json",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(conversations[0]["thread"]["id"], "T1")
 
-    def test_postcommit_cleanup_failure_is_recoverable_without_duplicate_append(
+    def test_direct_publish_with_wrong_token_is_structured_precommit_failure(
         self,
     ) -> None:
         source = self.snapshot()
-        token = self.acquire()
-        event_id = self.prepare_review(token, source)
-        # Keep the lock active but make the publisher's token fail only at release.
-        # The canonical commit happens before release; recovery uses the true token.
-        owner_output = run(
-            "python3",
-            str(LOCK_SCRIPT),
-            "status",
-            "--repo",
-            str(self.repo),
-            "--review-file",
-            str(self.review),
-            cwd=self.repo,
-        ).stdout
-        self.assertIn("acquired_at", owner_output)
+        self.acquire()
+        event_id = self.prepare_review(source)
         publisher = Path(__file__).parents[1] / "scripts" / "review_publish.py"
         failed = run(
             "python3",
@@ -192,30 +202,40 @@ class ReviewJsonCliTest(unittest.TestCase):
             str(Path(__file__).parents[1] / "scripts" / "review_state.py"),
             "--lock-script",
             str(LOCK_SCRIPT),
+            "--snapshot-script",
+            str(Path(__file__).parents[1] / "scripts" / "source_snapshot.py"),
             "--token",
             "wrong-token",
+            "--expected-review-sha",
+            hashlib.sha256(self.review.read_bytes()).hexdigest(),
+            "--expected-source-fingerprint",
+            source["fingerprint"],
+            "--",
+            "example.txt",
             cwd=self.repo,
             check=False,
         )
         result = json.loads(failed.stdout)
-        self.assertEqual(result["status"], "published_cleanup_required")
-        self.assertTrue(result["committed"])
-        self.assertTrue(self.journal.exists())
-        recovered = run(
+        self.assertEqual(result["status"], "precommit_failed")
+        self.assertFalse(result["committed"])
+        self.assertFalse(self.journal.exists())
+        history = json.loads(self.review.read_text())["history"]
+        self.assertEqual(history, [])
+        self.assertEqual(json.loads(self.event.read_text())["event_id"], event_id)
+        run(
             "bash",
             str(SCRIPT),
-            "recover-publish",
+            "lock",
+            "release",
             str(self.repo),
             self.review_id,
-            token,
             cwd=self.repo,
         )
-        self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
-        history = json.loads(self.review.read_text())["history"]
-        self.assertEqual([item["event_id"] for item in history], [event_id])
 
     def test_wrong_lock_token_does_not_damage_active_lock(self) -> None:
-        token = self.acquire()
+        self.acquire()
+        lease_path = self.repo / ".local" / "reviews" / f"{self.review_id}.lease.json"
+        token = json.loads(lease_path.read_text())["token"]
         failed = run(
             "bash",
             str(SCRIPT),

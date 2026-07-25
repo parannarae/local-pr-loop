@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 FORMAT = "local-pr-loop"
-FORMAT_REVISION = "2026-07-25.1"
+FORMAT_REVISION = "2026-07-25.2"
 CREATOR_VERSION = "0.3.0"
 
 ACTOR_BY_KIND = {
@@ -55,6 +55,7 @@ EXTERNAL_EVIDENCE_BASES = {
     "authoritative_contract",
 }
 THREAD_ID_PATTERN = re.compile(r"^T([1-9][0-9]*)$")
+GAP_ID_PATTERN = re.compile(r"^G([1-9][0-9]*)$")
 EVENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{11,63}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
@@ -86,6 +87,17 @@ def load_json() -> Any:
 def require(errors: list[str], condition: bool, message: str) -> None:
     if not condition:
         errors.append(message)
+
+
+def reject_unknown(
+    errors: list[str], value: dict[str, Any], allowed: set[str], prefix: str
+) -> None:
+    unknown = sorted(set(value) - allowed)
+    require(
+        errors,
+        not unknown,
+        f"{prefix} contains unknown fields: {', '.join(unknown)}",
+    )
 
 
 def parse_timestamp(errors: list[str], value: Any, prefix: str) -> datetime | None:
@@ -120,6 +132,21 @@ def validate_snapshot(
     require(errors, isinstance(snapshot, dict), f"{prefix} must be a mapping")
     if not isinstance(snapshot, dict):
         return
+    reject_unknown(
+        errors,
+        snapshot,
+        {
+            "revision",
+            "scope",
+            "fingerprint",
+            "exclusions",
+            "additional_inputs",
+            "staged_sha256",
+            "unstaged_sha256",
+            "untracked",
+        },
+        prefix,
+    )
     require(
         errors,
         isinstance(snapshot.get("revision"), str)
@@ -142,6 +169,12 @@ def validate_snapshot(
             require(errors, isinstance(item, dict), f"{item_prefix} must be a mapping")
             if not isinstance(item, dict):
                 continue
+            reject_unknown(
+                errors,
+                item,
+                {"path", "kind", "mode", "sha256", "link_target"},
+                item_prefix,
+            )
             path = item.get("path")
             require(
                 errors,
@@ -186,6 +219,37 @@ def validate_snapshot(
             and bool(SHA256_PATTERN.fullmatch(snapshot["fingerprint"])),
             f"{prefix}.fingerprint must be lowercase SHA-256",
         )
+        for key in ("staged_sha256", "unstaged_sha256"):
+            require(
+                errors,
+                isinstance(snapshot.get(key), str)
+                and bool(SHA256_PATTERN.fullmatch(snapshot[key])),
+                f"{prefix}.{key} must be lowercase SHA-256",
+            )
+        untracked = snapshot.get("untracked")
+        require(
+            errors, isinstance(untracked, list), f"{prefix}.untracked must be a list"
+        )
+        if isinstance(untracked, list):
+            for index, item in enumerate(untracked):
+                item_prefix = f"{prefix}.untracked[{index}]"
+                require(
+                    errors, isinstance(item, dict), f"{item_prefix} must be a mapping"
+                )
+                if not isinstance(item, dict):
+                    continue
+                reject_unknown(
+                    errors,
+                    item,
+                    {"path", "kind", "mode", "sha256", "link_target"},
+                    item_prefix,
+                )
+                for key in ("path", "kind", "mode", "sha256"):
+                    require(
+                        errors,
+                        isinstance(item.get(key), str) and bool(item[key]),
+                        f"{item_prefix}.{key} must be a non-empty string",
+                    )
 
 
 def snapshot_identity(snapshot: Any) -> dict[str, Any] | None:
@@ -213,6 +277,12 @@ def validate_evidence(errors: list[str], value: Any, prefix: str) -> None:
     require(errors, isinstance(value, dict), f"{prefix} must be a mapping")
     if not isinstance(value, dict):
         return
+    reject_unknown(
+        errors,
+        value,
+        {"basis", "provenance", "observed_at", "sanitized_result", "artifact_digest"},
+        prefix,
+    )
     require(
         errors,
         value.get("basis") in EVIDENCE_BASES,
@@ -232,12 +302,19 @@ def validate_evidence(errors: list[str], value: Any, prefix: str) -> None:
         or (isinstance(digest, str) and bool(SHA256_PATTERN.fullmatch(digest))),
         f"{prefix}.artifact_digest must be lowercase SHA-256 when present",
     )
+    if value.get("basis") == "captured_fixture":
+        require(
+            errors,
+            isinstance(digest, str) and bool(SHA256_PATTERN.fullmatch(digest)),
+            f"{prefix}.artifact_digest is required for captured_fixture",
+        )
 
 
 def validate_validation(errors: list[str], value: Any, prefix: str) -> None:
     require(errors, isinstance(value, dict), f"{prefix} must be a mapping")
     if not isinstance(value, dict):
         return
+    reject_unknown(errors, value, {"performed", "gaps"}, prefix)
     performed = value.get("performed")
     gaps = value.get("gaps")
     require(errors, isinstance(performed, list), f"{prefix}.performed must be a list")
@@ -247,6 +324,7 @@ def validate_validation(errors: list[str], value: Any, prefix: str) -> None:
             require(errors, isinstance(check, dict), f"{item_prefix} must be a mapping")
             if not isinstance(check, dict):
                 continue
+            reject_unknown(errors, check, {"check", "result", "evidence"}, item_prefix)
             require(
                 errors,
                 isinstance(check.get("check"), str) and bool(check["check"]),
@@ -266,6 +344,15 @@ def validate_validation(errors: list[str], value: Any, prefix: str) -> None:
             require(errors, isinstance(gap, dict), f"{item_prefix} must be a mapping")
             if not isinstance(gap, dict):
                 continue
+            reject_unknown(
+                errors, gap, {"gap_id", "check", "reason", "material"}, item_prefix
+            )
+            require(
+                errors,
+                isinstance(gap.get("gap_id"), str)
+                and bool(GAP_ID_PATTERN.fullmatch(gap["gap_id"])),
+                f"{item_prefix}.gap_id must match G<N>",
+            )
             for key in ("check", "reason"):
                 require(
                     errors,
@@ -277,12 +364,40 @@ def validate_validation(errors: list[str], value: Any, prefix: str) -> None:
                 type(gap.get("material")) is bool,
                 f"{item_prefix}.material must be boolean",
             )
+    if isinstance(performed, list) and isinstance(gaps, list):
+        material_checks = {
+            gap.get("check")
+            for gap in gaps
+            if isinstance(gap, dict) and gap.get("material") is True
+        }
+        for index, check in enumerate(performed):
+            if isinstance(check, dict) and check.get("result") == "failed":
+                require(
+                    errors,
+                    check.get("check") in material_checks,
+                    f"{prefix}.performed[{index}]: failed check requires a matching "
+                    "material validation gap",
+                )
 
 
 def validate_thread(errors: list[str], thread: Any, prefix: str) -> None:
     require(errors, isinstance(thread, dict), f"{prefix} must be a mapping")
     if not isinstance(thread, dict):
         return
+    reject_unknown(
+        errors,
+        thread,
+        {
+            "id",
+            "priority",
+            "contract",
+            "title",
+            "risk",
+            "evidence",
+            "required_behavior",
+        },
+        prefix,
+    )
     thread_id = thread.get("id")
     require(
         errors,
@@ -331,6 +446,10 @@ def validate_action(
     require(errors, isinstance(action, dict), f"{prefix} must be a mapping")
     if not isinstance(action, dict):
         return
+    allowed_fields = {"thread_id", "message", "action"}
+    if resolution:
+        allowed_fields.add("verification")
+    reject_unknown(errors, action, allowed_fields, prefix)
     thread_id = action.get("thread_id")
     require(
         errors,
@@ -356,6 +475,12 @@ def validate_action(
             f"{prefix}.verification must be a mapping",
         )
         if isinstance(verification, dict):
+            reject_unknown(
+                errors,
+                verification,
+                {"independent", "evidence"},
+                f"{prefix}.verification",
+            )
             require(
                 errors,
                 verification.get("independent") is True,
@@ -375,6 +500,48 @@ def validate_event(event: Any) -> list[str]:
     require(errors, kind in ACTOR_BY_KIND, f"unsupported event kind: {kind}")
     if kind not in ACTOR_BY_KIND:
         return errors
+    allowed_by_kind = {
+        "review": {"source_snapshot", "threads", "validation"},
+        "source_update": {
+            "source_snapshot",
+            "reason",
+            "thread_impacts",
+            "new_threads",
+            "validation",
+        },
+        "owner_reply": {
+            "starting_source_snapshot",
+            "source_drift_assessment",
+            "completed_source_snapshot",
+            "replies",
+            "files_changed",
+            "guide_synchronization",
+            "validation",
+            "commits",
+        },
+        "reviewer_update": {
+            "source_snapshot",
+            "decisions",
+            "new_threads",
+            "gap_resolutions",
+            "validation",
+        },
+        "final_review": {
+            "source_snapshot",
+            "resolutions",
+            "gap_resolutions",
+            "decision",
+            "validation",
+        },
+        "reviewer_timeout": {"reason", "started_at", "deadline"},
+        "owner_timeout": {"reason", "started_at", "deadline"},
+    }
+    reject_unknown(
+        errors,
+        event,
+        {"event_id", "kind", "occurred_at"} | allowed_by_kind[kind],
+        "event",
+    )
     require(
         errors,
         isinstance(event.get("event_id"), str)
@@ -438,7 +605,36 @@ def validate_event(event: Any) -> list[str]:
         if isinstance(replies, list):
             for index, reply in enumerate(replies):
                 prefix = f"replies[{index}]"
-                validate_action(errors, reply, prefix, set())
+                require(errors, isinstance(reply, dict), f"{prefix} must be a mapping")
+                if not isinstance(reply, dict):
+                    continue
+                reject_unknown(
+                    errors,
+                    reply,
+                    {
+                        "thread_id",
+                        "decision",
+                        "message",
+                        "evidence",
+                        "blocker",
+                        "completed_work",
+                        "remaining_work",
+                        "validation_gap",
+                    },
+                    prefix,
+                )
+                thread_id = reply.get("thread_id")
+                require(
+                    errors,
+                    isinstance(thread_id, str)
+                    and bool(THREAD_ID_PATTERN.fullmatch(thread_id)),
+                    f"{prefix}.thread_id must match T<N>",
+                )
+                require(
+                    errors,
+                    isinstance(reply.get("message"), str) and bool(reply["message"]),
+                    f"{prefix}.message must be a non-empty string",
+                )
                 require(
                     errors,
                     reply.get("decision")
@@ -524,6 +720,61 @@ def validate_event(event: Any) -> list[str]:
             require(
                 errors, occurred >= deadline, f"{kind} occurred before its deadline"
             )
+    if kind in {"reviewer_update", "final_review"}:
+        gap_resolutions = event.get("gap_resolutions")
+        require(
+            errors,
+            isinstance(gap_resolutions, list),
+            "gap_resolutions must be a list",
+        )
+        if isinstance(gap_resolutions, list):
+            for index, resolution in enumerate(gap_resolutions):
+                prefix = f"gap_resolutions[{index}]"
+                require(
+                    errors, isinstance(resolution, dict), f"{prefix} must be a mapping"
+                )
+                if not isinstance(resolution, dict):
+                    continue
+                reject_unknown(
+                    errors, resolution, {"gap_id", "message", "evidence"}, prefix
+                )
+                require(
+                    errors,
+                    isinstance(resolution.get("gap_id"), str)
+                    and bool(GAP_ID_PATTERN.fullmatch(resolution["gap_id"])),
+                    f"{prefix}.gap_id must match G<N>",
+                )
+                require(
+                    errors,
+                    isinstance(resolution.get("message"), str)
+                    and bool(resolution["message"]),
+                    f"{prefix}.message must be a non-empty string",
+                )
+                validate_evidence(
+                    errors, resolution.get("evidence"), f"{prefix}.evidence"
+                )
+
+    event_timestamp = parse_timestamp(errors, event.get("occurred_at"), "occurred_at")
+
+    def check_evidence_times(value: Any, prefix: str) -> None:
+        if isinstance(value, dict):
+            if {"basis", "provenance", "observed_at", "sanitized_result"} <= set(value):
+                observed = parse_timestamp(
+                    errors, value.get("observed_at"), f"{prefix}.observed_at"
+                )
+                if observed and event_timestamp:
+                    require(
+                        errors,
+                        observed <= event_timestamp,
+                        f"{prefix}.observed_at must not follow event.occurred_at",
+                    )
+            for key, item in value.items():
+                check_evidence_times(item, f"{prefix}.{key}")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                check_evidence_times(item, f"{prefix}[{index}]")
+
+    check_evidence_times(event, "event")
     return errors
 
 
@@ -568,6 +819,7 @@ def default_state() -> dict[str, Any]:
         "workflow": workflow_for(None, None),
         "source_fingerprint": None,
         "threads": {"open": [], "resolved": []},
+        "validation_gaps": {"open": [], "resolved": []},
         "latest_event": None,
         "terminal": None,
     }
@@ -601,6 +853,8 @@ def project_history(
     latest_kind: str | None = None
     latest_event: dict[str, Any] | None = None
     event_ids: set[str] = set()
+    gaps: dict[str, dict[str, Any]] = {}
+    next_gap = 1
 
     def add_threads(items: Any, prefix: str) -> None:
         nonlocal next_thread
@@ -664,6 +918,45 @@ def project_history(
 
         open_ids = {key for key, value in threads.items() if value["status"] == "open"}
         resolved_ids = set(threads) - open_ids
+        validation = event.get("validation")
+        event_gaps = validation.get("gaps") if isinstance(validation, dict) else []
+        if isinstance(event_gaps, list):
+            for gap_index, gap in enumerate(event_gaps):
+                if not isinstance(gap, dict):
+                    continue
+                gap_id = gap.get("gap_id")
+                expected = f"G{next_gap}"
+                require(
+                    errors,
+                    gap_id == expected,
+                    f"{prefix}.validation.gaps[{gap_index}].gap_id must be {expected}",
+                )
+                if isinstance(gap_id, str) and GAP_ID_PATTERN.fullmatch(gap_id):
+                    require(
+                        errors,
+                        gap_id not in gaps,
+                        f"{prefix}.validation.gaps[{gap_index}].gap_id is duplicated",
+                    )
+                    gaps[gap_id] = {**gap, "status": "open"}
+                    next_gap += 1
+        if kind in {"reviewer_update", "final_review"}:
+            resolutions = event.get("gap_resolutions", [])
+            resolution_ids = [
+                item.get("gap_id") for item in resolutions if isinstance(item, dict)
+            ]
+            require(
+                errors,
+                len(resolution_ids) == len(set(resolution_ids)),
+                f"{prefix}: gap resolution IDs must be unique",
+            )
+            for gap_id in resolution_ids:
+                require(
+                    errors,
+                    gap_id in gaps and gaps[gap_id]["status"] == "open",
+                    f"{prefix}: gap resolution references a non-open gap",
+                )
+                if gap_id in gaps:
+                    gaps[gap_id]["status"] = "resolved"
         if kind == "review":
             add_threads(event.get("threads"), f"{prefix}.threads")
             current_snapshot = event.get("source_snapshot")
@@ -813,10 +1106,23 @@ def project_history(
                 )
                 handoff_started_at = event.get("occurred_at")
             else:
+                failed_checks = [
+                    item
+                    for item in event.get("validation", {}).get("performed", [])
+                    if isinstance(item, dict) and item.get("result") == "failed"
+                ]
+                require(
+                    errors, not failed_checks, f"{prefix}: LGTM forbids failed checks"
+                )
+                open_material_gaps = {
+                    gap_id
+                    for gap_id, gap in gaps.items()
+                    if gap["status"] == "open" and gap.get("material") is True
+                }
                 require(
                     errors,
-                    not material_gaps(event),
-                    f"{prefix}: LGTM forbids material gaps",
+                    not open_material_gaps,
+                    f"{prefix}: LGTM forbids unresolved material gaps",
                 )
                 require(
                     errors,
@@ -857,6 +1163,16 @@ def project_history(
             "open": sorted_thread_ids(open_ids),
             "resolved": sorted_thread_ids(set(threads) - open_ids),
         },
+        "validation_gaps": {
+            "open": sorted(
+                (gap_id for gap_id, gap in gaps.items() if gap["status"] == "open"),
+                key=lambda value: int(GAP_ID_PATTERN.fullmatch(value).group(1)),
+            ),
+            "resolved": sorted(
+                (gap_id for gap_id, gap in gaps.items() if gap["status"] == "resolved"),
+                key=lambda value: int(GAP_ID_PATTERN.fullmatch(value).group(1)),
+            ),
+        },
         "latest_event": latest_event,
         "terminal": terminal,
     }
@@ -868,6 +1184,21 @@ def validate_document(document: Any) -> list[str]:
     require(errors, isinstance(document, dict), "document must be a mapping")
     if not isinstance(document, dict):
         return errors
+    reject_unknown(
+        errors,
+        document,
+        {
+            "format",
+            "format_revision",
+            "created_by",
+            "review_id",
+            "prior_review_id",
+            "name",
+            "state",
+            "history",
+        },
+        "document",
+    )
     revision = document.get("format_revision")
     require(errors, document.get("format") == FORMAT, f"format must be {FORMAT}")
     require(
@@ -884,11 +1215,24 @@ def validate_document(document: Any) -> list[str]:
         and bool(creator["version"]),
         "created_by.version is required",
     )
+    if isinstance(creator, dict):
+        reject_unknown(errors, creator, {"version"}, "created_by")
     require(
         errors,
         isinstance(document.get("review_id"), str)
         and bool(REVIEW_ID_PATTERN.fullmatch(document["review_id"])),
         "review_id must be an eight-character review ID",
+    )
+    prior_review_id = document.get("prior_review_id")
+    require(
+        errors,
+        prior_review_id is None
+        or (
+            isinstance(prior_review_id, str)
+            and bool(REVIEW_ID_PATTERN.fullmatch(prior_review_id))
+            and prior_review_id != document.get("review_id")
+        ),
+        "prior_review_id must be null or a different review ID",
     )
     require(
         errors,
@@ -914,6 +1258,9 @@ def blank_snapshot() -> dict[str, Any]:
         "fingerprint": "",
         "exclusions": [],
         "additional_inputs": [],
+        "staged_sha256": "",
+        "unstaged_sha256": "",
+        "untracked": [],
     }
 
 
@@ -942,12 +1289,15 @@ def blank_thread() -> dict[str, Any]:
     }
 
 
-def new_document(review_id: str, name: str) -> dict[str, Any]:
+def new_document(
+    review_id: str, name: str, prior_review_id: str | None = None
+) -> dict[str, Any]:
     return {
         "format": FORMAT,
         "format_revision": FORMAT_REVISION,
         "created_by": {"version": CREATOR_VERSION},
         "review_id": review_id,
+        "prior_review_id": prior_review_id,
         "name": name,
         "state": default_state(),
         "history": [],
@@ -958,7 +1308,6 @@ def event_template(kind: str) -> dict[str, Any]:
     base: dict[str, Any] = {
         "event_id": f"evt_{secrets.token_hex(12)}",
         "kind": kind,
-        "occurred_at": datetime.now(timezone.utc).isoformat(),
     }
     if kind == "review":
         base.update(
@@ -975,6 +1324,7 @@ def event_template(kind: str) -> dict[str, Any]:
                 "reason": "",
                 "thread_impacts": [],
                 "new_threads": [],
+                "gap_resolutions": [],
                 "validation": blank_validation(),
             }
         )
@@ -1005,13 +1355,177 @@ def event_template(kind: str) -> dict[str, Any]:
             {
                 "source_snapshot": blank_snapshot(),
                 "resolutions": [],
+                "gap_resolutions": [],
                 "decision": "",
                 "validation": blank_validation(),
             }
         )
     else:
         base.update({"reason": "", "started_at": "", "deadline": ""})
+    base["occurred_at"] = datetime.now(timezone.utc).isoformat()
     return base
+
+
+def current_snapshot(document: dict[str, Any]) -> dict[str, Any] | None:
+    for event in reversed(document.get("history", [])):
+        if not isinstance(event, dict):
+            continue
+        field = SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        value = event.get(field) if field else None
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def latest_owner_replies(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    for event in reversed(document.get("history", [])):
+        if isinstance(event, dict) and event.get("kind") == "owner_reply":
+            return {
+                item["thread_id"]: item
+                for item in event.get("replies", [])
+                if isinstance(item, dict) and isinstance(item.get("thread_id"), str)
+            }
+    return {}
+
+
+def contextual_event_template(
+    document: dict[str, Any], kind: str, guarded_snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    template = event_template(kind)
+    open_threads = document["state"]["threads"]["open"]
+    open_gaps = document["state"]["validation_gaps"]["open"]
+    prior_snapshot = current_snapshot(document)
+    if kind in SOURCE_FIELD_BY_KIND:
+        template[SOURCE_FIELD_BY_KIND[kind]] = guarded_snapshot
+    if kind == "review":
+        template["threads"][0]["id"] = "T1"
+    elif kind == "owner_reply":
+        template["starting_source_snapshot"] = prior_snapshot or guarded_snapshot
+        template["completed_source_snapshot"] = guarded_snapshot
+        template["replies"] = [
+            {
+                "thread_id": thread_id,
+                "decision": "applied",
+                "message": "",
+                "evidence": blank_evidence(),
+            }
+            for thread_id in open_threads
+        ]
+    elif kind in {"reviewer_update", "final_review"}:
+        replies = latest_owner_replies(document)
+        action_key = "decisions" if kind == "reviewer_update" else "resolutions"
+        actions = []
+        for thread_id in open_threads:
+            action: dict[str, Any] = {
+                "thread_id": thread_id,
+                "message": "",
+            }
+            if kind == "reviewer_update":
+                action["action"] = "comment"
+            if replies.get(thread_id, {}).get("decision") == "declined":
+                action["verification"] = {
+                    "independent": True,
+                    "evidence": blank_evidence(),
+                }
+            actions.append(action)
+        template[action_key] = actions
+        template["gap_resolutions"] = [
+            {
+                "gap_id": gap_id,
+                "message": "",
+                "evidence": blank_evidence(),
+            }
+            for gap_id in open_gaps
+        ]
+    elif kind in {"owner_timeout", "reviewer_timeout"}:
+        latest = document["state"].get("latest_event")
+        if isinstance(latest, dict):
+            started = datetime.fromisoformat(
+                latest["occurred_at"].replace("Z", "+00:00")
+            )
+            template["started_at"] = started.isoformat()
+            template["deadline"] = (
+                started + TIMEOUT_DURATION_BY_KIND[kind]
+            ).isoformat()
+        template["reason"] = "The active handoff deadline elapsed without a response."
+    template["occurred_at"] = datetime.now(timezone.utc).isoformat()
+    return template
+
+
+def thread_conversations(document: dict[str, Any]) -> list[dict[str, Any]]:
+    conversations: dict[str, dict[str, Any]] = {}
+    for event in document.get("history", []):
+        if not isinstance(event, dict):
+            continue
+        for thread in [*event.get("threads", []), *event.get("new_threads", [])]:
+            if isinstance(thread, dict):
+                conversations[thread["id"]] = {
+                    "thread": thread,
+                    "status": "open",
+                    "conversation": [],
+                }
+        action_groups = (
+            event.get("replies", []),
+            event.get("decisions", []),
+            event.get("resolutions", []),
+            event.get("thread_impacts", []),
+        )
+        for actions in action_groups:
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                thread_id = action.get("thread_id")
+                if thread_id in conversations:
+                    conversations[thread_id]["conversation"].append(
+                        {
+                            "event_id": event.get("event_id"),
+                            "kind": event.get("kind"),
+                            "occurred_at": event.get("occurred_at"),
+                            "entry": action,
+                        }
+                    )
+                    action_name = action.get("action")
+                    if event.get("kind") == "final_review" or action_name == "resolve":
+                        conversations[thread_id]["status"] = "resolved"
+                    elif action_name == "reopen":
+                        conversations[thread_id]["status"] = "open"
+    return [
+        conversations[key]
+        for key in sorted(
+            conversations,
+            key=lambda value: int(THREAD_ID_PATTERN.fullmatch(value).group(1)),
+        )
+    ]
+
+
+def render_conversations(document: dict[str, Any]) -> str:
+    lines = ["# Current Review Threads", ""]
+    for item in thread_conversations(document):
+        thread = item["thread"]
+        lines.extend(
+            [
+                f"## {thread['id']} [{thread['priority']}] {thread['title']}",
+                "",
+                f"- Status: {item['status']}",
+                f"- Required behavior: {thread['required_behavior']}",
+                f"- Original evidence: {evidence_summary(thread['evidence'])}",
+                "",
+            ]
+        )
+        for entry in item["conversation"]:
+            action = entry["entry"]
+            label = action.get("decision") or action.get("action") or "resolved"
+            lines.extend(
+                [
+                    f"### {entry['kind']} — {label}",
+                    "",
+                    action.get("message", ""),
+                    "",
+                ]
+            )
+    if len(lines) == 2:
+        lines.append("No threads.")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def append_event(document: Any, event: Any) -> dict[str, Any]:
@@ -1047,6 +1561,8 @@ def render_report(document: dict[str, Any]) -> str:
         f"- Primary action: {(workflow['primary_action'] or {}).get('kind', 'None')}",
         f"- Open threads: {', '.join(state['threads']['open']) or 'None'}",
         f"- Resolved threads: {', '.join(state['threads']['resolved']) or 'None'}",
+        f"- Open validation gaps: {', '.join(state['validation_gaps']['open']) or 'None'}",
+        f"- Resolved validation gaps: {', '.join(state['validation_gaps']['resolved']) or 'None'}",
         f"- Source fingerprint: {state['source_fingerprint'] or 'Unavailable'}",
     ]
     if not document["history"]:
@@ -1135,18 +1651,32 @@ def main() -> int:
     init_parser = subparsers.add_parser("init")
     init_parser.add_argument("review_id")
     init_parser.add_argument("name")
+    init_parser.add_argument("--prior-review-id")
     snapshot_parser = subparsers.add_parser("source-snapshot")
     snapshot_parser.add_argument("--kind")
     append_parser = subparsers.add_parser("append-event")
     append_parser.add_argument("event_json")
     template_parser = subparsers.add_parser("template")
     template_parser.add_argument("kind", choices=ACTOR_BY_KIND)
+    contextual_parser = subparsers.add_parser("context-template")
+    contextual_parser.add_argument("kind", choices=ACTOR_BY_KIND)
+    contextual_parser.add_argument("snapshot_json")
+    threads_parser = subparsers.add_parser("threads")
+    threads_parser.add_argument("--json", action="store_true")
+    evidence_parser = subparsers.add_parser("evidence-template")
+    evidence_parser.add_argument("basis", choices=EVIDENCE_BASES)
+    subparsers.add_parser("eligible-timeout")
     args = parser.parse_args()
     if args.command == "template":
         print(json.dumps(event_template(args.kind), indent=2))
         return 0
+    if args.command == "evidence-template":
+        value = blank_evidence()
+        value["basis"] = args.basis
+        print(json.dumps(value, indent=2))
+        return 0
     if args.command == "init":
-        document = new_document(args.review_id, args.name)
+        document = new_document(args.review_id, args.name, args.prior_review_id)
         errors = validate_document(document)
         if errors:
             return emit_validation(errors)
@@ -1179,6 +1709,48 @@ def main() -> int:
         return 0
     if args.command == "report":
         print(render_report(value), end="")
+        return 0
+    if args.command == "context-template":
+        try:
+            snapshot = json.loads(Path(args.snapshot_json).read_text())
+            if isinstance(snapshot, dict) and isinstance(
+                snapshot.get("source_snapshot"), dict
+            ):
+                snapshot = snapshot["source_snapshot"]
+            print(
+                json.dumps(
+                    contextual_event_template(value, args.kind, snapshot), indent=2
+                )
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"cannot build contextual event: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "eligible-timeout":
+        workflow = value["state"]["workflow"]
+        latest = value["state"].get("latest_event")
+        if workflow["phase"] not in {"owner_response", "reviewer_verification"}:
+            print("no timeout is structurally allowed", file=sys.stderr)
+            return 1
+        kind = (
+            "owner_timeout"
+            if workflow["phase"] == "owner_response"
+            else "reviewer_timeout"
+        )
+        started = datetime.fromisoformat(latest["occurred_at"].replace("Z", "+00:00"))
+        deadline = started + TIMEOUT_DURATION_BY_KIND[kind]
+        if datetime.now(timezone.utc) < deadline:
+            print(
+                f"timeout is not eligible until {deadline.isoformat()}", file=sys.stderr
+            )
+            return 1
+        print(kind)
+        return 0
+    if args.command == "threads":
+        if args.json:
+            print(json.dumps(thread_conversations(value), indent=2))
+        else:
+            print(render_conversations(value), end="")
         return 0
     if args.command == "state":
         print(json.dumps(value["state"], indent=2))

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -20,8 +21,14 @@ class ReviewLockTest(unittest.TestCase):
     def test_concurrent_acquire_has_one_winner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "lock"
-            self.assertEqual(review_lock.acquire(path, "review.json"), 0)
-            self.assertEqual(review_lock.acquire(path, "review.json"), 1)
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(
+                    executor.map(
+                        lambda _: review_lock.acquire(path, "review.json"), range(8)
+                    )
+                )
+            self.assertEqual(results.count(0), 1)
+            self.assertEqual(results.count(1), 7)
 
     def test_corrupt_owner_cannot_be_released(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

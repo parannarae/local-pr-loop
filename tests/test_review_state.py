@@ -28,23 +28,36 @@ def snapshot(marker: str) -> dict[str, Any]:
         "fingerprint": marker * 64,
         "exclusions": [],
         "additional_inputs": [],
+        "staged_sha256": "0" * 64,
+        "unstaged_sha256": "0" * 64,
+        "untracked": [],
     }
 
 
 def evidence(basis: str = "source_inspection") -> dict[str, Any]:
-    return {
+    value = {
         "basis": basis,
         "provenance": "example.txt",
         "observed_at": at(0),
         "sanitized_result": "Observed the declared behavior.",
     }
+    if basis == "captured_fixture":
+        value["artifact_digest"] = "a" * 64
+    return value
 
 
 def validation(*, material: bool = False) -> dict[str, Any]:
     return {
         "performed": [{"check": "focused test", "result": "passed"}],
         "gaps": (
-            [{"check": "live service", "reason": "unavailable", "material": True}]
+            [
+                {
+                    "gap_id": "G1",
+                    "check": "live service",
+                    "reason": "unavailable",
+                    "material": True,
+                }
+            ]
             if material
             else []
         ),
@@ -116,7 +129,7 @@ class ReviewStateTest(unittest.TestCase):
     def test_new_document_uses_calendar_revision_and_workflow(self) -> None:
         document = review_state.new_document("abcdefgh", "review")
         self.assertEqual(document["format"], "local-pr-loop")
-        self.assertEqual(document["format_revision"], "2026-07-25.1")
+        self.assertEqual(document["format_revision"], "2026-07-25.2")
         self.assertEqual(document["created_by"]["version"], "0.3.0")
         self.assertEqual(
             document["state"]["workflow"]["phase"], "awaiting_initial_review"
@@ -171,8 +184,130 @@ class ReviewStateTest(unittest.TestCase):
                 "validation": validation(material=True),
             }
         )
-        with self.assertRaisesRegex(ValueError, "LGTM forbids material gaps"):
+        with self.assertRaisesRegex(
+            ValueError, "LGTM forbids unresolved material gaps"
+        ):
             review_state.append_event(document, final)
+
+    def test_historical_material_gap_requires_explicit_resolution(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        initial = review_event()
+        initial["validation"] = validation(material=True)
+        review_state.append_event(document, initial)
+        review_state.append_event(document, owner_event())
+        final = event("final_review", 3)
+        final.update(
+            {
+                "source_snapshot": snapshot("2"),
+                "resolutions": [{"thread_id": "T1", "message": "Verified."}],
+                "gap_resolutions": [],
+                "decision": "LGTM",
+                "validation": validation(),
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "unresolved material gaps"):
+            review_state.append_event(document, deepcopy(final))
+        final["gap_resolutions"] = [
+            {
+                "gap_id": "G1",
+                "message": "The previously unavailable check now passes.",
+                "evidence": evidence("test_result"),
+            }
+        ]
+        review_state.append_event(document, final)
+        self.assertEqual(document["state"]["validation_gaps"]["resolved"], ["G1"])
+
+    def test_failed_final_check_blocks_lgtm(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        final = event("final_review", 1)
+        final.update(
+            {
+                "source_snapshot": snapshot("1"),
+                "resolutions": [],
+                "gap_resolutions": [
+                    {
+                        "gap_id": "G1",
+                        "message": "Attempted disposition.",
+                        "evidence": evidence("test_result"),
+                    }
+                ],
+                "decision": "LGTM",
+                "validation": {
+                    "performed": [{"check": "tests", "result": "failed"}],
+                    "gaps": [
+                        {
+                            "gap_id": "G1",
+                            "check": "tests",
+                            "reason": "failure",
+                            "material": True,
+                        }
+                    ],
+                },
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "LGTM forbids failed checks"):
+            review_state.append_event(document, final)
+
+    def test_unknown_secret_field_is_rejected(self) -> None:
+        candidate = review_event()
+        candidate["cookie"] = "secret"
+        self.assertTrue(
+            any(
+                "unknown fields: cookie" in error
+                for error in review_state.validate_event(candidate)
+            )
+        )
+
+    def test_contextual_templates_prefill_role_obligations(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        review_state.append_event(document, review_event())
+        owner = review_state.contextual_event_template(
+            document, "owner_reply", snapshot("2")
+        )
+        self.assertEqual([item["thread_id"] for item in owner["replies"]], ["T1"])
+        self.assertEqual(owner["starting_source_snapshot"], snapshot("1"))
+        owner["source_drift_assessment"] = "Guarded source changed."
+        owner["replies"][0].update(
+            {
+                "decision": "declined",
+                "message": "Existing behavior is correct.",
+                "evidence": evidence("test_result"),
+            }
+        )
+        owner["guide_synchronization"] = "No guide change."
+        review_state.append_event(document, owner)
+        final = review_state.contextual_event_template(
+            document, "final_review", snapshot("2")
+        )
+        self.assertTrue(final["resolutions"][0]["verification"]["independent"])
+
+    def test_thread_conversation_view_preserves_handoffs(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        review_state.append_event(document, review_event())
+        review_state.append_event(document, owner_event())
+        conversations = review_state.thread_conversations(document)
+        self.assertEqual(len(conversations), 1)
+        self.assertEqual(
+            [entry["kind"] for entry in conversations[0]["conversation"]],
+            ["owner_reply"],
+        )
+
+    def test_follow_up_document_links_prior_review(self) -> None:
+        document = review_state.new_document(
+            "abcdefgh", "follow-up", prior_review_id="bcdefghj"
+        )
+        self.assertEqual(document["prior_review_id"], "bcdefghj")
+        self.assertEqual(review_state.validate_document(document), [])
+
+    def test_evidence_cannot_postdate_event(self) -> None:
+        candidate = review_event()
+        candidate["threads"][0]["evidence"]["observed_at"] = at(2)
+        self.assertTrue(
+            any(
+                "must not follow event.occurred_at" in error
+                for error in review_state.validate_event(candidate)
+            )
+        )
 
     def test_declined_thread_requires_independent_reviewer_verification(self) -> None:
         document = review_state.new_document("abcdefgh", "review")

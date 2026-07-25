@@ -16,7 +16,9 @@ a random `REVIEW_ID`. Each loop uses:
 - `REVIEW_ID.event.json`: temporary event created by `template` and removed by
   `publish`; and
 - `REVIEW_ID.publish.json`: durable publication receipt, present only while
-  cleanup or recovery remains.
+  cleanup or recovery remains;
+- `REVIEW_ID.lease.json`: permission-restricted local lock capability; and
+- `REVIEW_ID.guard.json`: permission-restricted opaque inspection handle.
 
 Keep the ID through handoffs. Never reuse another repository or worktree's
 artifacts or guess an ambiguous ID. Treat only canonical JSON as state; generate,
@@ -92,18 +94,22 @@ handoff.
 ## Common Procedure
 
 1. For a new loop, run `init REPO NAME` and retain its `REVIEW_ID`.
-2. Run `inspect REPO REVIEW_ID ...`; read instructions, source, context, tests,
-   worktree changes, and canonical history.
-3. Acquire the lock before changing declared source or creating an event.
-4. Verify drift and run focused validation.
-5. Create the event with `template REPO REVIEW_ID TOKEN KIND`.
-6. Populate the event, run `validate-event`, then repeat `inspect` under lock.
-7. Run `publish` with the final inspection's exact hashes and unchanged scope.
+2. Run `inspect REPO REVIEW_ID ...` and follow its exact recommended command.
+   Use `--json` for an agent-readable dashboard.
+3. Acquire the lock. The command stores an opaque 0600 lease and never prints
+   its token.
+4. Repeat `inspect` under the lease to create an opaque guard for the declared
+   source scope.
+5. Create a state-aware draft with `template REPO REVIEW_ID KIND`. Read
+   `threads` when handling a multi-turn conversation.
+6. Populate the remaining blanks. Use `add-check`, `add-gap`, and
+   `evidence-template` for correctly shaped validation records.
+7. Run `validate-event`, repeat `inspect`, then run `publish REPO REVIEW_ID`.
 8. Read the structured publication result. After any nonzero result, inspect
    canonical state first. If `committed` is true or the event is latest, never
    retry the old SHA; run `recover-publish`.
-9. Check the latest report. Release a retained lock only after a precommit
-   failure. Reinspect every five minutes while following the recorded timeout.
+9. Use `abort-draft`, `regenerate-report`, or `wait` only as recommended.
+   `publish-timeout --if-eligible` computes the active timeout safely.
 
 Use priorities consistently:
 
@@ -128,7 +134,8 @@ Use priorities consistently:
   observation time, and sanitized result. A synthetic counterexample alone is
   insufficient.
 - Mark every validation gap `material: true|false`. Never publish LGTM with a
-  material gap.
+  material gap. Give gaps sequential `G<N>` IDs and resolve historical material
+  gaps explicitly with reviewer evidence.
 - Resolve an owner's declined thread only after independent reviewer
   verification. If that check is unavailable, comment with the exact unavailable
   check and leave the thread open.
@@ -141,10 +148,15 @@ Use priorities consistently:
 - Preserve unrelated changes; lock before changing state, event, or source.
 - Never publish stale hashes, claim unperformed validation, expose secrets, or
   continue after a terminal phase.
+- Use only documented schema fields. Unknown fields are rejected so raw
+  credentials, response payloads, and legacy metadata cannot silently enter
+  canonical history.
 - Treat canonical JSON as authoritative if it disagrees with a draft, receipt,
   report, terminal output, or another agent. The report is only a cache.
 - Never break a lock using PID or elapsed age. Lock status deliberately omits its
   token.
+- Never print, copy, or hand off a lease token. Pass the local lease and guard
+  only through the provided commands.
 - On ambiguity, another agent's lock, or material unexplained drift, stop rather
   than guessing or repairing canonical JSON manually.
 

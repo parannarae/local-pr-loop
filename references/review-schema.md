@@ -6,9 +6,10 @@ calendar revision:
 ```json
 {
   "format": "local-pr-loop",
-  "format_revision": "2026-07-25.1",
+  "format_revision": "2026-07-25.2",
   "created_by": {"version": "0.3.0"},
   "review_id": "k7m3q9wx",
+  "prior_review_id": null,
   "name": "feature-review",
   "state": {
     "workflow": {
@@ -21,6 +22,7 @@ calendar revision:
     },
     "source_fingerprint": null,
     "threads": {"open": [], "resolved": []},
+    "validation_gaps": {"open": [], "resolved": []},
     "latest_event": null,
     "terminal": null
   },
@@ -76,8 +78,11 @@ Thread IDs are globally gap-free `T<N>` values and remain stable:
 Evidence bases are `source_inspection`, `test_result`, `live_probe`,
 `captured_fixture`, and `authoritative_contract`. External-contract P1/P2
 threads require one of the last three; a synthetic counterexample is not enough.
-Never record credentials, signed URLs, query tokens, cookies, raw responses, raw
-headers, or unredacted commands.
+`captured_fixture` evidence requires `artifact_digest`, and evidence observation
+cannot postdate its containing event. Never record credentials, signed URLs,
+query tokens, cookies, raw responses, raw headers, or unredacted commands.
+Canonical documents and nested records use closed field sets; unknown fields
+are rejected.
 
 ## Validation
 
@@ -97,6 +102,7 @@ headers, or unredacted commands.
   ],
   "gaps": [
     {
+      "gap_id": "G1",
       "check": "full media download",
       "reason": "Intentionally bounded to ten seconds.",
       "material": false
@@ -105,8 +111,11 @@ headers, or unredacted commands.
 }
 ```
 
-Record only checks actually performed. LGTM is invalid while any gap is
-material.
+Record only checks actually performed. Gap IDs are globally sequential and
+stable. A failed check requires a matching material gap. Reviewer events resolve
+gaps explicitly with `gap_resolutions`, each containing `gap_id`, `message`, and
+structured evidence. LGTM is invalid while any historical material gap remains
+open or any final check failed.
 
 ## Conversation Events
 
@@ -149,7 +158,10 @@ unavailable check as a validation gap, and keep the thread open.
 
 ## Publication and Operation
 
-`publish` writes a durable receipt before replacing canonical JSON. The receipt
+`publish` performs lock, canonical SHA, source fingerprint, event, and event
+snapshot checks inside one structured-result boundary. It verifies lock
+ownership again immediately before the commit point and writes a durable receipt
+before replacing canonical JSON. The receipt
 contains event ID, draft digest, base and intended canonical SHA-256, source
 fingerprint, and commit phase. Atomic canonical replacement is the sole commit
 point. Report generation, draft removal, lock release, and receipt removal are
@@ -157,15 +169,30 @@ cleanup.
 
 Every publication result includes `status`, `committed`, current
 `canonical_sha256`, `event_id`, `lock_state`, and exact `recovery_action`.
-`precommit_failed` means canonical history did not change.
+`precommit_failed` means canonical history did not change. A surviving
+`prepared` receipt is aborted by `recover-publish` after verifying its lock,
+base canonical SHA, and draft digest; then source and canonical state must be
+reinspected.
 `published_cleanup_required` means it did change. After any nonzero result,
 inspect canonical history first. Never retry an old SHA when the event is
 already present; run `recover-publish`. Recovery identifies the publication by
 event ID and receipt digest, regenerates the report, cleans the matching draft,
 and never appends a duplicate event.
 
-`inspect` derives one operation status: `clean`, `editing_draft`,
-`publication_committed`, `cleanup_required`, or `locked`. Without a matching
-token it reports `locked`, not ownership-specific assumptions. `clean` means
-canonical validation passes, report matches canonical, and no draft, receipt, or
-active lock exists.
+`inspect` derives one artifact status: `clean`, `editing_draft`,
+`ready_to_publish`, `prepared_precommit`, `committed_cleanup`, `stale_report`, or
+`corrupt_artifact`. Lock status is orthogonal, so a locked valid draft remains
+`ready_to_publish` while its separate `lock_status` is `locked`. `clean` means
+canonical validation passes, report matches canonical, and no draft or receipt
+exists; the overall operation is idle only when `lock_status` is also `unlocked`.
+
+`inspect --json` returns the same workflow model as the compact human dashboard:
+expected responder, permitted events by actor, open threads and gaps, operation
+health, source drift, timeout eligibility, stale-approval state, and one exact
+recommended command. `threads --json` returns each durable conversation with
+its original finding and all later replies and decisions.
+
+State-aware templates prefill guarded snapshots, one required action per open
+thread, open gap resolutions, independent-verification placeholders for declined
+threads, and timeout clocks. Empty semantic fields remain for the responsible
+actor to complete.
