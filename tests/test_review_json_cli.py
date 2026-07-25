@@ -262,6 +262,175 @@ class ReviewJsonCliTest(unittest.TestCase):
         )
         self.assertIn("verified", verified.stdout)
 
+    def test_guarded_draft_helpers_preserve_cli_artifact_contract(self) -> None:
+        initial = json.loads(
+            run(
+                "bash",
+                str(SCRIPT),
+                "inspect",
+                str(self.repo),
+                self.review_id,
+                "--json",
+                "example.txt",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(initial["workflow"]["phase"], "awaiting_initial_review")
+        self.assertEqual(initial["operation"]["status"], "clean")
+        self.assertEqual(initial["operation"]["lock_status"], "unlocked")
+        self.assertFalse(initial["operation"]["lease_present"])
+        self.assertFalse(initial["source"]["drift"])
+        self.assertIn("lock acquire", initial["recommended_next_command"])
+
+        self.acquire()
+        guarded = json.loads(
+            run(
+                "bash",
+                str(SCRIPT),
+                "inspect",
+                str(self.repo),
+                self.review_id,
+                "--json",
+                "example.txt",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(guarded["operation"]["lock_status"], "locked")
+        self.assertTrue(guarded["operation"]["lease_present"])
+        self.assertIn("template", guarded["recommended_next_command"])
+
+        template_output = run(
+            "bash",
+            str(SCRIPT),
+            "template",
+            str(self.repo),
+            self.review_id,
+            "review",
+            cwd=self.repo,
+        ).stdout.strip()
+        self.assertEqual(Path(template_output), self.event)
+        self.assertEqual(self.event.stat().st_mode & 0o777, 0o600)
+
+        check_result = json.loads(
+            run(
+                "bash",
+                str(SCRIPT),
+                "add-check",
+                str(self.repo),
+                self.review_id,
+                "passed",
+                "schema validation",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(check_result["status"], "check_added")
+        gap_result = json.loads(
+            run(
+                "bash",
+                str(SCRIPT),
+                "add-gap",
+                str(self.repo),
+                self.review_id,
+                "live probe",
+                "service unavailable",
+                "--material",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(gap_result["status"], "gap_added")
+        self.assertEqual(gap_result["gap_id"], "G1")
+        draft = json.loads(self.event.read_text())
+        self.assertEqual(
+            draft["validation"]["performed"],
+            [{"check": "schema validation", "result": "passed"}],
+        )
+        self.assertEqual(
+            draft["validation"]["gaps"],
+            [
+                {
+                    "gap_id": "G1",
+                    "check": "live probe",
+                    "reason": "service unavailable",
+                    "material": True,
+                }
+            ],
+        )
+
+        aborted = json.loads(
+            run(
+                "bash",
+                str(SCRIPT),
+                "abort-draft",
+                str(self.repo),
+                self.review_id,
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(aborted["status"], "draft_aborted")
+        self.assertFalse(self.event.exists())
+        released = json.loads(
+            run(
+                "bash",
+                str(SCRIPT),
+                "lock",
+                "release",
+                str(self.repo),
+                self.review_id,
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(released["status"], "released")
+
+    def test_initial_final_review_and_source_drift_route_to_follow_up(self) -> None:
+        self.acquire()
+        source = self.snapshot()
+        run(
+            "bash",
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "--json",
+            "example.txt",
+            cwd=self.repo,
+        )
+        run(
+            "bash",
+            str(SCRIPT),
+            "template",
+            str(self.repo),
+            self.review_id,
+            "final_review",
+            cwd=self.repo,
+        )
+        event = json.loads(self.event.read_text())
+        event["source_snapshot"] = source
+        event["decision"] = "LGTM"
+        event["validation"]["performed"] = [
+            {"check": "source inspection", "result": "passed"}
+        ]
+        write_json(self.event, event)
+        result = json.loads(self.publish().stdout)
+        self.assertTrue(result["committed"])
+
+        (self.repo / "example.txt").write_text("after\n")
+        dashboard = json.loads(
+            run(
+                "bash",
+                str(SCRIPT),
+                "inspect",
+                str(self.repo),
+                self.review_id,
+                "--json",
+                "example.txt",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(dashboard["workflow"]["phase"], "terminal")
+        self.assertTrue(dashboard["source"]["drift"])
+        self.assertTrue(dashboard["source"]["approval_stale"])
+        self.assertIn("start-follow-up", dashboard["recommended_next_command"])
+
 
 if __name__ == "__main__":
     unittest.main()

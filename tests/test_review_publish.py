@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 
 
 def import_module(name: str, path: Path):

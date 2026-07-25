@@ -6,11 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import secrets
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+import review_render
+import review_templates
+from review_contract import (
+    SOURCE_FIELD_BY_KIND,
+    TIMEOUT_DURATION_BY_KIND,
+)
 
 FORMAT = "local-pr-loop"
 FORMAT_REVISION = "2026-07-25.2"
@@ -25,21 +31,10 @@ ACTOR_BY_KIND = {
     "reviewer_timeout": "owner",
     "owner_timeout": "reviewer",
 }
-SOURCE_FIELD_BY_KIND = {
-    "review": "source_snapshot",
-    "source_update": "source_snapshot",
-    "owner_reply": "completed_source_snapshot",
-    "reviewer_update": "source_snapshot",
-    "final_review": "source_snapshot",
-}
 TERMINAL_OUTCOME_BY_KIND = {
     "final_review": "lgtm",
     "reviewer_timeout": "reviewer_timeout",
     "owner_timeout": "owner_timeout",
-}
-TIMEOUT_DURATION_BY_KIND = {
-    "reviewer_timeout": timedelta(minutes=30),
-    "owner_timeout": timedelta(hours=2),
 }
 THREAD_PRIORITIES = {"P0", "P1", "P2", "P3"}
 EVIDENCE_BASES = {
@@ -1252,41 +1247,19 @@ def validate_document(document: Any) -> list[str]:
 
 
 def blank_snapshot() -> dict[str, Any]:
-    return {
-        "revision": "",
-        "scope": [],
-        "fingerprint": "",
-        "exclusions": [],
-        "additional_inputs": [],
-        "staged_sha256": "",
-        "unstaged_sha256": "",
-        "untracked": [],
-    }
+    return review_templates.blank_snapshot()
 
 
 def blank_evidence() -> dict[str, Any]:
-    return {
-        "basis": "source_inspection",
-        "provenance": "",
-        "observed_at": datetime.now(timezone.utc).isoformat(),
-        "sanitized_result": "",
-    }
+    return review_templates.blank_evidence()
 
 
 def blank_validation() -> dict[str, list[Any]]:
-    return {"performed": [], "gaps": []}
+    return review_templates.blank_validation()
 
 
 def blank_thread() -> dict[str, Any]:
-    return {
-        "id": "T1",
-        "priority": "P1",
-        "contract": "internal",
-        "title": "",
-        "risk": "",
-        "evidence": blank_evidence(),
-        "required_behavior": "",
-    }
+    return review_templates.blank_thread()
 
 
 def new_document(
@@ -1305,227 +1278,23 @@ def new_document(
 
 
 def event_template(kind: str) -> dict[str, Any]:
-    base: dict[str, Any] = {
-        "event_id": f"evt_{secrets.token_hex(12)}",
-        "kind": kind,
-    }
-    if kind == "review":
-        base.update(
-            {
-                "source_snapshot": blank_snapshot(),
-                "threads": [blank_thread()],
-                "validation": blank_validation(),
-            }
-        )
-    elif kind == "source_update":
-        base.update(
-            {
-                "source_snapshot": blank_snapshot(),
-                "reason": "",
-                "thread_impacts": [],
-                "new_threads": [],
-                "gap_resolutions": [],
-                "validation": blank_validation(),
-            }
-        )
-    elif kind == "owner_reply":
-        base.update(
-            {
-                "starting_source_snapshot": blank_snapshot(),
-                "source_drift_assessment": "",
-                "completed_source_snapshot": blank_snapshot(),
-                "replies": [],
-                "files_changed": [],
-                "guide_synchronization": "",
-                "validation": blank_validation(),
-                "commits": [],
-            }
-        )
-    elif kind == "reviewer_update":
-        base.update(
-            {
-                "source_snapshot": blank_snapshot(),
-                "decisions": [],
-                "new_threads": [],
-                "validation": blank_validation(),
-            }
-        )
-    elif kind == "final_review":
-        base.update(
-            {
-                "source_snapshot": blank_snapshot(),
-                "resolutions": [],
-                "gap_resolutions": [],
-                "decision": "",
-                "validation": blank_validation(),
-            }
-        )
-    else:
-        base.update({"reason": "", "started_at": "", "deadline": ""})
-    base["occurred_at"] = datetime.now(timezone.utc).isoformat()
-    return base
-
-
-def current_snapshot(document: dict[str, Any]) -> dict[str, Any] | None:
-    for event in reversed(document.get("history", [])):
-        if not isinstance(event, dict):
-            continue
-        field = SOURCE_FIELD_BY_KIND.get(event.get("kind"))
-        value = event.get(field) if field else None
-        if isinstance(value, dict):
-            return value
-    return None
-
-
-def latest_owner_replies(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    for event in reversed(document.get("history", [])):
-        if isinstance(event, dict) and event.get("kind") == "owner_reply":
-            return {
-                item["thread_id"]: item
-                for item in event.get("replies", [])
-                if isinstance(item, dict) and isinstance(item.get("thread_id"), str)
-            }
-    return {}
+    return review_templates.event_template(kind)
 
 
 def contextual_event_template(
     document: dict[str, Any], kind: str, guarded_snapshot: dict[str, Any]
 ) -> dict[str, Any]:
-    template = event_template(kind)
-    open_threads = document["state"]["threads"]["open"]
-    open_gaps = document["state"]["validation_gaps"]["open"]
-    prior_snapshot = current_snapshot(document)
-    if kind in SOURCE_FIELD_BY_KIND:
-        template[SOURCE_FIELD_BY_KIND[kind]] = guarded_snapshot
-    if kind == "review":
-        template["threads"][0]["id"] = "T1"
-    elif kind == "owner_reply":
-        template["starting_source_snapshot"] = prior_snapshot or guarded_snapshot
-        template["completed_source_snapshot"] = guarded_snapshot
-        template["replies"] = [
-            {
-                "thread_id": thread_id,
-                "decision": "applied",
-                "message": "",
-                "evidence": blank_evidence(),
-            }
-            for thread_id in open_threads
-        ]
-    elif kind in {"reviewer_update", "final_review"}:
-        replies = latest_owner_replies(document)
-        action_key = "decisions" if kind == "reviewer_update" else "resolutions"
-        actions = []
-        for thread_id in open_threads:
-            action: dict[str, Any] = {
-                "thread_id": thread_id,
-                "message": "",
-            }
-            if kind == "reviewer_update":
-                action["action"] = "comment"
-            if replies.get(thread_id, {}).get("decision") == "declined":
-                action["verification"] = {
-                    "independent": True,
-                    "evidence": blank_evidence(),
-                }
-            actions.append(action)
-        template[action_key] = actions
-        template["gap_resolutions"] = [
-            {
-                "gap_id": gap_id,
-                "message": "",
-                "evidence": blank_evidence(),
-            }
-            for gap_id in open_gaps
-        ]
-    elif kind in {"owner_timeout", "reviewer_timeout"}:
-        latest = document["state"].get("latest_event")
-        if isinstance(latest, dict):
-            started = datetime.fromisoformat(
-                latest["occurred_at"].replace("Z", "+00:00")
-            )
-            template["started_at"] = started.isoformat()
-            template["deadline"] = (
-                started + TIMEOUT_DURATION_BY_KIND[kind]
-            ).isoformat()
-        template["reason"] = "The active handoff deadline elapsed without a response."
-    template["occurred_at"] = datetime.now(timezone.utc).isoformat()
-    return template
+    return review_templates.contextual_event_template(
+        document, kind, guarded_snapshot
+    )
 
 
 def thread_conversations(document: dict[str, Any]) -> list[dict[str, Any]]:
-    conversations: dict[str, dict[str, Any]] = {}
-    for event in document.get("history", []):
-        if not isinstance(event, dict):
-            continue
-        for thread in [*event.get("threads", []), *event.get("new_threads", [])]:
-            if isinstance(thread, dict):
-                conversations[thread["id"]] = {
-                    "thread": thread,
-                    "status": "open",
-                    "conversation": [],
-                }
-        action_groups = (
-            event.get("replies", []),
-            event.get("decisions", []),
-            event.get("resolutions", []),
-            event.get("thread_impacts", []),
-        )
-        for actions in action_groups:
-            for action in actions:
-                if not isinstance(action, dict):
-                    continue
-                thread_id = action.get("thread_id")
-                if thread_id in conversations:
-                    conversations[thread_id]["conversation"].append(
-                        {
-                            "event_id": event.get("event_id"),
-                            "kind": event.get("kind"),
-                            "occurred_at": event.get("occurred_at"),
-                            "entry": action,
-                        }
-                    )
-                    action_name = action.get("action")
-                    if event.get("kind") == "final_review" or action_name == "resolve":
-                        conversations[thread_id]["status"] = "resolved"
-                    elif action_name == "reopen":
-                        conversations[thread_id]["status"] = "open"
-    return [
-        conversations[key]
-        for key in sorted(
-            conversations,
-            key=lambda value: int(THREAD_ID_PATTERN.fullmatch(value).group(1)),
-        )
-    ]
+    return review_render.thread_conversations(document)
 
 
 def render_conversations(document: dict[str, Any]) -> str:
-    lines = ["# Current Review Threads", ""]
-    for item in thread_conversations(document):
-        thread = item["thread"]
-        lines.extend(
-            [
-                f"## {thread['id']} [{thread['priority']}] {thread['title']}",
-                "",
-                f"- Status: {item['status']}",
-                f"- Required behavior: {thread['required_behavior']}",
-                f"- Original evidence: {evidence_summary(thread['evidence'])}",
-                "",
-            ]
-        )
-        for entry in item["conversation"]:
-            action = entry["entry"]
-            label = action.get("decision") or action.get("action") or "resolved"
-            lines.extend(
-                [
-                    f"### {entry['kind']} — {label}",
-                    "",
-                    action.get("message", ""),
-                    "",
-                ]
-            )
-    if len(lines) == 2:
-        lines.append("No threads.")
-    return "\n".join(lines).rstrip() + "\n"
+    return review_render.render_conversations(document)
 
 
 def append_event(document: Any, event: Any) -> dict[str, Any]:
@@ -1543,92 +1312,11 @@ def append_event(document: Any, event: Any) -> dict[str, Any]:
 
 
 def evidence_summary(value: Any) -> str:
-    if not isinstance(value, dict):
-        return "Unavailable"
-    return f"{value.get('basis', 'unknown')}: {value.get('sanitized_result', '')}"
+    return review_render.evidence_summary(value)
 
 
 def render_report(document: dict[str, Any]) -> str:
-    state = document["state"]
-    workflow = state["workflow"]
-    lines = [
-        "# Latest Review Report",
-        "",
-        f"- Review ID: {document['review_id']}",
-        f"- Review name: {document['name']}",
-        f"- Workflow phase: {workflow['phase']}",
-        f"- Primary actor: {workflow['primary_actor'] or 'None'}",
-        f"- Primary action: {(workflow['primary_action'] or {}).get('kind', 'None')}",
-        f"- Open threads: {', '.join(state['threads']['open']) or 'None'}",
-        f"- Resolved threads: {', '.join(state['threads']['resolved']) or 'None'}",
-        f"- Open validation gaps: {', '.join(state['validation_gaps']['open']) or 'None'}",
-        f"- Resolved validation gaps: {', '.join(state['validation_gaps']['resolved']) or 'None'}",
-        f"- Source fingerprint: {state['source_fingerprint'] or 'Unavailable'}",
-    ]
-    if not document["history"]:
-        return "\n".join(lines) + "\n"
-    event = document["history"][-1]
-    lines.extend(
-        [
-            f"- Latest event: {event['kind']} ({event['event_id']})",
-            f"- Recorded at: {event['occurred_at']}",
-            "",
-        ]
-    )
-    threads = event.get("threads", []) or event.get("new_threads", [])
-    if threads:
-        lines.extend(["## Threads", ""])
-        for thread in threads:
-            lines.extend(
-                [
-                    f"### {thread['id']} [{thread['priority']}]: {thread['title']}",
-                    "",
-                    thread["risk"],
-                    "",
-                    f"Evidence: {evidence_summary(thread['evidence'])}",
-                    "",
-                    f"Required behavior: {thread['required_behavior']}",
-                    "",
-                ]
-            )
-    actions = (
-        event.get("replies")
-        or event.get("decisions")
-        or event.get("resolutions")
-        or event.get("thread_impacts")
-        or []
-    )
-    if actions:
-        lines.extend(["## Thread Actions", ""])
-        for action in actions:
-            label = action.get("decision") or action.get("action") or "resolved"
-            lines.extend(
-                [f"### {action['thread_id']}: {label}", "", action["message"], ""]
-            )
-    validation = event.get("validation")
-    if isinstance(validation, dict):
-        lines.extend(["## Validation", ""])
-        for check in validation.get("performed", []):
-            lines.append(f"- {check.get('result')}: {check.get('check')}")
-        if not validation.get("performed"):
-            lines.append("- None")
-        lines.extend(["", "## Validation Gaps", ""])
-        for gap in validation.get("gaps", []):
-            material = "material" if gap.get("material") else "non-material"
-            lines.append(f"- [{material}] {gap.get('check')}: {gap.get('reason')}")
-        if not validation.get("gaps"):
-            lines.append("- None")
-    if state["terminal"]:
-        lines.extend(
-            [
-                "",
-                "## Terminal Outcome",
-                "",
-                f"- Outcome: {state['terminal']['outcome']}",
-                f"- Occurred at: {state['terminal']['occurred_at']}",
-            ]
-        )
-    return "\n".join(lines).rstrip() + "\n"
+    return review_render.render_report(document)
 
 
 def emit_validation(errors: list[str]) -> int:
