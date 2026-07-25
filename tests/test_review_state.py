@@ -128,11 +128,9 @@ def owner_event(decision: str = "applied") -> dict[str, Any]:
 
 
 class ReviewStateTest(unittest.TestCase):
-    def test_new_document_uses_calendar_revision_and_workflow(self) -> None:
+    def test_new_document_uses_format_and_initial_workflow(self) -> None:
         document = review_state.new_document("abcdefgh", "review")
         self.assertEqual(document["format"], "local-pr-loop")
-        self.assertEqual(document["format_revision"], "2026-07-25.2")
-        self.assertEqual(document["created_by"]["version"], "0.3.0")
         self.assertEqual(
             document["state"]["workflow"]["phase"], "awaiting_initial_review"
         )

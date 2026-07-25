@@ -3,7 +3,7 @@ name: local-pr-loop
 description: Run owner or reviewer role in a repository-local JSON PR loop with durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and latest-event Markdown reports. Use for review exchanges without hosted PR comments that continue until every thread is resolved and the current source reaches LGTM.
 license: MIT
 metadata:
-  version: "0.3.0"
+  version: "0.3.1"
 ---
 
 # Local PR Loop
