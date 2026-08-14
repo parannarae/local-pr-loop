@@ -168,19 +168,18 @@ Use priorities consistently:
 
 - Populate only the temporary event created by `template`. Let only `publish`
   append canonical history and derive state.
-- Use globally unique, gap-free `T<N>` IDs. Reuse a thread ID for the same
-  conversation across replies, resolutions, and reopenings.
-- Record timezone-aware ISO 8601 timestamps. Base owner timeout on the latest
-  reviewer event routing to the owner and reviewer timeout on the latest owner
-  reply.
-- Keep `event_id` unique and `occurred_at` strictly increasing.
+- Let `template` and `validate-event` carry the schema. Populate only a
+  draft's semantic blanks and fix reported failures instead of hand-shaping
+  IDs, timestamps, or fields; exact contracts live in
+  [review-schema.md](references/review-schema.md). Unknown fields are
+  rejected so raw credentials and response payloads cannot silently enter
+  canonical history.
 - For external-contract P1/P2 findings, record `live_probe`,
   `captured_fixture`, or `authoritative_contract` evidence with provenance,
   observation time, and sanitized result. A synthetic counterexample alone is
   insufficient.
-- Mark every validation gap `material: true|false`. Never publish LGTM with a
-  material gap. Give gaps sequential `G<N>` IDs and resolve historical material
-  gaps explicitly with reviewer evidence.
+- Never publish LGTM with a material validation gap; resolve historical
+  material gaps explicitly with reviewer evidence.
 - Resolve an owner's declined thread only after independent reviewer
   verification. If that check is unavailable, comment with the exact unavailable
   check and leave the thread open.
@@ -193,9 +192,6 @@ Use priorities consistently:
 - Preserve unrelated changes; lock before changing state, event, or source.
 - Never publish stale hashes, claim unperformed validation, expose secrets, or
   continue after a terminal phase.
-- Use only documented schema fields. Unknown fields are rejected so raw
-  credentials, response payloads, and legacy metadata cannot silently enter
-  canonical history.
 - Before reporting a loop complete, run terminal `inspect` and confirm
   `approval_stale` is false. If it is true, run the recommended
   `start-follow-up` before making any completion claim.

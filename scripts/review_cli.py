@@ -57,6 +57,8 @@ def run_helper(
     capture: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one bundled Python helper without invoking a shell."""
+    # Flush buffered parent output first so child output cannot precede it.
+    sys.stdout.flush()
     return subprocess.run(
         [sys.executable, str(script), *arguments],
         input=input_bytes,

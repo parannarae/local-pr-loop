@@ -91,9 +91,9 @@ python3 "$SKILL_DIR/scripts/review_cli.py" add-note \
 ```
 
 `add-note` appends a machine-formatted user-facing note to the draft's reply,
-decision, resolution, or thread impact for the given thread; use it only for
-design-shifting changes, never mechanical fixes. An initial `review` draft has
-no per-thread message entry, so add the note on the next decision instead.
+decision, resolution, or thread impact for the given thread, or to the thread
+itself when it is being raised in this draft; use it only for design-shifting
+changes, never mechanical fixes.
 
 Every draft helper restamps the draft's `occurred_at` when it writes, so
 evidence recorded after templating never postdates its event. Never hand-edit
@@ -150,8 +150,9 @@ python3 "$SKILL_DIR/scripts/review_cli.py" wait REPO REVIEW_ID 300
 The command returns on canonical change, the active handoff deadline, or its
 bounded timeout. A `timeout` result is not an answer — only a changed
 `canonical_sha256` is. The waiting actor re-arms until the status is `changed`
-or it becomes eligible to publish a timeout event. `awaiting_initial_review`
-carries no handoff deadline, so a lapse there is silence, not a signal.
+or it becomes eligible to publish a timeout event. Every phase carries a
+handoff deadline: `awaiting_initial_review` anchors on the document's
+`created_at`, the other phases on their latest handoff event.
 
 Span a handoff with one bounded call instead of hand-rolling that re-arm loop:
 
@@ -170,9 +171,11 @@ deadline exists, then re-arms `wait` per round until one structured outcome:
 | `timeout_eligible` | 4 | run `publish-timeout --if-eligible` |
 | `exhausted` | 5 | report to the user; do not silently continue or loop again |
 
-`exhausted` is the only non-change exit in `awaiting_initial_review`, which has
-no deadline and no publishable timeout event. The round bound is mandatory, and
-exhausting it is a reportable result, not a reason to re-enter.
+The round bound is mandatory, and exhausting it is a reportable result, not a
+reason to re-enter. A stalled `awaiting_initial_review` becomes
+`timeout_eligible` once the creation-anchored deadline passes, so
+`publish-timeout --if-eligible` can terminate a loop whose reviewer never
+appeared.
 
 Publish a timeout only when eligible:
 

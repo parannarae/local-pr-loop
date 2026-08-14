@@ -402,6 +402,63 @@ class ReviewRenderTest(unittest.TestCase):
         self.assertIn("**Declined, independently verified.**", report)
         self.assertIn("Intentional behavior.", report)
 
+    def test_note_on_raised_thread_message_is_lifted(self) -> None:
+        thread = make_thread("T1", "P2", "Finding", "Risk")
+        thread["message"] = "Note to user: [decision] raised as a constraint"
+        document = make_document(
+            [{"kind": "review", "threads": [thread]}], open_threads=["T1"]
+        )
+        notes = review_render.summary_notes(document)
+        self.assertEqual(
+            notes, [{"text": "[decision] raised as a constraint", "source": "T1"}]
+        )
+
+    def test_header_names_prior_review_when_linked(self) -> None:
+        document = make_document([])
+        document["prior_review_id"] = "q84vy559"
+        report = review_render.render_report(document)
+        self.assertIn("- Prior review: `q84vy559`", report)
+
+    def test_verification_rolls_up_earlier_rounds_and_keeps_failures(self) -> None:
+        document = make_document(
+            [
+                {
+                    "kind": "review",
+                    "validation": {
+                        "performed": [
+                            {"check": "suite: 46 tests", "result": "passed"},
+                            {"check": "live probe", "result": "failed"},
+                        ],
+                        "gaps": [],
+                    },
+                },
+                {
+                    "kind": "owner_reply",
+                    "validation": {
+                        "performed": [{"check": "suite: 49 tests", "result": "passed"}],
+                        "gaps": [],
+                    },
+                },
+                {
+                    "kind": "final_review",
+                    "validation": {
+                        "performed": [{"check": "final suite: 68 tests", "result": "passed"}],
+                        "gaps": [],
+                    },
+                },
+            ]
+        )
+        report = review_render.render_report(document)
+        self.assertIn("- passed: final suite: 68 tests", report)
+        self.assertIn("- failed (earlier round): live probe", report)
+        self.assertIn(
+            "- Earlier rounds recorded 2 more passed checks;"
+            " see `threads` or canonical JSON",
+            report,
+        )
+        self.assertNotIn("- passed: suite: 46 tests", report)
+        self.assertNotIn("- passed: suite: 49 tests", report)
+
     def test_timeout_verification_recovers_latest_guarded_snapshot(self) -> None:
         snapshot = {"fingerprint": "a" * 64, "scope": ["x.py"]}
         document = make_document(

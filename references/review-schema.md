@@ -6,8 +6,9 @@ calendar revision:
 ```json
 {
   "format": "local-pr-loop",
-  "format_revision": "2026-07-25.2",
+  "format_revision": "2026-08-15.1",
   "created_by": {"version": "0.5.0"},
+  "created_at": "2026-08-15T01:00:00+00:00",
   "review_id": "k7m3q9wx",
   "prior_review_id": null,
   "name": "feature-review",
@@ -42,7 +43,7 @@ Every event contains a unique `event_id`, `kind`, and timezone-aware
 
 - Reviewer: `review`, `source_update`, `reviewer_update`, `final_review`,
   `owner_timeout`.
-- Owner: `owner_reply`, `reviewer_timeout`.
+- Owner: `owner_reply`, `reviewer_timeout`, `initial_review_timeout`.
 
 Valid workflow phases are `awaiting_initial_review`, `owner_response`,
 `reviewer_verification`, and `terminal`. `allowed_events_by_actor` is
@@ -50,8 +51,12 @@ authoritative; `primary_actor` describes the main handoff without excluding
 other allowed events.
 
 Timeout events contain `started_at`, exact `deadline`, `reason`, and
-`occurred_at`. `inspect` computes whether a structurally allowed timeout has
-become eligible. Wall-clock eligibility never changes canonical state.
+`occurred_at`. `owner_timeout` and `reviewer_timeout` anchor on the latest
+handoff event; `initial_review_timeout` anchors on the document's
+`created_at`, since that handoff starts before any event exists, and lets the
+owner terminate a loop whose reviewer never appeared. `inspect` computes
+whether a structurally allowed timeout has become eligible. Wall-clock
+eligibility never changes canonical state.
 
 ## Threads and Evidence
 
@@ -136,10 +141,12 @@ Blocked replies also require `blocker`, `completed_work`, `remaining_work`, and
 
 Any per-thread message may carry `Note to user:` lines — machine-written by the
 `add-note` helper — flagging design, contract, or business-logic shifts or
-decisions that need the user's attention. The summary report lifts them
-verbatim into its first section; mechanical fixes are never flagged.
-`deferred/blocked` replies, timeout terminals, and material gaps open at
-terminal surface there automatically without a marker.
+decisions that need the user's attention. Threads themselves accept an
+optional `message`, so a finding can be flagged at raise time in a `review` or
+`new_threads` entry. The summary report lifts notes verbatim into its first
+section; mechanical fixes are never flagged. `deferred/blocked` replies,
+timeout terminals, and material gaps open at terminal surface there
+automatically without a marker.
 
 A reviewer may resolve a declined reply only with:
 

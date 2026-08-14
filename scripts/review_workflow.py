@@ -20,7 +20,8 @@ from review_io import (
 )
 from review_notes import NOTE_MARKER
 
-# Draft event kinds that carry per-thread message entries a note can join.
+# Per-thread action entries a note joins first; threads raised in the draft
+# itself (review threads, new_threads) carry their own message as a fallback.
 NOTE_ENTRY_FIELD_BY_KIND = {
     "owner_reply": "replies",
     "reviewer_update": "decisions",
@@ -238,21 +239,26 @@ def add_note(args: argparse.Namespace) -> int:
     require_secure_regular(event_path, "draft")
     event = load_object(event_path)
     field = NOTE_ENTRY_FIELD_BY_KIND.get(event.get("kind"))
-    if field is None:
-        raise ValueError(
-            f"draft kind {event.get('kind')!r} has no per-thread message entry;"
-            " add the note on the next reply, decision, or resolution"
-        )
+    entries = event.get(field, []) if field else []
     entry = next(
         (
             item
-            for item in event.get(field, [])
+            for item in entries
             if isinstance(item, dict) and item.get("thread_id") == args.thread
         ),
         None,
     )
     if entry is None:
-        raise ValueError(f"draft has no {field} entry for thread {args.thread}")
+        entry = next(
+            (
+                thread
+                for thread in [*event.get("threads", []), *event.get("new_threads", [])]
+                if isinstance(thread, dict) and thread.get("id") == args.thread
+            ),
+            None,
+        )
+    if entry is None:
+        raise ValueError(f"draft has no entry for thread {args.thread}")
     tag_prefix = f"[{args.tag}] " if args.tag else ""
     note_line = f"{NOTE_MARKER} {tag_prefix}{args.note}"
     message = entry.get("message", "")
@@ -286,11 +292,18 @@ def poll_for_change(
     workflow = document["state"]["workflow"]
     latest = document["state"].get("latest_event")
     handoff_deadline: float | None = None
-    if workflow["phase"] in {"owner_response", "reviewer_verification"} and isinstance(
+    started_text: str | None = None
+    seconds = 7200
+    if workflow["phase"] == "awaiting_initial_review":
+        # Anchored on document creation: this handoff starts before any event.
+        started_text = document.get("created_at")
+    elif workflow["phase"] in {"owner_response", "reviewer_verification"} and isinstance(
         latest, dict
     ):
-        started = datetime.fromisoformat(latest["occurred_at"].replace("Z", "+00:00"))
+        started_text = latest["occurred_at"]
         seconds = 7200 if workflow["phase"] == "owner_response" else 1800
+    if started_text:
+        started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
         handoff_deadline = started.timestamp() + seconds
     deadline = min(
         value for value in (wall_deadline, handoff_deadline) if value is not None
@@ -324,8 +337,8 @@ def await_handoff(args: argparse.Namespace) -> int:
     """Span one handoff by re-arming bounded polls until a structured outcome.
 
     Exit codes: 0 for `changed` or `terminal`, 4 for `timeout_eligible`, and
-    5 for `exhausted`. The round bound is mandatory: `awaiting_initial_review`
-    has no handoff deadline, so an unbounded wait there would never return.
+    5 for `exhausted`. The round bound is mandatory so the total wait stays
+    finite even when it lapses before the phase's handoff deadline.
     """
     review = Path(args.review)
     # Capture the baseline before reading the workflow: a publication landing
@@ -336,14 +349,9 @@ def await_handoff(args: argparse.Namespace) -> int:
     if workflow["phase"] == "terminal":
         print(json.dumps({"status": "terminal", "rounds_used": 0}, sort_keys=True))
         return 0
-    deadline_note = (
-        "a handoff deadline applies"
-        if workflow["phase"] in {"owner_response", "reviewer_verification"}
-        else "no handoff deadline in this phase"
-    )
     print(
         f"waiting_for: {workflow['primary_actor']}"
-        f" to {workflow['primary_action']['kind']} ({deadline_note})",
+        f" to {workflow['primary_action']['kind']} (a handoff deadline applies)",
         flush=True,
     )
     for round_number in range(1, args.max_rounds + 1):

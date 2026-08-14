@@ -44,7 +44,10 @@ def workflow_for(kind: str | None, terminal: dict[str, Any] | None) -> dict[str,
             "phase": "awaiting_initial_review",
             "primary_actor": "reviewer",
             "primary_action": {"kind": "publish_initial_review"},
-            "allowed_events_by_actor": {"reviewer": ["review", "final_review"]},
+            "allowed_events_by_actor": {
+                "reviewer": ["review", "final_review"],
+                "owner": ["initial_review_timeout"],
+            },
         }
     if kind in {"review", "source_update", "reviewer_update"}:
         return {
@@ -95,8 +98,14 @@ def material_gaps(event: dict[str, Any]) -> bool:
 
 def project_history(
     history: list[Any],
+    created_at: str | None = None,
 ) -> tuple[list[str], dict[str, Any], dict[str, dict[str, Any]]]:
-    """Validate immutable history and derive canonical state and thread records."""
+    """Validate immutable history and derive canonical state and thread records.
+
+    `created_at` is the document creation timestamp; it anchors the
+    `initial_review_timeout` clock, the only handoff that starts before any
+    event exists.
+    """
     errors: list[str] = []
     threads: dict[str, dict[str, Any]] = {}
     current_snapshot: dict[str, Any] | None = None
@@ -389,9 +398,12 @@ def project_history(
                     "occurred_at": event.get("occurred_at"),
                 }
         else:
+            expected_start = (
+                created_at if kind == "initial_review_timeout" else handoff_started_at
+            )
             require(
                 errors,
-                event.get("started_at") == handoff_started_at,
+                event.get("started_at") == expected_start,
                 f"{prefix}: timeout start does not match active handoff",
             )
             terminal = {
@@ -447,6 +459,7 @@ def validate_document(document: Any) -> list[str]:
             "format",
             "format_revision",
             "created_by",
+            "created_at",
             "review_id",
             "prior_review_id",
             "name",
@@ -455,6 +468,7 @@ def validate_document(document: Any) -> list[str]:
         },
         "document",
     )
+    parse_timestamp(errors, document.get("created_at"), "created_at")
     revision = document.get("format_revision")
     require(errors, document.get("format") == FORMAT, f"format must be {FORMAT}")
     require(
@@ -501,7 +515,9 @@ def validate_document(document: Any) -> list[str]:
     require(errors, isinstance(history, list), "history must be a list")
     require(errors, isinstance(state, dict), "state must be a mapping")
     if isinstance(history, list) and isinstance(state, dict):
-        history_errors, expected, _ = project_history(history)
+        history_errors, expected, _ = project_history(
+            history, document.get("created_at")
+        )
         errors.extend(history_errors)
         require(errors, state == expected, "state projection is stale")
     return errors

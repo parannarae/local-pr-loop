@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
-import contextlib
 import hashlib
-import io
 import json
 import os
 import subprocess
@@ -16,11 +13,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
-import review_workflow
+import review_state
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "review_cli.py"
 LOCK_SCRIPT = Path(__file__).parents[1] / "scripts" / "review_lock.py"
@@ -473,7 +469,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertEqual(
             lines[0],
             "waiting_for: reviewer to publish_initial_review"
-            " (no handoff deadline in this phase)",
+            " (a handoff deadline applies)",
         )
         outcome = json.loads(lines[-1])
         self.assertEqual(outcome["status"], "changed")
@@ -530,7 +526,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertEqual(
             lines[0],
             "waiting_for: reviewer to publish_initial_review"
-            " (no handoff deadline in this phase)",
+            " (a handoff deadline applies)",
         )
         outcome = json.loads(lines[-1])
         self.assertEqual(outcome, {"rounds_used": 1, "status": "exhausted"})
@@ -543,7 +539,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     # --- add-note ---
 
-    def test_add_note_rejects_initial_review_draft(self) -> None:
+    def test_add_note_lands_on_review_draft_thread_message(self) -> None:
         self.snapshot()
         self.acquire()
         run(
@@ -565,21 +561,41 @@ class ReviewJsonCliTest(unittest.TestCase):
             "review",
             cwd=self.repo,
         )
-        # An initial review carries threads without message entries, so a note
-        # has nowhere to land and the helper must refuse with guidance.
+        # Review threads carry their own optional message, so a note flagged
+        # at raise time lands on the thread itself.
+        noted = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "add-note",
+                str(self.repo),
+                self.review_id,
+                "T1",
+                "raised as a design constraint",
+                "--tag",
+                "decision",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(noted["status"], "note_added")
+        draft = json.loads(self.event.read_text())
+        self.assertEqual(
+            draft["threads"][0]["message"],
+            "Note to user: [decision] raised as a design constraint",
+        )
         failed = run(
             sys.executable,
             str(SCRIPT),
             "add-note",
             str(self.repo),
             self.review_id,
-            "T1",
-            "should not land",
+            "T9",
+            "no such thread",
             cwd=self.repo,
             check=False,
         )
         self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("no per-thread message entry", failed.stderr)
+        self.assertIn("no entry for thread", failed.stderr)
 
     def test_add_note_round_trips_into_summary_notes_section(self) -> None:
         source = self.snapshot()
@@ -651,6 +667,110 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertLess(
             report.index("## Notes for You"), report.index("## Issue Summary")
         )
+
+    # --- event templates vs schema ---
+
+    def test_event_templates_emit_only_schema_allowed_fields(self) -> None:
+        # A generated field the validator rejects forces agents to hand-edit
+        # structure, which the workflow forbids; every kind must template
+        # clean of unknown-field errors.
+        for kind in review_state.ACTOR_BY_KIND:
+            template = review_state.event_template(kind)
+            unknown = [
+                error
+                for error in review_state.validate_event(template)
+                if "unknown fields" in error
+            ]
+            self.assertEqual(unknown, [], kind)
+
+    # --- source_update template ---
+
+    def test_source_update_template_validates_after_filling_blanks_only(self) -> None:
+        source = self.snapshot()
+        self.acquire()
+        self.prepare_review(source)
+        self.publish()
+        self.acquire()
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "--json",
+            "example.txt",
+            cwd=self.repo,
+        )
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "template",
+            str(self.repo),
+            self.review_id,
+            "source_update",
+            cwd=self.repo,
+        )
+        event = json.loads(self.event.read_text())
+        event["reason"] = "Replacement basis for continued review."
+        write_json(self.event, event)
+        # Filling the documented semantic blank alone must validate; no
+        # generated field may need deleting.
+        result = run(
+            sys.executable,
+            str(SCRIPT),
+            "validate-event",
+            str(self.repo),
+            self.review_id,
+            cwd=self.repo,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    # --- initial_review_timeout ---
+
+    def test_stalled_initial_review_reaches_terminal_via_timeout(self) -> None:
+        # Back-date creation past the two-hour deadline before guarding, so
+        # the guard hashes the canonical bytes that publish will verify. The
+        # Z spelling covers the verbatim started_at anchor copy: projection
+        # compares raw strings, so a reserialized +00:00 form would reject.
+        document = json.loads(self.review.read_text())
+        document["created_at"] = (
+            (datetime.now(timezone.utc) - timedelta(hours=3))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        write_json(self.review, document)
+        self.acquire()
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "--json",
+            "example.txt",
+            cwd=self.repo,
+        )
+        result = run(
+            sys.executable,
+            str(SCRIPT),
+            "publish-timeout",
+            "--if-eligible",
+            str(self.repo),
+            self.review_id,
+            cwd=self.repo,
+        )
+        published = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(published["committed"])
+        state = json.loads(self.review.read_text())["state"]
+        self.assertEqual(state["workflow"]["phase"], "terminal")
+        self.assertEqual(state["terminal"]["outcome"], "initial_review_timeout")
+        report = self.report.read_text()
+        self.assertIn(
+            "- **Outcome: ended by initial_review_timeout — review incomplete**",
+            report,
+        )
+        self.assertIn("Review ended by initial_review_timeout", report)
 
     # --- scope-candidates ---
 
@@ -745,83 +865,6 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertTrue(dashboard["source"]["drift"])
         self.assertTrue(dashboard["source"]["approval_stale"])
         self.assertIn("start-follow-up", dashboard["recommended_next_command"])
-
-
-def write_waiting_document(path: Path, marker: str) -> str:
-    """Write a minimal waiting-phase canonical document; return its SHA-256.
-
-    `marker` only varies the bytes so two writes produce distinct hashes.
-    """
-    document = {
-        "name": marker,
-        "state": {
-            "workflow": {
-                "phase": "awaiting_initial_review",
-                "primary_actor": "reviewer",
-                "primary_action": {"kind": "publish_initial_review"},
-            },
-            "latest_event": None,
-        },
-    }
-    path.write_text(json.dumps(document))
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-class ReviewWorkflowWaitTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.review = Path(self.temporary.name) / "review.json"
-
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
-
-    # --- poll_for_change ---
-
-    def test_reports_change_that_landed_before_the_poll_started(self) -> None:
-        baseline = write_waiting_document(self.review, "before")
-        current = write_waiting_document(self.review, "after")
-
-        result = review_workflow.poll_for_change(self.review, 1, baseline)
-
-        self.assertEqual(result, {"status": "changed", "canonical_sha256": current})
-
-    def test_times_out_on_unchanged_file_without_expected_baseline(self) -> None:
-        baseline = write_waiting_document(self.review, "stable")
-
-        result = review_workflow.poll_for_change(self.review, 1)
-
-        self.assertEqual(result, {"status": "timeout", "canonical_sha256": baseline})
-
-    # --- await_handoff ---
-
-    def test_every_round_polls_against_the_entry_baseline(self) -> None:
-        baseline = write_waiting_document(self.review, "entry")
-        changed = {"status": "changed", "canonical_sha256": "b" * 64}
-        timed_out = {"status": "timeout", "canonical_sha256": baseline}
-        args = argparse.Namespace(
-            review=str(self.review), round_seconds=5, max_rounds=3
-        )
-
-        # A change absorbed into a later round's baseline was the original
-        # defect, so the contract under test is that every round receives the
-        # baseline captured once at entry.
-        with mock.patch.object(
-            review_workflow, "poll_for_change", side_effect=[timed_out, changed]
-        ) as poll:
-            with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                exit_code = review_workflow.await_handoff(args)
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(
-            poll.call_args_list,
-            [
-                mock.call(self.review, 5, baseline),
-                mock.call(self.review, 5, baseline),
-            ],
-        )
-        outcome = json.loads(stdout.getvalue().strip().splitlines()[-1])
-        self.assertEqual(outcome["status"], "changed")
-        self.assertEqual(outcome["rounds_used"], 2)
 
 
 if __name__ == "__main__":

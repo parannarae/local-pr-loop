@@ -12,7 +12,7 @@ RESOLUTION_LABEL_BY_DECISION = {
     "declined": "**Declined, independently verified.**",
 }
 VERIFYING_EVENT_KINDS = {"reviewer_update", "final_review", "source_update"}
-TIMEOUT_OUTCOMES = {"owner_timeout", "reviewer_timeout"}
+TIMEOUT_OUTCOMES = {"owner_timeout", "reviewer_timeout", "initial_review_timeout"}
 
 
 def evidence_summary(value: Any) -> str:
@@ -154,30 +154,38 @@ def event_date(event: dict[str, Any]) -> str:
 
 
 def marked_notes(event: dict[str, Any]) -> list[dict[str, str]]:
-    """Lift `Note to user:` lines from every per-thread message in one event."""
+    """Lift `Note to user:` lines from every per-thread message in one event.
+
+    Threads raised in the event carry their own optional message, so notes
+    flagged at raise time surface alongside notes on replies and decisions.
+    """
     notes: list[dict[str, str]] = []
-    action_groups = (
+    carriers: list[tuple[dict[str, Any], str]] = []
+    for actions in (
         event.get("replies", []),
         event.get("decisions", []),
         event.get("resolutions", []),
         event.get("thread_impacts", []),
-    )
-    for actions in action_groups:
+    ):
         for action in actions:
-            if not isinstance(action, dict):
-                continue
-            message = action.get("message")
-            if not isinstance(message, str):
-                continue
-            for line in message.splitlines():
-                stripped = line.strip()
-                if stripped.startswith(NOTE_MARKER):
-                    notes.append(
-                        {
-                            "text": stripped[len(NOTE_MARKER):].strip(),
-                            "source": str(action.get("thread_id", "")),
-                        }
-                    )
+            if isinstance(action, dict):
+                carriers.append((action, str(action.get("thread_id", ""))))
+    for thread in [*event.get("threads", []), *event.get("new_threads", [])]:
+        if isinstance(thread, dict):
+            carriers.append((thread, str(thread.get("id", ""))))
+    for carrier, thread_id in carriers:
+        message = carrier.get("message")
+        if not isinstance(message, str):
+            continue
+        for line in message.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(NOTE_MARKER):
+                notes.append(
+                    {
+                        "text": stripped[len(NOTE_MARKER):].strip(),
+                        "source": str(thread_id or ""),
+                    }
+                )
     return notes
 
 
@@ -350,6 +358,9 @@ def render_header(document: dict[str, Any], note_count: int) -> list[str]:
             f"- **In progress** — waiting on: {actor} to {action}"
             f" · open: {open_threads}"
         )
+    prior_review_id = document.get("prior_review_id")
+    if prior_review_id:
+        lines.append(f"- Prior review: `{prior_review_id}`")
     if note_count:
         lines.append(
             f"- **Attention: {note_count} note{'s' if note_count != 1 else ''}"
@@ -404,18 +415,35 @@ def render_verification(document: dict[str, Any]) -> list[str]:
     state = document["state"]
     history = document.get("history", [])
     lines = ["## Verification", ""]
-    seen_checks = []
+    check_groups = []
     for event in history:
         validation = event.get("validation")
-        if not isinstance(validation, dict):
-            continue
-        for check in validation.get("performed", []):
-            key = (check.get("result"), check.get("check"))
-            if key not in seen_checks:
-                seen_checks.append(key)
-    for result, check in seen_checks:
-        lines.append(f"- {result}: {flatten_inline(check)}")
-    if not seen_checks:
+        if isinstance(validation, dict) and validation.get("performed"):
+            check_groups.append(validation["performed"])
+    if check_groups:
+        # The latest validating event carries the final verification state;
+        # earlier rounds roll up into one line, except failures, which always
+        # stay visible individually.
+        for check in check_groups[-1]:
+            lines.append(
+                f"- {check.get('result')}: {flatten_inline(check.get('check'))}"
+            )
+        earlier = [check for group in check_groups[:-1] for check in group]
+        for check in earlier:
+            if check.get("result") == "failed":
+                lines.append(
+                    f"- failed (earlier round): {flatten_inline(check.get('check'))}"
+                )
+        passed_earlier = sum(
+            1 for check in earlier if check.get("result") != "failed"
+        )
+        if passed_earlier:
+            lines.append(
+                f"- Earlier rounds recorded {passed_earlier} more passed"
+                f" check{'s' if passed_earlier != 1 else ''};"
+                " see `threads` or canonical JSON"
+            )
+    else:
         lines.append("- No validation checks recorded")
     fingerprint = state.get("source_fingerprint")
     if fingerprint and history:

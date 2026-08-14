@@ -12,4 +12,5 @@ SOURCE_FIELD_BY_KIND = {
 TIMEOUT_DURATION_BY_KIND = {
     "reviewer_timeout": timedelta(minutes=30),
     "owner_timeout": timedelta(hours=2),
+    "initial_review_timeout": timedelta(hours=2),
 }

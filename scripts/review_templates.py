@@ -72,7 +72,6 @@ def event_template(kind: str) -> dict[str, Any]:
                 "reason": "",
                 "thread_impacts": [],
                 "new_threads": [],
-                "gap_resolutions": [],
                 "validation": blank_validation(),
             }
         )
@@ -185,13 +184,20 @@ def contextual_event_template(
             }
             for gap_id in open_gaps
         ]
-    elif kind in {"owner_timeout", "reviewer_timeout"}:
+    elif kind in {"owner_timeout", "reviewer_timeout", "initial_review_timeout"}:
         latest = document["state"].get("latest_event")
-        if isinstance(latest, dict):
-            started = datetime.fromisoformat(
-                latest["occurred_at"].replace("Z", "+00:00")
-            )
-            template["started_at"] = started.isoformat()
+        started_text = (
+            document.get("created_at")
+            if kind == "initial_review_timeout"
+            else latest["occurred_at"] if isinstance(latest, dict) else None
+        )
+        if started_text:
+            # Copy the anchor verbatim: projection compares started_at to the
+            # canonical anchor as raw text, so reserializing a Z-form value as
+            # +00:00 would generate a rejected event. Parse only for the
+            # deadline arithmetic.
+            started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
+            template["started_at"] = started_text
             template["deadline"] = (
                 started + TIMEOUT_DURATION_BY_KIND[kind]
             ).isoformat()

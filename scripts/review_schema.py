@@ -24,7 +24,7 @@ __all__ = [
 ]
 
 FORMAT = "local-pr-loop"
-FORMAT_REVISION = "2026-07-25.2"
+FORMAT_REVISION = "2026-08-15.1"
 CREATOR_VERSION = "0.5.0"
 
 ACTOR_BY_KIND = {
@@ -35,11 +35,13 @@ ACTOR_BY_KIND = {
     "final_review": "reviewer",
     "reviewer_timeout": "owner",
     "owner_timeout": "reviewer",
+    "initial_review_timeout": "owner",
 }
 TERMINAL_OUTCOME_BY_KIND = {
     "final_review": "lgtm",
     "reviewer_timeout": "reviewer_timeout",
     "owner_timeout": "owner_timeout",
+    "initial_review_timeout": "initial_review_timeout",
 }
 THREAD_PRIORITIES = {"P0", "P1", "P2", "P3"}
 EVIDENCE_BASES = {
@@ -395,8 +397,15 @@ def validate_thread(errors: list[str], thread: Any, prefix: str) -> None:
             "risk",
             "evidence",
             "required_behavior",
+            "message",
         },
         prefix,
+    )
+    message = thread.get("message")
+    require(
+        errors,
+        message is None or (isinstance(message, str) and bool(message)),
+        f"{prefix}.message must be a non-empty string when present",
     )
     thread_id = thread.get("id")
     require(
@@ -536,6 +545,7 @@ def validate_event(event: Any) -> list[str]:
         },
         "reviewer_timeout": {"reason", "started_at", "deadline"},
         "owner_timeout": {"reason", "started_at", "deadline"},
+        "initial_review_timeout": {"reason", "started_at", "deadline"},
     }
     reject_unknown(
         errors,

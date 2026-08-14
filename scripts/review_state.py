@@ -55,6 +55,7 @@ def new_document(
         "format": FORMAT,
         "format_revision": FORMAT_REVISION,
         "created_by": {"version": CREATOR_VERSION},
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "review_id": review_id,
         "prior_review_id": prior_review_id,
         "name": name,
@@ -89,7 +90,7 @@ def append_event(document: Any, event: Any) -> dict[str, Any]:
     if not isinstance(event, dict):
         raise TypeError("event must be a JSON object")
     next_history = [*document["history"], event]
-    errors, state, _ = project_history(next_history)
+    errors, state, _ = project_history(next_history, document.get("created_at"))
     if errors:
         raise ValueError("; ".join(errors))
     document["history"] = next_history
@@ -203,15 +204,20 @@ def main() -> int:
     if args.command == "eligible-timeout":
         workflow = value["state"]["workflow"]
         latest = value["state"].get("latest_event")
-        if workflow["phase"] not in {"owner_response", "reviewer_verification"}:
+        if workflow["phase"] == "awaiting_initial_review":
+            kind = "initial_review_timeout"
+            started_text = value["created_at"]
+        elif workflow["phase"] in {"owner_response", "reviewer_verification"}:
+            kind = (
+                "owner_timeout"
+                if workflow["phase"] == "owner_response"
+                else "reviewer_timeout"
+            )
+            started_text = latest["occurred_at"]
+        else:
             print("no timeout is structurally allowed", file=sys.stderr)
             return 1
-        kind = (
-            "owner_timeout"
-            if workflow["phase"] == "owner_response"
-            else "reviewer_timeout"
-        )
-        started = datetime.fromisoformat(latest["occurred_at"].replace("Z", "+00:00"))
+        started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
         deadline = started + TIMEOUT_DURATION_BY_KIND[kind]
         if datetime.now(timezone.utc) < deadline:
             print(

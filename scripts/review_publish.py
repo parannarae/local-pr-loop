@@ -505,17 +505,26 @@ def operation(args: argparse.Namespace) -> int:
     workflow = document["state"]["workflow"]
     timeout_eligibility: dict[str, Any] | None = None
     latest = document["state"].get("latest_event")
-    if workflow["phase"] in {"owner_response", "reviewer_verification"} and isinstance(
+    started_text: str | None = None
+    kind = ""
+    if workflow["phase"] == "awaiting_initial_review":
+        kind = "initial_review_timeout"
+        started_text = document.get("created_at")
+    elif workflow["phase"] in {"owner_response", "reviewer_verification"} and isinstance(
         latest, dict
     ):
-        started = datetime.fromisoformat(latest["occurred_at"].replace("Z", "+00:00"))
         kind = (
             "owner_timeout"
             if workflow["phase"] == "owner_response"
             else "reviewer_timeout"
         )
+        started_text = latest["occurred_at"]
+    if started_text:
+        started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
         deadline = started + (
-            timedelta(hours=2) if kind == "owner_timeout" else timedelta(minutes=30)
+            timedelta(minutes=30)
+            if kind == "reviewer_timeout"
+            else timedelta(hours=2)
         )
         timeout_eligibility = {
             "event_kind": kind,
