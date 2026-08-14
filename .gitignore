@@ -1,4 +1,28 @@
+# Python runtime and packaging
 __pycache__/
 *.py[cod]
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Tool caches and reports
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# macOS
 .DS_Store
+
+# Repository-local workspace state
 .local/
+.claude/settings.local.json
+.env
