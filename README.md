@@ -1,6 +1,6 @@
 # Local PR Loop
 
-`local-pr-loop` is a vendor-neutral [Agent Skills](https://agentskills.io) package for an asynchronous, repository-local owner/reviewer code-review loop. It keeps durable review conversations and immutable history in JSON, checks source drift, records deadlines, and generates a Markdown report for the latest event.
+`local-pr-loop` is a vendor-neutral [Agent Skills](https://agentskills.io) package for an asynchronous, repository-local owner/reviewer code-review loop. It keeps durable review conversations and immutable history in JSON, checks source drift, records deadlines, and regenerates a skim-first Markdown summary of the whole loop on every publication.
 
 ## Install
 

@@ -37,6 +37,14 @@ class ReviewModuleBoundaryTest(unittest.TestCase):
         self.assertNotIn("review_state", projection_imports)
         self.assertIn("review_schema", projection_imports)
 
+    def test_workflow_layer_does_not_import_presentation_renderer(self) -> None:
+        workflow_imports = imported_modules(SCRIPTS / "review_workflow.py")
+
+        self.assertNotIn("review_render", workflow_imports)
+        self.assertIn("review_notes", workflow_imports)
+        # The shared note marker must stay dependency-neutral.
+        self.assertEqual(imported_modules(SCRIPTS / "review_notes.py"), set())
+
     def test_state_facade_exposes_schema_and_projection_contracts(self) -> None:
         self.assertIs(review_state.validate_event, review_schema.validate_event)
         self.assertIs(

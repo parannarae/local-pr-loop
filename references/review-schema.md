@@ -1,13 +1,13 @@
 # Review Artifact Format
 
-The skill version is `0.4.0`. Persisted compatibility uses an independent
+The skill version is `0.5.0`. Persisted compatibility uses an independent
 calendar revision:
 
 ```json
 {
   "format": "local-pr-loop",
   "format_revision": "2026-07-25.2",
-  "created_by": {"version": "0.4.0"},
+  "created_by": {"version": "0.5.0"},
   "review_id": "k7m3q9wx",
   "prior_review_id": null,
   "name": "feature-review",
@@ -133,6 +133,13 @@ open or any final check failed.
 An owner reply decision is `applied`, `declined`, or `deferred/blocked`.
 Blocked replies also require `blocker`, `completed_work`, `remaining_work`, and
 `validation_gap`.
+
+Any per-thread message may carry `Note to user:` lines — machine-written by the
+`add-note` helper — flagging design, contract, or business-logic shifts or
+decisions that need the user's attention. The summary report lifts them
+verbatim into its first section; mechanical fixes are never flagged.
+`deferred/blocked` replies, timeout terminals, and material gaps open at
+terminal surface there automatically without a marker.
 
 A reviewer may resolve a declined reply only with:
 

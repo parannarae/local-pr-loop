@@ -1,8 +1,18 @@
-"""Render review conversations and latest-event reports."""
+"""Render review conversations and the skim-first summary report."""
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+from review_notes import NOTE_MARKER
+
+RESOLUTION_LABEL_BY_DECISION = {
+    "applied": "**Fixed.**",
+    "declined": "**Declined, independently verified.**",
+}
+VERIFYING_EVENT_KINDS = {"reviewer_update", "final_review", "source_update"}
+TIMEOUT_OUTCOMES = {"owner_timeout", "reviewer_timeout"}
 
 
 def evidence_summary(value: Any) -> str:
@@ -87,85 +97,376 @@ def render_conversations(document: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_report(document: dict[str, Any]) -> str:
-    """Render the latest canonical event and projected state as Markdown."""
+# --- summary projection helpers ---
+
+
+def escape_html(text: str) -> str:
+    """Render history-derived angle brackets and ampersands inert."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def escape_cell(text: Any) -> str:
+    """Make history text safe inside one Markdown table cell.
+
+    HTML is entity-escaped, pipes are escaped, single line breaks collapse to
+    spaces, and paragraph breaks become renderer-owned `<br>`, so message
+    content can never open a new row, heading, or HTML element.
+    """
+    if not isinstance(text, str):
+        return ""
+    paragraphs = [
+        " ".join(paragraph.split())
+        for paragraph in re.split(r"\n\s*\n", escape_html(text).strip())
+        if paragraph.strip()
+    ]
+    return "<br>".join(paragraphs).replace("|", "\\|")
+
+
+def flatten_inline(text: Any) -> str:
+    """Collapse history text to one inert line for list items and headings.
+
+    One line cannot start a new heading or table row, and entity escaping
+    keeps embedded HTML from rendering as markup.
+    """
+    if not isinstance(text, str):
+        return ""
+    return " ".join(escape_html(text).split())
+
+
+def completed_rounds(history: list[dict[str, Any]]) -> int:
+    """Count owner replies that were verified by a later reviewer event."""
+    rounds = 0
+    awaiting_verification = False
+    for event in history:
+        kind = event.get("kind")
+        if kind == "owner_reply":
+            awaiting_verification = True
+        elif kind in VERIFYING_EVENT_KINDS and awaiting_verification:
+            rounds += 1
+            awaiting_verification = False
+    return rounds
+
+
+def event_date(event: dict[str, Any]) -> str:
+    """Return the recorded calendar date, preserving the event's offset."""
+    occurred_at = event.get("occurred_at", "")
+    return occurred_at.split("T")[0] if isinstance(occurred_at, str) else ""
+
+
+def marked_notes(event: dict[str, Any]) -> list[dict[str, str]]:
+    """Lift `Note to user:` lines from every per-thread message in one event."""
+    notes: list[dict[str, str]] = []
+    action_groups = (
+        event.get("replies", []),
+        event.get("decisions", []),
+        event.get("resolutions", []),
+        event.get("thread_impacts", []),
+    )
+    for actions in action_groups:
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            message = action.get("message")
+            if not isinstance(message, str):
+                continue
+            for line in message.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(NOTE_MARKER):
+                    notes.append(
+                        {
+                            "text": stripped[len(NOTE_MARKER):].strip(),
+                            "source": str(action.get("thread_id", "")),
+                        }
+                    )
+    return notes
+
+
+def gap_records(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Collect every gap definition and resolution message by gap ID."""
+    records: dict[str, dict[str, Any]] = {}
+    for event in history:
+        validation = event.get("validation")
+        if isinstance(validation, dict):
+            for gap in validation.get("gaps", []):
+                if isinstance(gap, dict) and isinstance(gap.get("gap_id"), str):
+                    records[gap["gap_id"]] = {"gap": gap, "resolution": None}
+        for resolution in event.get("gap_resolutions", []):
+            if isinstance(resolution, dict):
+                record = records.get(resolution.get("gap_id"))
+                if record is not None:
+                    record["resolution"] = resolution.get("message", "")
+    return records
+
+
+def summary_notes(document: dict[str, Any]) -> list[dict[str, str]]:
+    """Project the Notes-for-You items: marked notes plus structured signals.
+
+    One event contributes at most one note per thread and text: an
+    agent-marked note suppresses the automatic deferred/blocked duplicate for
+    its thread, while distinct notes from the same event stay distinct.
+    """
+    state = document["state"]
+    notes: list[dict[str, str]] = []
+    for event in document.get("history", []):
+        marked = marked_notes(event)
+        seen_texts = set()
+        for note in marked:
+            key = (note["source"], note["text"])
+            if key in seen_texts:
+                continue
+            seen_texts.add(key)
+            notes.append(note)
+        marked_normalized = {" ".join(note["text"].split()) for note in marked}
+        for reply in event.get("replies", []):
+            if not isinstance(reply, dict):
+                continue
+            if reply.get("decision") != "deferred/blocked":
+                continue
+            generated = (
+                f"[blocked] {reply.get('blocker', '')} Remaining work: "
+                f"{reply.get('remaining_work', '')}"
+            )
+            # The blocked-work alert always surfaces; only a marked note that
+            # is an exact normalized duplicate of it may replace it, so an
+            # unrelated note on the same thread cannot hide the blocker.
+            if " ".join(generated.split()) in marked_normalized:
+                continue
+            notes.append(
+                {"text": generated, "source": str(reply.get("thread_id", ""))}
+            )
+    terminal = state.get("terminal")
+    if isinstance(terminal, dict) and terminal.get("outcome") in TIMEOUT_OUTCOMES:
+        open_threads = ", ".join(state["threads"]["open"]) or "none"
+        notes.append(
+            {
+                "text": (
+                    f"[action required] Review ended by {terminal['outcome']} — "
+                    f"threads still open at termination: {open_threads}"
+                ),
+                "source": "",
+            }
+        )
+        records = gap_records(document.get("history", []))
+        for gap_id in state["validation_gaps"]["open"]:
+            record = records.get(gap_id)
+            if record and record["gap"].get("material"):
+                gap = record["gap"]
+                notes.append(
+                    {
+                        "text": (
+                            f"[action required] Material validation gap still open: "
+                            f"{gap.get('check', '')} — {gap.get('reason', '')}"
+                        ),
+                        "source": gap_id,
+                    }
+                )
+    return notes
+
+
+def render_note_item(note: dict[str, str]) -> str:
+    """Render one note as a list item, bolding a leading bracketed tag."""
+    text = flatten_inline(note["text"])
+    match = re.match(r"^\[([^\]]+)\]\s*(.*)$", text)
+    if match:
+        text = f"**[{match.group(1)}]** {match.group(2)}"
+    suffix = f" *({note['source']})*" if note["source"] else ""
+    return f"- {text}{suffix}"
+
+
+def thread_sort_key(item: dict[str, Any]) -> tuple[str, int]:
+    thread = item["thread"]
+    return (thread.get("priority", "P3"), int(thread["id"][1:]))
+
+
+def end_picture(item: dict[str, Any], workflow: dict[str, Any]) -> str:
+    """Derive the End-picture cell from one thread's conversation trail."""
+    conversation = item["conversation"]
+    if item["status"] == "resolved":
+        last_decision = None
+        resolution_message = ""
+        for entry in conversation:
+            action = entry["entry"]
+            if "decision" in action:
+                last_decision = action["decision"]
+            if entry["kind"] == "final_review" or action.get("action") == "resolve":
+                resolution_message = action.get("message", "")
+        label = RESOLUTION_LABEL_BY_DECISION.get(last_decision, "**Resolved.**")
+        return f"{label} {resolution_message}".strip()
+    awaiting = workflow.get("primary_actor") or "none"
+    if conversation:
+        action = conversation[-1]["entry"]
+        label = action.get("decision") or action.get("action") or "update"
+        base = f"{label}: {action.get('message', '')}"
+    else:
+        base = "open"
+    return f"{base} — in progress, awaiting {awaiting}"
+
+
+def rejection_cell(item: dict[str, Any]) -> str:
+    """Collect declined/deferred reasons and post-applied reviewer pushback."""
+    parts: list[str] = []
+    last_owner_decision = None
+    for entry in item["conversation"]:
+        action = entry["entry"]
+        if "decision" in action:
+            if action["decision"] != "applied":
+                parts.append(action.get("message", ""))
+            last_owner_decision = action["decision"]
+        elif (
+            action.get("action") in {"comment", "reopen"}
+            and last_owner_decision == "applied"
+        ):
+            parts.append(action.get("message", ""))
+    return "; ".join(part for part in parts if part) or "—"
+
+
+def render_header(document: dict[str, Any], note_count: int) -> list[str]:
     state = document["state"]
     workflow = state["workflow"]
+    history = document.get("history", [])
+    terminal = state.get("terminal")
     lines = [
-        "# Latest Review Report",
+        f"# Review Summary — {flatten_inline(document['name'])} "
+        f"(`{document['review_id']}`)",
         "",
-        f"- Review ID: {document['review_id']}",
-        f"- Review name: {document['name']}",
-        f"- Workflow phase: {workflow['phase']}",
-        f"- Primary actor: {workflow['primary_actor'] or 'None'}",
-        f"- Primary action: {(workflow['primary_action'] or {}).get('kind', 'None')}",
-        f"- Open threads: {', '.join(state['threads']['open']) or 'None'}",
-        f"- Resolved threads: {', '.join(state['threads']['resolved']) or 'None'}",
-        f"- Open validation gaps: {', '.join(state['validation_gaps']['open']) or 'None'}",
-        f"- Resolved validation gaps: {', '.join(state['validation_gaps']['resolved']) or 'None'}",
-        f"- Source fingerprint: {state['source_fingerprint'] or 'Unavailable'}",
     ]
-    if not document["history"]:
-        return "\n".join(lines) + "\n"
-    event = document["history"][-1]
+    if isinstance(terminal, dict):
+        rounds = completed_rounds(history)
+        rounds_text = f"{rounds} completed review round{'s' if rounds != 1 else ''}"
+        events_text = f"{len(history)} event{'s' if len(history) != 1 else ''}"
+        date = event_date(history[-1]) if history else ""
+        outcome = terminal.get("outcome")
+        outcome_text = (
+            "**Outcome: LGTM**"
+            if outcome == "lgtm"
+            else f"**Outcome: ended by {outcome} — review incomplete**"
+        )
+        lines.append(f"- {outcome_text} · {rounds_text}, {events_text} · {date}")
+    else:
+        actor = workflow.get("primary_actor") or "none"
+        action = (workflow.get("primary_action") or {}).get("kind", "none")
+        open_threads = ", ".join(state["threads"]["open"]) or "none"
+        lines.append(
+            f"- **In progress** — waiting on: {actor} to {action}"
+            f" · open: {open_threads}"
+        )
+    if note_count:
+        lines.append(
+            f"- **Attention: {note_count} note{'s' if note_count != 1 else ''}"
+            " for you**"
+        )
+    else:
+        lines.append("- No notes — nothing flagged for you")
+    return lines
+
+
+def render_issue_summary(document: dict[str, Any]) -> list[str]:
+    workflow = document["state"]["workflow"]
+    threads = sorted(thread_conversations(document), key=thread_sort_key)
+    gaps = gap_records(document.get("history", []))
+    lines = ["## Issue Summary", ""]
+    if not threads and not gaps:
+        lines.append("No findings raised.")
+        return lines
     lines.extend(
         [
-            f"- Latest event: {event['kind']} ({event['event_id']})",
-            f"- Recorded at: {event['occurred_at']}",
-            "",
+            "| ID | Raised issue | End picture | Rejected / deferred (why) |",
+            "|---|---|---|---|",
         ]
     )
-    threads = event.get("threads", []) or event.get("new_threads", [])
-    if threads:
-        lines.extend(["## Threads", ""])
-        for thread in threads:
-            lines.extend(
-                [
-                    f"### {thread['id']} [{thread['priority']}]: {thread['title']}",
-                    "",
-                    thread["risk"],
-                    "",
-                    f"Evidence: {evidence_summary(thread['evidence'])}",
-                    "",
-                    f"Required behavior: {thread['required_behavior']}",
-                    "",
-                ]
-            )
-    actions = (
-        event.get("replies")
-        or event.get("decisions")
-        or event.get("resolutions")
-        or event.get("thread_impacts")
-        or []
-    )
-    if actions:
-        lines.extend(["## Thread Actions", ""])
-        for action in actions:
-            label = action.get("decision") or action.get("action") or "resolved"
-            lines.extend(
-                [f"### {action['thread_id']}: {label}", "", action["message"], ""]
-            )
-    validation = event.get("validation")
-    if isinstance(validation, dict):
-        lines.extend(["## Validation", ""])
-        for check in validation.get("performed", []):
-            lines.append(f"- {check.get('result')}: {check.get('check')}")
-        if not validation.get("performed"):
-            lines.append("- None")
-        lines.extend(["", "## Validation Gaps", ""])
-        for gap in validation.get("gaps", []):
-            material = "material" if gap.get("material") else "non-material"
-            lines.append(f"- [{material}] {gap.get('check')}: {gap.get('reason')}")
-        if not validation.get("gaps"):
-            lines.append("- None")
-    if state["terminal"]:
-        lines.extend(
-            [
-                "",
-                "## Terminal Outcome",
-                "",
-                f"- Outcome: {state['terminal']['outcome']}",
-                f"- Occurred at: {state['terminal']['occurred_at']}",
-            ]
+    for item in threads:
+        thread = item["thread"]
+        identity = f"{thread['id']} `{thread.get('priority', '')}`"
+        raised = escape_cell(
+            f"{thread.get('title', '')} — {thread.get('risk', '')}"
         )
+        lines.append(
+            f"| {identity} | {raised} | {escape_cell(end_picture(item, workflow))} |"
+            f" {escape_cell(rejection_cell(item))} |"
+        )
+    open_gaps = set(document["state"]["validation_gaps"]["open"])
+    for gap_id in sorted(gaps, key=lambda value: int(value[1:])):
+        record = gaps[gap_id]
+        gap = record["gap"]
+        badge = "material" if gap.get("material") else "non-material"
+        raised = escape_cell(f"{gap.get('check', '')} — {gap.get('reason', '')}")
+        if gap_id in open_gaps:
+            picture = "open — awaiting reviewer resolution"
+        else:
+            picture = f"**Resolved.** {record['resolution'] or ''}".strip()
+        lines.append(
+            f"| {gap_id} `{badge}` | {raised} | {escape_cell(picture)} | — |"
+        )
+    return lines
+
+
+def render_verification(document: dict[str, Any]) -> list[str]:
+    state = document["state"]
+    history = document.get("history", [])
+    lines = ["## Verification", ""]
+    seen_checks = []
+    for event in history:
+        validation = event.get("validation")
+        if not isinstance(validation, dict):
+            continue
+        for check in validation.get("performed", []):
+            key = (check.get("result"), check.get("check"))
+            if key not in seen_checks:
+                seen_checks.append(key)
+    for result, check in seen_checks:
+        lines.append(f"- {result}: {flatten_inline(check)}")
+    if not seen_checks:
+        lines.append("- No validation checks recorded")
+    fingerprint = state.get("source_fingerprint")
+    if fingerprint and history:
+        # Timeout events carry no snapshot, so walk history backward for the
+        # snapshot that recorded the current guarded fingerprint.
+        snapshot: dict[str, Any] | None = None
+        for event in reversed(history):
+            for key in ("completed_source_snapshot", "source_snapshot"):
+                candidate = event.get(key)
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("fingerprint") == fingerprint
+                ):
+                    snapshot = candidate
+                    break
+            if snapshot is not None:
+                break
+        scope = snapshot.get("scope", []) if isinstance(snapshot, dict) else []
+        scope_text = ", ".join(f"`{path}`" for path in scope) or "unrecorded scope"
+        count = f"{len(scope)} file{'s' if len(scope) != 1 else ''}"
+        terminal = state.get("terminal")
+        subject = (
+            "LGTM applies to"
+            if isinstance(terminal, dict) and terminal.get("outcome") == "lgtm"
+            else "Recorded source"
+        )
+        lines.append(
+            f"- {subject} fingerprint `{fingerprint[:8]}…` over {count}: {scope_text}"
+        )
+    lines.extend(
+        [
+            "- Approval freshness: run `inspect` — this page is a cache and does"
+            " not know current drift",
+            "- Full conversations: `threads` command or canonical JSON; this page"
+            " is intentionally a skim view",
+        ]
+    )
+    return lines
+
+
+def render_report(document: dict[str, Any]) -> str:
+    """Render the skim-first summary page from canonical history."""
+    notes = summary_notes(document)
+    lines = render_header(document, len(notes))
+    lines.extend(["", "## Notes for You", ""])
+    if notes:
+        lines.extend(render_note_item(note) for note in notes)
+    else:
+        lines.append("None recorded — neither agent flagged a design-shifting change")
+    lines.append("")
+    lines.extend(render_issue_summary(document))
+    lines.append("")
+    lines.extend(render_verification(document))
     return "\n".join(lines).rstrip() + "\n"

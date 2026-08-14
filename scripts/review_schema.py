@@ -25,7 +25,7 @@ __all__ = [
 
 FORMAT = "local-pr-loop"
 FORMAT_REVISION = "2026-07-25.2"
-CREATOR_VERSION = "0.4.0"
+CREATOR_VERSION = "0.5.0"
 
 ACTOR_BY_KIND = {
     "review": "reviewer",

@@ -18,6 +18,15 @@ from review_io import (
     require_secure_regular,
     secure_json,
 )
+from review_notes import NOTE_MARKER
+
+# Draft event kinds that carry per-thread message entries a note can join.
+NOTE_ENTRY_FIELD_BY_KIND = {
+    "owner_reply": "replies",
+    "reviewer_update": "decisions",
+    "final_review": "resolutions",
+    "source_update": "thread_impacts",
+}
 
 
 def verify_lease(args: argparse.Namespace) -> dict[str, Any]:
@@ -132,6 +141,16 @@ def refresh_guard(args: argparse.Namespace) -> int:
     return 0
 
 
+def refresh_draft_timestamp(event: dict[str, Any]) -> None:
+    """Restamp the draft's occurred_at at helper-write time.
+
+    Templates stamp occurred_at at creation, while helpers add evidence
+    observed later; without this refresh every helper-touched draft fails
+    validation because evidence must not postdate its event.
+    """
+    event["occurred_at"] = datetime.now(timezone.utc).isoformat()
+
+
 def abort_draft(args: argparse.Namespace) -> int:
     verify_lease(args)
     event = Path(args.event)
@@ -165,6 +184,7 @@ def add_check(args: argparse.Namespace) -> int:
         if args.artifact_digest:
             check["evidence"]["artifact_digest"] = args.artifact_digest
     validation["performed"].append(check)
+    refresh_draft_timestamp(event)
     secure_json(event_path, event)
     print(
         json.dumps({"status": "check_added", "draft": str(event_path)}, sort_keys=True)
@@ -200,10 +220,48 @@ def add_gap(args: argparse.Namespace) -> int:
             "material": args.material,
         }
     )
+    refresh_draft_timestamp(event)
     secure_json(event_path, event)
     print(
         json.dumps(
             {"status": "gap_added", "gap_id": gap_id, "draft": str(event_path)},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def add_note(args: argparse.Namespace) -> int:
+    """Append a machine-formatted `Note to user:` line to a draft entry."""
+    verify_lease(args)
+    event_path = Path(args.event)
+    require_secure_regular(event_path, "draft")
+    event = load_object(event_path)
+    field = NOTE_ENTRY_FIELD_BY_KIND.get(event.get("kind"))
+    if field is None:
+        raise ValueError(
+            f"draft kind {event.get('kind')!r} has no per-thread message entry;"
+            " add the note on the next reply, decision, or resolution"
+        )
+    entry = next(
+        (
+            item
+            for item in event.get(field, [])
+            if isinstance(item, dict) and item.get("thread_id") == args.thread
+        ),
+        None,
+    )
+    if entry is None:
+        raise ValueError(f"draft has no {field} entry for thread {args.thread}")
+    tag_prefix = f"[{args.tag}] " if args.tag else ""
+    note_line = f"{NOTE_MARKER} {tag_prefix}{args.note}"
+    message = entry.get("message", "")
+    entry["message"] = f"{message}\n{note_line}" if message else note_line
+    refresh_draft_timestamp(event)
+    secure_json(event_path, event)
+    print(
+        json.dumps(
+            {"status": "note_added", "thread_id": args.thread, "draft": str(event_path)},
             sort_keys=True,
         )
     )
@@ -322,6 +380,7 @@ def main() -> int:
         "abort-draft",
         "add-check",
         "add-gap",
+        "add-note",
     ):
         child = commands.add_parser(name)
         child.add_argument("--repo", required=True)
@@ -347,6 +406,11 @@ def main() -> int:
             child.add_argument("--check", required=True)
             child.add_argument("--reason", required=True)
             child.add_argument("--material", action="store_true")
+        if name == "add-note":
+            child.add_argument("--event", required=True)
+            child.add_argument("--thread", required=True)
+            child.add_argument("--note", required=True)
+            child.add_argument("--tag")
     wait_parser = commands.add_parser("wait")
     wait_parser.add_argument("--review", required=True)
     wait_parser.add_argument("--timeout", type=int, default=300)
@@ -371,6 +435,8 @@ def main() -> int:
         return add_check(args)
     if args.command == "add-gap":
         return add_gap(args)
+    if args.command == "add-note":
+        return add_note(args)
     if args.command == "await-handoff":
         if not 1 <= args.round_seconds <= 86400:
             parser.error("--round-seconds must be between 1 and 86400 seconds")

@@ -239,6 +239,48 @@ def command_snapshot(args: argparse.Namespace) -> int:
     return run_helper(SNAPSHOT_SCRIPT, snapshot_arguments(args)).returncode
 
 
+def command_scope_candidates(args: argparse.Namespace) -> int:
+    """Collect the mechanical candidate set for a guarded scope.
+
+    Emits every changed path grouped by change kind; choosing the comparison
+    base and judging relevance stays with the agent.
+    """
+    root = str(repository_paths(args.repo).root)
+
+    def git_lines(*arguments: str) -> list[str]:
+        completed = subprocess.run(
+            ["git", "-C", root, *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ValueError(
+                f"git {' '.join(arguments)} failed: {completed.stderr.strip()}"
+            )
+        return [line for line in completed.stdout.splitlines() if line]
+
+    merge_base = None
+    candidates: dict[str, list[str]] = {}
+    if args.base_ref:
+        merge_base = git_lines("merge-base", "HEAD", args.base_ref)[0]
+        candidates["merge_base_diff"] = git_lines(
+            "diff", "--name-only", f"{merge_base}..HEAD"
+        )
+    candidates["staged"] = git_lines("diff", "--name-only", "--cached")
+    candidates["unstaged"] = git_lines("diff", "--name-only")
+    candidates["untracked"] = git_lines("ls-files", "--others", "--exclude-standard")
+    union = sorted({path for group in candidates.values() for path in group})
+    print(
+        json.dumps(
+            {"merge_base": merge_base, "candidates": candidates, "union": union},
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def command_inspect(args: argparse.Namespace) -> int:
     paths = review_paths(args.repo, args.review_id)
     validate_review(paths)
@@ -524,6 +566,23 @@ def command_add_gap(args: argparse.Namespace) -> int:
     return run_helper(WORKFLOW_SCRIPT, values).returncode
 
 
+def command_add_note(args: argparse.Namespace) -> int:
+    paths = review_paths(args.repo, args.review_id)
+    values = [
+        "add-note",
+        *workflow_arguments(paths),
+        "--event",
+        str(paths.event),
+        "--thread",
+        args.thread_id,
+        "--note",
+        args.note,
+    ]
+    if args.tag:
+        values.extend(["--tag", args.tag])
+    return run_helper(WORKFLOW_SCRIPT, values).returncode
+
+
 def command_evidence_template(args: argparse.Namespace) -> int:
     return run_helper(STATE_SCRIPT, ["evidence-template", args.basis]).returncode
 
@@ -667,6 +726,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_gap.add_argument("--material", action="store_true")
     add_gap.set_defaults(handler=command_add_gap)
 
+    add_note = commands.add_parser("add-note")
+    add_review_selection(add_note)
+    add_note.add_argument("thread_id")
+    add_note.add_argument("note")
+    add_note.add_argument(
+        "--tag", choices=("action-required", "follow-up", "decision")
+    )
+    add_note.set_defaults(handler=command_add_note)
+
     evidence = commands.add_parser("evidence-template")
     evidence.add_argument("basis", choices=review_state.EVIDENCE_BASES)
     evidence.set_defaults(handler=command_evidence_template)
@@ -675,6 +743,11 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("repo")
     add_scope_arguments(snapshot)
     snapshot.set_defaults(handler=command_snapshot)
+
+    scope_candidates = commands.add_parser("scope-candidates")
+    scope_candidates.add_argument("repo")
+    scope_candidates.add_argument("base_ref", nargs="?")
+    scope_candidates.set_defaults(handler=command_scope_candidates)
 
     lock = commands.add_parser("lock")
     lock.add_argument("action", choices=("acquire", "status", "release"))

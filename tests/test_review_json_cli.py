@@ -541,6 +541,188 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertEqual(self.await_handoff(1, 0).returncode, 2)
         self.assertEqual(self.await_handoff(0, 1).returncode, 2)
 
+    # --- add-note ---
+
+    def test_add_note_rejects_initial_review_draft(self) -> None:
+        self.snapshot()
+        self.acquire()
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "--json",
+            "example.txt",
+            cwd=self.repo,
+        )
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "template",
+            str(self.repo),
+            self.review_id,
+            "review",
+            cwd=self.repo,
+        )
+        # An initial review carries threads without message entries, so a note
+        # has nowhere to land and the helper must refuse with guidance.
+        failed = run(
+            sys.executable,
+            str(SCRIPT),
+            "add-note",
+            str(self.repo),
+            self.review_id,
+            "T1",
+            "should not land",
+            cwd=self.repo,
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("no per-thread message entry", failed.stderr)
+
+    def test_add_note_round_trips_into_summary_notes_section(self) -> None:
+        source = self.snapshot()
+        self.acquire()
+        self.prepare_review(source)
+        self.publish()
+
+        self.acquire()
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "--json",
+            "example.txt",
+            cwd=self.repo,
+        )
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "template",
+            str(self.repo),
+            self.review_id,
+            "owner_reply",
+            cwd=self.repo,
+        )
+        event = json.loads(self.event.read_text())
+        event["source_drift_assessment"] = "No drift."
+        event["guide_synchronization"] = "No guide impact."
+        event["replies"][0].update(
+            {"decision": "applied", "message": "Updated the example."}
+        )
+        event["replies"][0]["evidence"].update(
+            {
+                "provenance": "example.txt",
+                "sanitized_result": "The file now holds the new value.",
+            }
+        )
+        event["validation"]["performed"] = [
+            {"check": "source inspection", "result": "passed"}
+        ]
+        write_json(self.event, event)
+        noted = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "add-note",
+                str(self.repo),
+                self.review_id,
+                "T1",
+                "design shifted to eventual consistency",
+                "--tag",
+                "decision",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertEqual(noted["status"], "note_added")
+        # No manual occurred_at repair: the helper restamps the draft, so the
+        # publish below also proves the timestamp refresh.
+        result = json.loads(self.publish().stdout)
+        self.assertTrue(result["committed"])
+        report = self.report.read_text()
+        self.assertIn("- **Attention: 1 note for you**", report)
+        self.assertIn(
+            "- **[decision]** design shifted to eventual consistency *(T1)*",
+            report,
+        )
+        self.assertLess(
+            report.index("## Notes for You"), report.index("## Issue Summary")
+        )
+
+    # --- scope-candidates ---
+
+    def test_scope_candidates_groups_changed_paths_and_unions_them(self) -> None:
+        (self.repo / "example.txt").write_text("modified\n")
+        (self.repo / "new.txt").write_text("untracked\n")
+        result = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "scope-candidates",
+                str(self.repo),
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertIsNone(result["merge_base"])
+        self.assertIn("example.txt", result["candidates"]["unstaged"])
+        self.assertIn("new.txt", result["candidates"]["untracked"])
+        self.assertEqual(result["union"], ["example.txt", "new.txt"])
+
+    def test_scope_candidates_with_base_ref_reports_merge_base_diff(self) -> None:
+        with_base = json.loads(
+            run(
+                sys.executable,
+                str(SCRIPT),
+                "scope-candidates",
+                str(self.repo),
+                "HEAD",
+                cwd=self.repo,
+            ).stdout
+        )
+        self.assertTrue(with_base["merge_base"])
+        self.assertEqual(with_base["candidates"]["merge_base_diff"], [])
+
+    # --- draft helper timestamp refresh ---
+
+    def test_draft_helpers_restamp_occurred_at(self) -> None:
+        self.snapshot()
+        self.acquire()
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "inspect",
+            str(self.repo),
+            self.review_id,
+            "--json",
+            "example.txt",
+            cwd=self.repo,
+        )
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "template",
+            str(self.repo),
+            self.review_id,
+            "review",
+            cwd=self.repo,
+        )
+        templated_at = json.loads(self.event.read_text())["occurred_at"]
+        run(
+            sys.executable,
+            str(SCRIPT),
+            "add-check",
+            str(self.repo),
+            self.review_id,
+            "passed",
+            "schema validation",
+            cwd=self.repo,
+        )
+        restamped_at = json.loads(self.event.read_text())["occurred_at"]
+        self.assertGreater(restamped_at, templated_at)
+
     # --- follow-up routing ---
 
     def test_initial_final_review_and_source_drift_route_to_follow_up(self) -> None:

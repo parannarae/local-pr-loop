@@ -17,21 +17,19 @@ plus the latest report beneath `.local/reviews/`. Keep the ID unchanged.
 ## Determine the Guarded Scope
 
 Determine the comparison base from the user's request or pull-request metadata.
-Ask when more than one base is plausible. Compute the merge base, then form the
-candidate set from:
+Ask when more than one base is plausible. Collect the mechanical candidate set
+with one command; omit `BASE_REF` when reviewing uncommitted work only:
 
 ```bash
-git merge-base HEAD BASE_REF
-git diff --name-only MERGE_BASE..HEAD
-git diff --name-only --cached
-git diff --name-only
-git ls-files --others --exclude-standard
+python3 "$SKILL_DIR/scripts/review_cli.py" scope-candidates REPO [BASE_REF]
 ```
 
-Guard relevant modified implementation, tests, configuration, deployment
-manifests, and guides. Read unchanged callers and dependencies as context without
-adding them to scope. Add relevant ignored or generated files with
-`--additional-input`.
+It returns the merge base plus changed paths grouped by kind (merge-base diff,
+staged, unstaged, untracked) and their union. Selecting from the candidates is
+judgment, not mechanics: guard relevant modified implementation, tests,
+configuration, deployment manifests, and guides. Read unchanged callers and
+dependencies as context without adding them to scope. Add relevant ignored or
+generated files with `--additional-input`.
 
 ## Inspect
 
@@ -88,7 +86,18 @@ python3 "$SKILL_DIR/scripts/review_cli.py" add-check \
   REPO REVIEW_ID passed "focused tests"
 python3 "$SKILL_DIR/scripts/review_cli.py" add-gap \
   REPO REVIEW_ID "live probe" "service unavailable" --material
+python3 "$SKILL_DIR/scripts/review_cli.py" add-note \
+  REPO REVIEW_ID T2 "bump deferred to the release commit" --tag decision
 ```
+
+`add-note` appends a machine-formatted user-facing note to the draft's reply,
+decision, resolution, or thread impact for the given thread; use it only for
+design-shifting changes, never mechanical fixes. An initial `review` draft has
+no per-thread message entry, so add the note on the next decision instead.
+
+Every draft helper restamps the draft's `occurred_at` when it writes, so
+evidence recorded after templating never postdates its event. Never hand-edit
+the timestamp.
 
 Use the event kind and fields defined in
 [review-schema.md](review-schema.md).

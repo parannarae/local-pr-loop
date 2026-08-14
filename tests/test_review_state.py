@@ -421,11 +421,11 @@ class ReviewStateTest(unittest.TestCase):
         self.assertEqual(document["state"]["terminal"]["outcome"], "lgtm")
 
         report = review_state.render_report(document)
-        self.assertIn("# Latest Review Report", report)
-        self.assertIn("- Review name: review", report)
-        self.assertIn("- Latest event: final_review (evt_test_0005)", report)
-        self.assertIn("## Terminal Outcome", report)
-        self.assertIn("- Outcome: lgtm", report)
+        self.assertIn("# Review Summary — review (`abcdefgh`)", report)
+        self.assertIn("- **Outcome: LGTM**", report)
+        self.assertIn("## Notes for You", report)
+        self.assertIn("## Issue Summary", report)
+        self.assertIn("## Verification", report)
 
     def test_contextual_templates_cover_timeout_and_gap_obligations(self) -> None:
         document = review_state.new_document("abcdefgh", "review")

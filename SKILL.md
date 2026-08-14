@@ -1,9 +1,9 @@
 ---
 name: local-pr-loop
-description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and latest-event Markdown reports — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
+description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and a skim-first Markdown summary report — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
 license: MIT
 metadata:
-  version: "0.4.0"
+  version: "0.5.0"
 ---
 
 # Local PR Loop
@@ -66,6 +66,13 @@ Use stable `T<N>` IDs as durable review conversations:
 
 Only the reviewer resolves or reopens threads. Preserve all replies and decisions
 as immutable events and derive thread state from history.
+
+When a change shifts design, a behavior contract, or business logic, or a
+decision needs the user's attention, flag it with `add-note` on your draft
+reply, decision, or resolution — the summary report lifts these notes into the
+section the user reads first. Never flag mechanical fixes. Both roles may
+write notes; `deferred/blocked` replies and timeout terminals surface
+automatically without one.
 
 ### Topology
 
@@ -136,7 +143,8 @@ handoff.
 5. Create a state-aware draft with `template REPO REVIEW_ID KIND`. Read
    `threads` when handling a multi-turn conversation.
 6. Populate the remaining blanks. Use `add-check`, `add-gap`, and
-   `evidence-template` for correctly shaped validation records.
+   `evidence-template` for correctly shaped validation records, and `add-note`
+   for user-facing notes on design-shifting changes.
 7. Run `validate-event`, repeat `inspect`, then run `publish REPO REVIEW_ID`.
 8. Read the structured publication result. After any nonzero result, inspect
    canonical state first. If `committed` is true or the event is latest, never

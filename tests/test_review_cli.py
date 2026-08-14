@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import review_cli
+import review_schema
 
 
 class ReviewCliTest(unittest.TestCase):
@@ -33,6 +35,7 @@ class ReviewCliTest(unittest.TestCase):
                 "abort-draft",
                 "add-check",
                 "add-gap",
+                "add-note",
                 "await-handoff",
                 "evidence-template",
                 "init",
@@ -42,6 +45,7 @@ class ReviewCliTest(unittest.TestCase):
                 "publish-timeout",
                 "recover-publish",
                 "regenerate-report",
+                "scope-candidates",
                 "snapshot",
                 "start-follow-up",
                 "template",
@@ -51,3 +55,13 @@ class ReviewCliTest(unittest.TestCase):
                 "wait",
             },
         )
+
+    def test_package_version_references_are_consistent(self) -> None:
+        skill_text = (ROOT / "SKILL.md").read_text()
+        match = re.search(r'^  version: "([^"]+)"$', skill_text, re.MULTILINE)
+        self.assertIsNotNone(match)
+        version = match.group(1)
+        self.assertEqual(version, review_schema.CREATOR_VERSION)
+        schema_document = (ROOT / "references" / "review-schema.md").read_text()
+        self.assertIn(f"The skill version is `{version}`.", schema_document)
+        self.assertIn(f'"created_by": {{"version": "{version}"}}', schema_document)
