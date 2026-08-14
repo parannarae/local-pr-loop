@@ -210,10 +210,20 @@ def add_gap(args: argparse.Namespace) -> int:
     return 0
 
 
-def wait_for_change(args: argparse.Namespace) -> int:
-    review = Path(args.review)
-    initial = hashlib.sha256(review.read_bytes()).hexdigest()
-    wall_deadline = datetime.now(timezone.utc).timestamp() + args.timeout
+def poll_for_change(
+    review: Path, timeout: int, initial: str | None = None
+) -> dict[str, str]:
+    """Poll canonical JSON until it changes, the active handoff deadline
+    passes, or the bounded timeout lapses; return the structured result.
+
+    `initial` is the expected canonical SHA-256. Callers that wait across
+    several polls must capture it once and pass the same value to every poll,
+    or a change landing between polls is absorbed into the next baseline and
+    reported as no change.
+    """
+    if initial is None:
+        initial = hashlib.sha256(review.read_bytes()).hexdigest()
+    wall_deadline = datetime.now(timezone.utc).timestamp() + timeout
     document = load_object(review)
     workflow = document["state"]["workflow"]
     latest = document["state"].get("latest_event")
@@ -232,15 +242,73 @@ def wait_for_change(args: argparse.Namespace) -> int:
         time.sleep(min(2.0, max(0.0, remaining)))
         current = hashlib.sha256(review.read_bytes()).hexdigest()
         if current != initial:
-            print(json.dumps({"status": "changed", "canonical_sha256": current}))
-            return 0
+            return {"status": "changed", "canonical_sha256": current}
+    # Final comparison closes the boundary race: a change that landed before
+    # this poll started, or in its last instant, must win over a timeout.
+    current = hashlib.sha256(review.read_bytes()).hexdigest()
+    if current != initial:
+        return {"status": "changed", "canonical_sha256": current}
     status = (
         "deadline_reached"
         if handoff_deadline is not None and handoff_deadline <= wall_deadline
         else "timeout"
     )
-    print(json.dumps({"status": status, "canonical_sha256": initial}))
-    return 3
+    return {"status": status, "canonical_sha256": initial}
+
+
+def wait_for_change(args: argparse.Namespace) -> int:
+    result = poll_for_change(Path(args.review), args.timeout)
+    print(json.dumps(result))
+    return 0 if result["status"] == "changed" else 3
+
+
+def await_handoff(args: argparse.Namespace) -> int:
+    """Span one handoff by re-arming bounded polls until a structured outcome.
+
+    Exit codes: 0 for `changed` or `terminal`, 4 for `timeout_eligible`, and
+    5 for `exhausted`. The round bound is mandatory: `awaiting_initial_review`
+    has no handoff deadline, so an unbounded wait there would never return.
+    """
+    review = Path(args.review)
+    # Capture the baseline before reading the workflow: a publication landing
+    # between these two statements then reports as changed on the first poll
+    # instead of being absorbed into a later baseline.
+    baseline = hashlib.sha256(review.read_bytes()).hexdigest()
+    workflow = load_object(review)["state"]["workflow"]
+    if workflow["phase"] == "terminal":
+        print(json.dumps({"status": "terminal", "rounds_used": 0}, sort_keys=True))
+        return 0
+    deadline_note = (
+        "a handoff deadline applies"
+        if workflow["phase"] in {"owner_response", "reviewer_verification"}
+        else "no handoff deadline in this phase"
+    )
+    print(
+        f"waiting_for: {workflow['primary_actor']}"
+        f" to {workflow['primary_action']['kind']} ({deadline_note})",
+        flush=True,
+    )
+    for round_number in range(1, args.max_rounds + 1):
+        result = poll_for_change(review, args.round_seconds, baseline)
+        outcome = {
+            "rounds_used": round_number,
+            "canonical_sha256": result["canonical_sha256"],
+        }
+        if result["status"] == "changed":
+            phase = load_object(review)["state"]["workflow"]["phase"]
+            outcome["status"] = "terminal" if phase == "terminal" else "changed"
+            print(json.dumps(outcome, sort_keys=True))
+            return 0
+        if result["status"] == "deadline_reached":
+            outcome["status"] = "timeout_eligible"
+            print(json.dumps(outcome, sort_keys=True))
+            return 4
+    print(
+        json.dumps(
+            {"status": "exhausted", "rounds_used": args.max_rounds}, sort_keys=True
+        )
+    )
+    return 5
 
 
 def main() -> int:
@@ -282,6 +350,10 @@ def main() -> int:
     wait_parser = commands.add_parser("wait")
     wait_parser.add_argument("--review", required=True)
     wait_parser.add_argument("--timeout", type=int, default=300)
+    await_parser = commands.add_parser("await-handoff")
+    await_parser.add_argument("--review", required=True)
+    await_parser.add_argument("--round-seconds", type=int, default=300)
+    await_parser.add_argument("--max-rounds", type=int, default=24)
     args = parser.parse_args()
     if args.command == "acquire":
         return acquire_lease(args)
@@ -299,6 +371,12 @@ def main() -> int:
         return add_check(args)
     if args.command == "add-gap":
         return add_gap(args)
+    if args.command == "await-handoff":
+        if not 1 <= args.round_seconds <= 86400:
+            parser.error("--round-seconds must be between 1 and 86400 seconds")
+        if args.max_rounds < 1:
+            parser.error("--max-rounds must be at least 1")
+        return await_handoff(args)
     if not 1 <= args.timeout <= 86400:
         parser.error("--timeout must be between 1 and 86400 seconds")
     return wait_for_change(args)

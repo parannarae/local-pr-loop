@@ -33,6 +33,7 @@ class ReviewCliTest(unittest.TestCase):
                 "abort-draft",
                 "add-check",
                 "add-gap",
+                "await-handoff",
                 "evidence-template",
                 "init",
                 "inspect",

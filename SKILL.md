@@ -1,12 +1,17 @@
 ---
 name: local-pr-loop
-description: Run owner or reviewer role in a repository-local JSON PR loop with durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and latest-event Markdown reports. Use for review exchanges without hosted PR comments that continue until every thread is resolved and the current source reaches LGTM.
+description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and latest-event Markdown reports — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
 license: MIT
 metadata:
-  version: "0.3.1"
+  version: "0.4.0"
 ---
 
 # Local PR Loop
+
+Do not simulate this loop with ad-hoc subagent review rounds — a review without
+durable threads, a source guard, and a lock is not a local-pr-loop. The cheapest
+correct path is already built in: run `init`, then `inspect`, then the one
+recommended command it prints, and repeat.
 
 Store each loop under the target repository's `.local/reviews/`. `init` returns
 a random `REVIEW_ID`. Each loop uses:
@@ -62,6 +67,34 @@ Use stable `T<N>` IDs as durable review conversations:
 Only the reviewer resolves or reopens threads. Preserve all replies and decisions
 as immutable events and derive thread state from history.
 
+### Topology
+
+One agent context holds one role for the life of a handoff. When an
+orchestrator delegates review, the delegated reviewer itself runs the full CLI
+sequence — lock, `inspect`, `template`, `validate-event`, `publish` — so lock
+tenure and evidence are first-person. Transcribing a terminated subagent's
+findings into a reviewer event claims unperformed validation and is forbidden.
+
+### Driving the Loop
+
+Once a loop is scoped and open, each agent continues across handoffs until a
+terminal event: the loop progresses until every thread is resolved at `LGTM` or
+the recorded timeout. The user starts the loop and reads the outcome, and is
+never the message bus between handoffs.
+
+The only legal stops are: a terminal event; an `exhausted` `await-handoff`
+result; ambiguity, another agent's lock, or material unexplained drift; and a
+scoping question that must be settled before the first event. Returning to the
+user at any other point, including after publishing an event, is a stall.
+
+- **Delegating owner:** the spawn blocks, so no file waiting is involved, but
+  the delegate's report is another agent's claim. Before acting on it, run
+  `inspect` and confirm the expected event is in canonical history, then
+  continue the cycle — reply, re-delegate for verification — until terminal.
+  Re-delegation is the owner's job, not a question for the user.
+- **One agent per role:** after publishing, run `await-handoff` and act on its
+  outcome. Neither agent asks the user what to do next.
+
 ## Starting and Scoping a Loop
 
 Inspect `.local/reviews/` first and preserve legacy review artifacts. If no loop
@@ -108,8 +141,12 @@ handoff.
 8. Read the structured publication result. After any nonzero result, inspect
    canonical state first. If `committed` is true or the event is latest, never
    retry the old SHA; run `recover-publish`.
-9. Use `abort-draft`, `regenerate-report`, or `wait` only as recommended.
-   `publish-timeout --if-eligible` computes the active timeout safely.
+9. Use `abort-draft` and `regenerate-report` only as recommended. When
+   `expected_responder` names the other actor, span the handoff with
+   `await-handoff` — `inspect` recommends the primary actor's command, never
+   the waiting actor's, so an unrecommended wait is the correct move for the
+   role that is not acting. `publish-timeout --if-eligible` computes the
+   active timeout safely.
 
 Use priorities consistently:
 
@@ -151,6 +188,12 @@ Use priorities consistently:
 - Use only documented schema fields. Unknown fields are rejected so raw
   credentials, response payloads, and legacy metadata cannot silently enter
   canonical history.
+- Before reporting a loop complete, run terminal `inspect` and confirm
+  `approval_stale` is false. If it is true, run the recommended
+  `start-follow-up` before making any completion claim.
+- Never delegate your own waiting to the user. While the other actor holds the
+  handoff, keep re-arming `wait` — `await-handoff` does this with a bound — and
+  treat a lapsed `wait` as silence, not a handoff.
 - Treat canonical JSON as authoritative if it disagrees with a draft, receipt,
   report, terminal output, or another agent. The report is only a cache.
 - Never break a lock using PID or elapsed age. Lock status deliberately omits its

@@ -555,6 +555,23 @@ def command_wait(args: argparse.Namespace) -> int:
     ).returncode
 
 
+def command_await_handoff(args: argparse.Namespace) -> int:
+    paths = review_paths(args.repo, args.review_id)
+    validate_review(paths)
+    return run_helper(
+        WORKFLOW_SCRIPT,
+        [
+            "await-handoff",
+            "--review",
+            str(paths.canonical),
+            "--round-seconds",
+            str(args.round_seconds),
+            "--max-rounds",
+            str(args.max_rounds),
+        ],
+    ).returncode
+
+
 def command_publish_timeout(args: argparse.Namespace) -> int:
     paths = review_paths(args.repo, args.review_id)
     kind = captured_helper(
@@ -678,6 +695,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_review_selection(wait)
     wait.add_argument("seconds", nargs="?", type=int, default=300)
     wait.set_defaults(handler=command_wait)
+
+    await_handoff = commands.add_parser("await-handoff")
+    add_review_selection(await_handoff)
+    await_handoff.add_argument("--round-seconds", type=int, default=300)
+    await_handoff.add_argument("--max-rounds", type=int, default=24)
+    await_handoff.set_defaults(handler=command_await_handoff)
 
     timeout = commands.add_parser("publish-timeout")
     add_review_selection(timeout)

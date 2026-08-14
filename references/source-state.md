@@ -139,7 +139,33 @@ python3 "$SKILL_DIR/scripts/review_cli.py" wait REPO REVIEW_ID 300
 ```
 
 The command returns on canonical change, the active handoff deadline, or its
-bounded timeout. Publish a timeout only when eligible:
+bounded timeout. A `timeout` result is not an answer — only a changed
+`canonical_sha256` is. The waiting actor re-arms until the status is `changed`
+or it becomes eligible to publish a timeout event. `awaiting_initial_review`
+carries no handoff deadline, so a lapse there is silence, not a signal.
+
+Span a handoff with one bounded call instead of hand-rolling that re-arm loop:
+
+```bash
+python3 "$SKILL_DIR/scripts/review_cli.py" await-handoff \
+  REPO REVIEW_ID --round-seconds 300 --max-rounds 24
+```
+
+`await-handoff` prints, on entry, who it is waiting for and whether a handoff
+deadline exists, then re-arms `wait` per round until one structured outcome:
+
+| Status | Exit | Required next step |
+|---|---|---|
+| `changed` | 0 | re-`inspect` and act on the new phase |
+| `terminal` | 0 | run the terminal `inspect` and check `approval_stale` |
+| `timeout_eligible` | 4 | run `publish-timeout --if-eligible` |
+| `exhausted` | 5 | report to the user; do not silently continue or loop again |
+
+`exhausted` is the only non-change exit in `awaiting_initial_review`, which has
+no deadline and no publishable timeout event. The round bound is mandatory, and
+exhausting it is a reportable result, not a reason to re-enter.
+
+Publish a timeout only when eligible:
 
 ```bash
 python3 "$SKILL_DIR/scripts/review_cli.py" publish-timeout \
@@ -165,3 +191,7 @@ LGTM and timeouts apply only to their recorded source fingerprint. If source
 changes afterward, leave terminal history immutable and start a new loop with a
 new ID. Mention the prior ID in the handoff. Never present the prior terminal
 decision as approval of changed source.
+
+Before reporting a loop complete, run terminal `inspect` and confirm
+`approval_stale` is false. If it is true, run the recommended `start-follow-up`
+before making any completion claim.
