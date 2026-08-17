@@ -3,7 +3,7 @@ name: local-pr-loop
 description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and a skim-first Markdown summary report — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
 license: MIT
 metadata:
-  version: "0.5.0"
+  version: "0.6.0"
 ---
 
 # Local PR Loop
@@ -115,6 +115,12 @@ After review begins, publish `source_update` before further owner work whenever
 the guarded basis changes. Record only actual thread impacts, and add any
 findings discovered in the replacement source as sequential new threads.
 
+Guard creation refuses a scope overlapping another non-terminal loop and names
+the blocker. Finish that loop, `retire` it when it has published no events, use
+`start-follow-up` to supersede it, or make the scopes disjoint. `retire` applies
+only to a loop with no events, draft, guard, or lock; anything that published an
+event keeps the ordinary terminal and timeout paths.
+
 ## Role and Routing
 
 Run `inspect` and route on `.state.workflow`. Read `phase`, `primary_actor`,
@@ -129,7 +135,17 @@ written to canonical history.
 
 After a terminal event, treat later source changes as unreviewed. Leave terminal
 history immutable, start a new review ID, and mention the prior ID in the
-handoff.
+handoff. Prefer `start-follow-up` for any successor: it records `prior_review_id`,
+which plain `init` never attaches afterward.
+
+Read terminal state by outcome, not phase alone. `approval_stale` marks a
+recorded approval whose source moved, so it is never set for a timeout, which
+recorded no verification; that case reports `source_moved_since_terminal` and
+recommends nothing, because a successor is a deliberate choice.
+
+Source drift is an expected safety stop, not a flaky result. Where the reviewer
+may publish `source_update`, drift routes there rather than to the ordinary
+phase action, and `inspect` names the changed paths.
 
 ## Common Procedure
 
@@ -179,7 +195,16 @@ Use priorities consistently:
   observation time, and sanitized result. A synthetic counterexample alone is
   insufficient.
 - Never publish LGTM with a material validation gap; resolve historical
-  material gaps explicitly with reviewer evidence.
+  material gaps explicitly with reviewer evidence. Every resolution states a
+  `disposition`: `performed`, or `unavailable_non_material` when the check still
+  was not run and independent evidence shows the residual risk is non-material
+  because the behavior fails closed. The second never means the check passed. A
+  still-material gap is not resolved at all; leave it open, where it blocks LGTM.
+- Read a publication result by `committed` first. Past the commit point the event
+  is recorded and must never be republished; only cleanup remains, which
+  `recover-publish` finishes. Its `already_clean` is a successful no-op.
+- A timeout draft stamped before its own deadline can never publish, however long
+  you wait. Run `abort-draft` and template it again after the deadline.
 - Resolve an owner's declined thread only after independent reviewer
   verification. If that check is unavailable, comment with the exact unavailable
   check and leave the thread open.

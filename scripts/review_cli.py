@@ -11,8 +11,10 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
+import review_scope
 import review_state
 from review_io import atomic_bytes, load_object
 from review_schema import REVIEW_ID_PATTERN, REVIEW_NAME_PATTERN
@@ -47,6 +49,9 @@ class ReviewPaths:
     receipt: Path
     lease: Path
     guard: Path
+    # Present only for a retired event-free review; it keeps the identifier claimed so a
+    # later init can never reuse it.
+    retired: Path
 
 
 def run_helper(
@@ -127,6 +132,7 @@ def review_paths(repo: str, review_id: str) -> ReviewPaths:
         receipt=base.with_suffix(".publish.json"),
         lease=base.with_suffix(".lease.json"),
         guard=base.with_suffix(".guard.json"),
+        retired=base.with_suffix(".retired.json"),
     )
 
 
@@ -164,15 +170,16 @@ def validate_event(paths: ReviewPaths) -> None:
         raise RuntimeError("event validation failed")
 
 
+def scope_declaration(args: argparse.Namespace) -> dict[str, list[str]]:
+    """Build the structured scope declaration a scoped command asked for."""
+    return review_scope.declaration(args.exclude, args.additional_input, args.scope)
+
+
 def snapshot_arguments(args: argparse.Namespace) -> list[str]:
     """Build source-snapshot arguments from a scoped command."""
-    values: list[str] = ["--repo", str(repository_paths(args.repo).root)]
-    for exclusion in args.exclude:
-        values.extend(["--exclude", exclusion])
-    for additional_input in args.additional_input:
-        values.extend(["--additional-input", additional_input])
-    values.extend(args.scope)
-    return values
+    return review_scope.snapshot_arguments(
+        str(repository_paths(args.repo).root), scope_declaration(args)
+    )
 
 
 def command_init(args: argparse.Namespace) -> int:
@@ -192,6 +199,7 @@ def command_init(args: argparse.Namespace) -> int:
             paths.receipt,
             paths.lease,
             paths.guard,
+            paths.retired,
         )
         if not any(path.exists() or path.is_symlink() for path in artifacts):
             break
@@ -296,7 +304,10 @@ def command_inspect(args: argparse.Namespace) -> int:
             str(paths.canonical),
         ],
     )
-    scope_args = snapshot_arguments(args)[2:]
+    # One declaration serves both branches. Transporting it as structured data keeps the
+    # guarded and unguarded snapshots identical for an identical request, which an argument
+    # tail re-parsed by a second process cannot guarantee.
+    declaration = scope_declaration(args)
     lease_present = paths.lease.is_file() and not paths.lease.is_symlink()
     if lease_present:
         snapshot_json = captured_helper(
@@ -315,14 +326,14 @@ def command_inspect(args: argparse.Namespace) -> int:
                 str(LOCK_SCRIPT),
                 "--snapshot-script",
                 str(SNAPSHOT_SCRIPT),
-                "--",
-                *scope_args,
+                "--scope-json",
+                json.dumps(declaration, sort_keys=True),
             ],
         )
     else:
         snapshot_json = captured_helper(
             SNAPSHOT_SCRIPT,
-            ["--repo", str(paths.repository.root), *scope_args],
+            review_scope.snapshot_arguments(str(paths.repository.root), declaration),
         )
     snapshot_value = json.loads(snapshot_json)
     source = snapshot_value.get("source_snapshot", snapshot_value)
@@ -359,6 +370,10 @@ def command_inspect(args: argparse.Namespace) -> int:
         paths.review_id,
         "--current-source-fingerprint",
         source["fingerprint"],
+        # The whole snapshot, so drift can be reported per path instead of as one
+        # changed fingerprint the reader has to investigate by hand.
+        "--current-source-json",
+        json.dumps(source, sort_keys=True),
         "--command-prefix",
         command_prefix,
     ]
@@ -404,7 +419,12 @@ def command_template(args: argparse.Namespace) -> int:
         return verified.returncode
     require_regular(paths.guard, "guard")
     if paths.event.exists() or paths.event.is_symlink():
-        raise ValueError(f"event file already exists: {paths.event}")
+        # Naming the remedy matters: templating again is the natural retry, and without
+        # this the caller keeps the stale draft and repeats whatever rejected it.
+        raise ValueError(
+            f"a draft already exists at {paths.event}; run abort-draft first if you "
+            "need to replace it, because templating will not overwrite it"
+        )
     if paths.receipt.exists() or paths.receipt.is_symlink():
         raise ValueError(f"publication recovery is required first: {paths.receipt}")
     event = captured_helper(
@@ -652,6 +672,89 @@ def command_publish_timeout(args: argparse.Namespace) -> int:
     return command_publish(template_args)
 
 
+def command_retire(args: argparse.Namespace) -> int:
+    """Retire a review that has published nothing, so it stops blocking the next loop.
+
+    A review with no history carries no findings, no decisions, and no approval, so there
+    is nothing for a timeout clock to protect. Any review that has published even one
+    event keeps the ordinary timeout and terminal paths instead.
+    """
+
+    paths = review_paths(args.repo, args.review_id)
+    validate_review(paths)
+    require_retirable(paths, load_object(paths.canonical), include_lease=True)
+
+    # Take the cooperative lock and re-check inside it. Guard creation verifies a lease
+    # and publication verifies the lock, so holding it is what stops either from starting
+    # between the checks and the removal of canonical state.
+    acquired = run_helper(
+        WORKFLOW_SCRIPT, ["acquire", *workflow_arguments(paths)], capture=True
+    )
+    if acquired.returncode != 0:
+        sys.stderr.buffer.write(acquired.stdout)
+        raise RuntimeError(
+            f"review {paths.review_id} could not be locked for retirement; another "
+            "process holds it"
+        )
+    try:
+        validate_review(paths)
+        document = load_object(paths.canonical)
+        # The lease is ours now, so it is not evidence of another holder.
+        require_retirable(paths, document, include_lease=False)
+        retire_locked_review(paths, document, args.reason)
+    finally:
+        run_helper(WORKFLOW_SCRIPT, ["release", *workflow_arguments(paths)], capture=True)
+    print(json.dumps({"status": "retired", "review_id": paths.review_id}, sort_keys=True))
+    return 0
+
+
+def require_retirable(
+    paths: ReviewPaths, document: dict, *, include_lease: bool
+) -> None:
+    """Refuse to retire a review that carries history or in-flight work."""
+
+    if document.get("history"):
+        raise ValueError(
+            f"review {paths.review_id} has published events and cannot be retired; "
+            "let it reach a terminal event or an eligible timeout instead"
+        )
+    artifacts = [
+        (paths.event, "a draft"),
+        (paths.receipt, "a publication receipt"),
+        (paths.guard, "an inspection guard"),
+    ]
+    if include_lease:
+        artifacts.append((paths.lease, "a lock lease"))
+    for path, label in artifacts:
+        if path.exists() or path.is_symlink():
+            raise ValueError(
+                f"review {paths.review_id} still has {label} at {path}; resolve it "
+                "before retiring the review"
+            )
+
+
+def retire_locked_review(paths: ReviewPaths, document: dict, reason: str) -> None:
+    """Record the disposal and remove active canonical state, under the held lock."""
+
+    disposal = {
+        "review_id": paths.review_id,
+        "name": document.get("name"),
+        "created_at": document.get("created_at"),
+        "prior_review_id": document.get("prior_review_id"),
+        "retired_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+    }
+    # The tombstone lands before canonical state goes, so a crash between the two leaves
+    # the identifier claimed rather than silently reusable.
+    atomic_bytes(
+        paths.retired,
+        (json.dumps(disposal, indent=2, sort_keys=True) + "\n").encode(),
+        mode=0o600,
+    )
+    paths.canonical.unlink()
+    paths.report.unlink(missing_ok=True)
+
+
 def command_start_follow_up(args: argparse.Namespace) -> int:
     prior = review_paths(args.repo, args.prior_review_id)
     validate_review(prior)
@@ -787,6 +890,15 @@ def build_parser() -> argparse.ArgumentParser:
     follow_up.add_argument("prior_review_id")
     follow_up.add_argument("name")
     follow_up.set_defaults(handler=command_start_follow_up)
+
+    retire = commands.add_parser("retire")
+    add_review_selection(retire)
+    retire.add_argument(
+        "--reason",
+        default="",
+        help="Why this event-free review is being retired",
+    )
+    retire.set_defaults(handler=command_retire)
     return parser
 
 

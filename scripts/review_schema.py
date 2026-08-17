@@ -24,8 +24,8 @@ __all__ = [
 ]
 
 FORMAT = "local-pr-loop"
-FORMAT_REVISION = "2026-08-15.1"
-CREATOR_VERSION = "0.5.0"
+FORMAT_REVISION = "2026-08-18.1"
+CREATOR_VERSION = "0.6.0"
 
 ACTOR_BY_KIND = {
     "review": "reviewer",
@@ -44,6 +44,15 @@ TERMINAL_OUTCOME_BY_KIND = {
     "initial_review_timeout": "initial_review_timeout",
 }
 THREAD_PRIORITIES = {"P0", "P1", "P2", "P3"}
+# How a validation gap was disposed of. A gap that is still material is not resolved at
+# all: it stays open and blocks LGTM, so it has no disposition value here.
+GAP_DISPOSITIONS = {
+    # The check was later performed, and direct evidence records its result.
+    "performed",
+    # The check remains unavailable. Independent evidence shows the residual risk is
+    # non-material because the behavior fails closed. This never means the check passed.
+    "unavailable_non_material",
+}
 EVIDENCE_BASES = {
     "source_inspection",
     "test_result",
@@ -273,6 +282,49 @@ def snapshot_scope_basis(snapshot: Any) -> dict[str, Any] | None:
             item.get("path") for item in inputs if isinstance(item, dict)
         ],
     }
+
+
+GAP_JUSTIFICATION_FIELDS = {"unperformed_check", "fail_closed_behavior"}
+
+
+def validate_gap_justification(errors: list[str], resolution: Any, prefix: str) -> None:
+    """Require the reasoning behind resolving a gap whose check never ran.
+
+    The report states that the check was not performed and that the residual risk was
+    judged non-material and fail-closed. Those are claims about the review, so the event
+    has to carry them as recorded facts rather than let the renderer assert them.
+    """
+
+    justification = resolution.get("justification")
+    unavailable = resolution.get("disposition") == "unavailable_non_material"
+    if unavailable and justification is None:
+        errors.append(
+            f"{prefix}.justification is required for an unavailable_non_material "
+            "disposition, naming unperformed_check and fail_closed_behavior"
+        )
+        return
+    if justification is None:
+        return
+    if not unavailable:
+        errors.append(
+            f"{prefix}.justification applies only to an unavailable_non_material "
+            "disposition"
+        )
+        return
+    require(
+        errors, isinstance(justification, dict), f"{prefix}.justification must be a mapping"
+    )
+    if not isinstance(justification, dict):
+        return
+    reject_unknown(
+        errors, justification, GAP_JUSTIFICATION_FIELDS, f"{prefix}.justification"
+    )
+    for field in sorted(GAP_JUSTIFICATION_FIELDS):
+        require(
+            errors,
+            isinstance(justification.get(field), str) and bool(justification[field]),
+            f"{prefix}.justification.{field} must be a non-empty string",
+        )
 
 
 def validate_evidence(errors: list[str], value: Any, prefix: str) -> None:
@@ -747,8 +799,25 @@ def validate_event(event: Any) -> list[str]:
                 if not isinstance(resolution, dict):
                     continue
                 reject_unknown(
-                    errors, resolution, {"gap_id", "message", "evidence"}, prefix
+                    errors,
+                    resolution,
+                    {
+                        "gap_id",
+                        "message",
+                        "evidence",
+                        "disposition",
+                        "justification",
+                    },
+                    prefix,
                 )
+                require(
+                    errors,
+                    resolution.get("disposition") in GAP_DISPOSITIONS,
+                    f"{prefix}.disposition must be one of "
+                    + ", ".join(sorted(GAP_DISPOSITIONS))
+                    + "; a gap that is still material stays open instead",
+                )
+                validate_gap_justification(errors, resolution, prefix)
                 require(
                     errors,
                     isinstance(resolution.get("gap_id"), str)

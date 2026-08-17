@@ -219,8 +219,10 @@ class ReviewJsonCliTest(unittest.TestCase):
             hashlib.sha256(self.review.read_bytes()).hexdigest(),
             "--expected-source-fingerprint",
             source["fingerprint"],
-            "--",
-            "example.txt",
+            "--scope-json",
+            json.dumps(
+                {"exclude": [], "additional_input": [], "scope": ["example.txt"]}
+            ),
             cwd=self.repo,
             check=False,
         )

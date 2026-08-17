@@ -179,6 +179,12 @@ def contextual_event_template(
         template["gap_resolutions"] = [
             {
                 "gap_id": gap_id,
+                # "performed" when the check was finally run, or
+                # "unavailable_non_material" when it still was not. For the latter the
+                # message must name the check that was not performed, the independent
+                # evidence used to judge the residual risk, and the fail-closed behavior
+                # that makes it non-material. A gap that is still material stays open.
+                "disposition": "",
                 "message": "",
                 "evidence": blank_evidence(),
             }

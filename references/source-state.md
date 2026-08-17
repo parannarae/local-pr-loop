@@ -31,6 +31,32 @@ configuration, deployment manifests, and guides. Read unchanged callers and
 dependencies as context without adding them to scope. Add relevant ignored or
 generated files with `--additional-input`.
 
+An ignored or generated file must be declared with `--additional-input`, never as
+an ordinary scope path. A snapshot records reviewed paths in `scope` and every
+ignored input in `additional_inputs` with its own content digest; an ignored file
+listed as ordinary scope appears in neither the tracked diff nor the untracked
+listing, so it would contribute its name to the fingerprint with no content behind
+it. The declaration travels as structured data, so an option name can never be
+recorded as a reviewed path, and a locked inspection and an unlocked inspection of
+the same declaration compute identical scope, additional inputs, and fingerprint.
+A disagreement between them is a defect, not drift.
+
+The same path may not be declared both as reviewed scope and as an additional
+input, and a scope declaration must name at least one reviewed path.
+
+Guard creation also refuses a scope overlapping another non-terminal loop in this
+worktree, comparing reviewed paths and additional inputs with a directory treated
+as its whole subtree. The refusal names the blocking review, its phase, and the
+overlapping paths. The check runs inside the lease-verified critical section that
+creates the guard, so two first inspections cannot both find the scope free.
+
+When a snapshot drifts, `inspect` reports which parts moved. Digested entries,
+meaning untracked files and additional inputs, are named individually as added,
+removed, or modified. Tracked changes are reported only as one aggregate flag,
+because individual tracked paths cannot be recovered from a diff digest; the
+dashboard says so rather than guessing paths. Scope and exclusion changes and a
+changed base revision are reported separately.
+
 ## Inspect
 
 ```bash

@@ -203,6 +203,8 @@ def gap_records(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                 record = records.get(resolution.get("gap_id"))
                 if record is not None:
                     record["resolution"] = resolution.get("message", "")
+                    record["disposition"] = resolution.get("disposition")
+                    record["justification"] = resolution.get("justification")
     return records
 
 
@@ -403,6 +405,24 @@ def render_issue_summary(document: dict[str, Any]) -> list[str]:
         raised = escape_cell(f"{gap.get('check', '')} — {gap.get('reason', '')}")
         if gap_id in open_gaps:
             picture = "open — awaiting reviewer resolution"
+        elif record.get("disposition") == "unavailable_non_material":
+            # The reader must never infer that an unavailable check was performed, and
+            # every claim here is quoted from the validated event rather than asserted.
+            justification = record.get("justification") or {}
+            picture = " ".join(
+                part
+                for part in (
+                    "**Resolved without performing the check.**",
+                    f"Not performed: {justification.get('unperformed_check', '')}."
+                    if justification.get("unperformed_check")
+                    else "",
+                    f"Fails closed: {justification.get('fail_closed_behavior', '')}."
+                    if justification.get("fail_closed_behavior")
+                    else "",
+                    record["resolution"] or "",
+                )
+                if part
+            ).strip()
         else:
             picture = f"**Resolved.** {record['resolution'] or ''}".strip()
         lines.append(
