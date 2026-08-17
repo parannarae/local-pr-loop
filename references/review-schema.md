@@ -1,13 +1,13 @@
 # Review Artifact Format
 
-The skill version is `0.5.0`. Persisted compatibility uses an independent
+The skill version is `0.6.0`. Persisted compatibility uses an independent
 calendar revision:
 
 ```json
 {
   "format": "local-pr-loop",
-  "format_revision": "2026-08-15.1",
-  "created_by": {"version": "0.5.0"},
+  "format_revision": "2026-08-18.1",
+  "created_by": {"version": "0.6.0"},
   "created_at": "2026-08-15T01:00:00+00:00",
   "review_id": "k7m3q9wx",
   "prior_review_id": null,
@@ -118,9 +118,23 @@ are rejected.
 
 Record only checks actually performed. Gap IDs are globally sequential and
 stable. A failed check requires a matching material gap. Reviewer events resolve
-gaps explicitly with `gap_resolutions`, each containing `gap_id`, `message`, and
-structured evidence. LGTM is invalid while any historical material gap remains
-open or any final check failed.
+gaps explicitly with `gap_resolutions`, each containing `gap_id`, `disposition`,
+`message`, and structured evidence. LGTM is invalid while any historical material
+gap remains open or any final check failed.
+
+`disposition` is one of:
+
+- `performed`: the check was finally run, and the evidence records its result.
+- `unavailable_non_material`: the check still was not run. This requires a
+  `justification` object recording `unperformed_check` and
+  `fail_closed_behavior`, alongside the resolution's own evidence for the
+  residual-risk assessment. The report renders it as resolved *without*
+  performing the check and quotes those recorded facts, so the rendered claim
+  never exceeds what the event carries. A `performed` disposition rejects
+  `justification`, which does not apply to it.
+
+A still-material gap has no disposition, because it is not resolved: it stays
+open and blocks LGTM.
 
 ## Conversation Events
 

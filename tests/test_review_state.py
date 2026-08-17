@@ -210,6 +210,7 @@ class ReviewStateTest(unittest.TestCase):
         final["gap_resolutions"] = [
             {
                 "gap_id": "G1",
+                "disposition": "performed",
                 "message": "The previously unavailable check now passes.",
                 "evidence": evidence("test_result"),
             }
@@ -227,6 +228,7 @@ class ReviewStateTest(unittest.TestCase):
                 "gap_resolutions": [
                     {
                         "gap_id": "G1",
+                        "disposition": "performed",
                         "message": "Attempted disposition.",
                         "evidence": evidence("test_result"),
                     }

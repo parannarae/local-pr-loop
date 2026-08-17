@@ -63,7 +63,9 @@ class ReviewPublishFaultTest(unittest.TestCase):
             snapshot_script=str(ROOT / "scripts" / "source_snapshot.py"),
             expected_review_sha=publisher.sha256(self.review),
             expected_source_fingerprint="1" * 64,
-            scope_args=["example.txt"],
+            scope_json=json.dumps(
+                {"exclude": [], "additional_input": [], "scope": ["example.txt"]}
+            ),
             lease=None,
             guard=None,
         )

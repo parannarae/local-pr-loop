@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import review_scope
 from review_io import (
     load_object,
     require_secure_regular,
@@ -113,15 +114,111 @@ def release_lease(args: argparse.Namespace) -> int:
     return 0
 
 
+def candidate_declared_paths(canonical: Path, guard: Path) -> list[str] | None:
+    """Return the paths another review guards, or None when it declares none yet.
+
+    Only normalized scope metadata is read. A guard also carries an opaque lock
+    capability, which is never read here and never leaves its own file.
+    """
+
+    if guard.is_file() and not guard.is_symlink():
+        try:
+            stored = load_object(guard).get("scope")
+            return review_scope.declared_paths(stored)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    try:
+        document = load_object(canonical)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    for event in reversed(document.get("history") or []):
+        if not isinstance(event, dict):
+            continue
+        for field in ("completed_source_snapshot", "source_snapshot"):
+            snapshot = event.get(field)
+            if isinstance(snapshot, dict):
+                paths = [
+                    value
+                    for value in (snapshot.get("scope") or [])
+                    if isinstance(value, str)
+                ]
+                paths.extend(
+                    entry["path"]
+                    for entry in (snapshot.get("additional_inputs") or [])
+                    if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+                )
+                return paths
+    return None
+
+
+def scope_conflicts(
+    review: Path, declaration: dict[str, list[str]], repository_root: str
+) -> list[dict]:
+    """Find non-terminal reviews in this worktree whose declared paths overlap."""
+
+    reviews = review.parent
+    proposed = review_scope.declared_paths(declaration)
+    conflicts: list[dict] = []
+    for canonical in sorted(reviews.glob("*.json")):
+        # Only "<id>.json" is canonical; drafts, guards, leases and receipts are not.
+        if canonical.name.count(".") != 1 or canonical == review:
+            continue
+        try:
+            document = load_object(canonical)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        state = document.get("state")
+        if not isinstance(state, dict):
+            continue
+        workflow = state.get("workflow") or {}
+        if workflow.get("phase") == "terminal":
+            continue
+        guard = canonical.with_suffix(".guard.json")
+        declared = candidate_declared_paths(canonical, guard)
+        if not declared:
+            continue
+        shared = review_scope.overlapping_paths(proposed, declared, repository_root)
+        if shared:
+            conflicts.append(
+                {
+                    "review_id": canonical.stem,
+                    "name": document.get("name"),
+                    "phase": workflow.get("phase"),
+                    "overlapping_paths": shared,
+                }
+            )
+    return conflicts
+
+
 def refresh_guard(args: argparse.Namespace) -> int:
     verify_lease(args)
+    # Canonicalized against the repository first: comparing the strings a caller typed
+    # would let an alias of one path pass as two different declarations.
+    declaration = review_scope.require_distinct_declarations(
+        args.repo, json.loads(args.scope_json)
+    )
+    # Checked here, inside the lease-verified critical section that creates the guard, so
+    # two first inspections cannot both observe no conflict and then both create one.
+    conflicts = scope_conflicts(Path(args.review), declaration, args.repo)
+    if conflicts:
+        described = "; ".join(
+            f"{conflict['review_id']} ({conflict['phase']}) over "
+            + ", ".join(conflict["overlapping_paths"])
+            for conflict in conflicts
+        )
+        print(
+            "scope overlaps an active review: "
+            + described
+            + ". Finish that review, retire it if it has published no events, or use "
+            "start-follow-up to supersede it; alternatively make the scopes disjoint.",
+            file=sys.stderr,
+        )
+        return 1
     snapshot = subprocess.run(
         [
             sys.executable,
             args.snapshot_script,
-            "--repo",
-            args.repo,
-            *args.scope_args,
+            *review_scope.snapshot_arguments(args.repo, declaration),
         ],
         capture_output=True,
         text=True,
@@ -134,7 +231,9 @@ def refresh_guard(args: argparse.Namespace) -> int:
     guard = {
         "review_sha256": hashlib.sha256(Path(args.review).read_bytes()).hexdigest(),
         "source_snapshot": snapshot_value,
-        "scope_args": args.scope_args,
+        # Stored structured so a later publication rebuilds the same arguments through the
+        # same builder instead of replaying an argument tail.
+        "scope": declaration,
         "inspected_at": datetime.now(timezone.utc).isoformat(),
     }
     secure_json(Path(args.guard), guard)
@@ -398,7 +497,7 @@ def main() -> int:
         child.add_argument("--lock-script", required=True)
         if name == "guard":
             child.add_argument("--snapshot-script", required=True)
-            child.add_argument("scope_args", nargs=argparse.REMAINDER)
+            child.add_argument("--scope-json", required=True)
         if name == "abort-draft":
             child.add_argument("--event", required=True)
         if name == "add-check":

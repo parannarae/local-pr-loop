@@ -45,6 +45,7 @@ class ReviewCliTest(unittest.TestCase):
                 "publish-timeout",
                 "recover-publish",
                 "regenerate-report",
+                "retire",
                 "scope-candidates",
                 "snapshot",
                 "start-follow-up",
