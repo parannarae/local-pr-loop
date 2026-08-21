@@ -49,7 +49,12 @@ def blank_thread() -> dict[str, Any]:
 
 
 def new_document(
-    review_id: str, name: str, prior_review_id: str | None = None
+    review_id: str,
+    name: str,
+    prior_review_id: str | None = None,
+    review_kind: str = "correctness",
+    structure_policy: str = "auto",
+    comparison_base: str | None = None,
 ) -> dict[str, Any]:
     return {
         "format": FORMAT,
@@ -59,6 +64,9 @@ def new_document(
         "review_id": review_id,
         "prior_review_id": prior_review_id,
         "name": name,
+        "review_kind": review_kind,
+        "structure_policy": structure_policy,
+        "comparison_base": comparison_base,
         "state": default_state(),
         "history": [],
     }
@@ -69,10 +77,13 @@ def event_template(kind: str) -> dict[str, Any]:
 
 
 def contextual_event_template(
-    document: dict[str, Any], kind: str, guarded_snapshot: dict[str, Any]
+    document: dict[str, Any],
+    kind: str,
+    guarded_snapshot: dict[str, Any],
+    flagged_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     return review_templates.contextual_event_template(
-        document, kind, guarded_snapshot
+        document, kind, guarded_snapshot, flagged_paths
     )
 
 
@@ -127,6 +138,17 @@ def main() -> int:
     init_parser.add_argument("review_id")
     init_parser.add_argument("name")
     init_parser.add_argument("--prior-review-id")
+    init_parser.add_argument(
+        "--review-kind",
+        choices=sorted(review_schema.REVIEW_KINDS),
+        default="correctness",
+    )
+    init_parser.add_argument(
+        "--structure-policy",
+        choices=sorted(review_schema.STRUCTURE_POLICIES),
+        default="auto",
+    )
+    init_parser.add_argument("--comparison-base")
     snapshot_parser = subparsers.add_parser("source-snapshot")
     snapshot_parser.add_argument("--kind")
     append_parser = subparsers.add_parser("append-event")
@@ -136,6 +158,10 @@ def main() -> int:
     contextual_parser = subparsers.add_parser("context-template")
     contextual_parser.add_argument("kind", choices=ACTOR_BY_KIND)
     contextual_parser.add_argument("snapshot_json")
+    contextual_parser.add_argument(
+        "--flagged-json",
+        help="JSON list of accretion-flagged paths to prefill as structure_debt",
+    )
     threads_parser = subparsers.add_parser("threads")
     threads_parser.add_argument("--json", action="store_true")
     evidence_parser = subparsers.add_parser("evidence-template")
@@ -151,7 +177,14 @@ def main() -> int:
         print(json.dumps(value, indent=2))
         return 0
     if args.command == "init":
-        document = new_document(args.review_id, args.name, args.prior_review_id)
+        document = new_document(
+            args.review_id,
+            args.name,
+            args.prior_review_id,
+            args.review_kind,
+            args.structure_policy,
+            args.comparison_base,
+        )
         errors = validate_document(document)
         if errors:
             return emit_validation(errors)
@@ -192,9 +225,16 @@ def main() -> int:
                 snapshot.get("source_snapshot"), dict
             ):
                 snapshot = snapshot["source_snapshot"]
+            flagged = json.loads(args.flagged_json) if args.flagged_json else None
+            if flagged is not None and (
+                not isinstance(flagged, list)
+                or not all(isinstance(item, str) for item in flagged)
+            ):
+                raise ValueError("--flagged-json must be a JSON list of paths")
             print(
                 json.dumps(
-                    contextual_event_template(value, args.kind, snapshot), indent=2
+                    contextual_event_template(value, args.kind, snapshot, flagged),
+                    indent=2,
                 )
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:

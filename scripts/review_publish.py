@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import review_ledger
 import review_scope
 from review_io import (
     atomic_bytes,
@@ -387,6 +388,21 @@ def publish(args: argparse.Namespace) -> int:
                 event_snapshot.get(key) != snapshot.get(key) for key in identity_fields
             ):
                 raise ValueError("event snapshot does not match guarded source")
+        if event.get("kind") == "final_review":
+            # Enforced here, where the fingerprint checks above pinned the guarded
+            # tree, so the flagged set the acknowledgment is compared against is the
+            # one the reviewer templated from.
+            flagged = review_ledger.flagged_paths(
+                args.repo,
+                document,
+                snapshot.get("scope") or [],
+                snapshot.get("exclusions") or [],
+            )
+            acknowledgment = review_ledger.acknowledgment_error(
+                document, event, flagged
+            )
+            if acknowledgment:
+                raise ValueError(acknowledgment)
         draft_sha = sha256(event_path)
         updated = state.append_event(document, event)
         validation_errors = state.validate_document(updated)
@@ -804,6 +820,26 @@ def operation(args: argparse.Namespace) -> int:
     reviewer_may_replace_source = "source_update" in (
         workflow["allowed_events_by_actor"].get("reviewer") or []
     )
+    # Derived per inspection, like operation status. Active phases show the ledger so
+    # the reviewer sees the flagged set before templating final_review; a terminal is
+    # judged from the recorded structure_debt instead, because the tree may have moved
+    # since the loop's guarded snapshot.
+    accretion: dict[str, Any] | None = None
+    if (
+        workflow["phase"] != "terminal"
+        and document.get("review_kind") == "correctness"
+        and document.get("structure_policy") != "off"
+        and isinstance(current_snapshot_value, dict)
+    ):
+        accretion = review_ledger.ledger(
+            args.repo,
+            document,
+            current_snapshot_value.get("scope") or [],
+            current_snapshot_value.get("exclusions") or [],
+        )
+    structure_due = workflow[
+        "phase"
+    ] == "terminal" and review_ledger.structure_follow_up_due(document, review.parent)
 
     def recommended_command(*arguments: str) -> str:
         quoted_arguments = " ".join(shlex.quote(argument) for argument in arguments)
@@ -837,6 +873,15 @@ def operation(args: argparse.Namespace) -> int:
             args.repo,
             args.review_id,
             f"{document['name']}-follow-up",
+        )
+    elif structure_due:
+        recommended = recommended_command(
+            "start-follow-up",
+            args.repo,
+            args.review_id,
+            f"{document['name']}-structure",
+            "--kind",
+            "structure",
         )
     elif workflow["phase"] == "terminal":
         recommended = "none"
@@ -882,6 +927,9 @@ def operation(args: argparse.Namespace) -> int:
     }
     dashboard = {
         "workflow": workflow,
+        "review_kind": document.get("review_kind"),
+        "structure_policy": document.get("structure_policy"),
+        "accretion": accretion,
         "open_threads": document["state"]["threads"]["open"],
         "open_validation_gaps": document["state"]["validation_gaps"]["open"],
         "operation": operation_value,
@@ -918,6 +966,22 @@ def operation(args: argparse.Namespace) -> int:
                     + (", ".join(dashboard["open_validation_gaps"]) or "none"),
                     f"operation_status: {status}",
                     f"lock_status: {operation_value['lock_status']}",
+                    *(
+                        [f"review_kind: {document['review_kind']}"]
+                        if document.get("review_kind") == "structure"
+                        else []
+                    ),
+                    *(
+                        [
+                            "accretion_flagged: "
+                            + ", ".join(
+                                f"{path} ({'+'.join(accretion['files'][path]['flags'])})"
+                                for path in accretion["flagged"]
+                            )
+                        ]
+                        if accretion and accretion["flagged"]
+                        else []
+                    ),
                     f"source_drift: {str(source_drift).lower()}",
                     f"approval_stale: {str(approval_stale).lower()}",
                     *(

@@ -454,5 +454,128 @@ class ReviewStateTest(unittest.TestCase):
         )
 
 
+def structure_debt(paths: list[str]) -> dict[str, Any]:
+    return {
+        "disposition": "structure_deferred",
+        "flagged_paths": paths,
+        "message": "Real accretion; a structure round should follow.",
+    }
+
+
+class StructureSchemaTest(unittest.TestCase):
+    # --- document envelope ---
+
+    def test_new_document_records_kind_policy_and_base_defaults(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        self.assertEqual(document["review_kind"], "correctness")
+        self.assertEqual(document["structure_policy"], "auto")
+        self.assertIsNone(document["comparison_base"])
+        self.assertEqual(review_state.validate_document(document), [])
+
+    def test_structure_kind_with_comparison_base_validates(self) -> None:
+        document = review_state.new_document(
+            "abcdefgh", "review", None, "structure", "defer", "a" * 40
+        )
+        self.assertEqual(review_state.validate_document(document), [])
+
+    def test_invalid_kind_policy_and_base_are_rejected(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        document["review_kind"] = "cosmetic"
+        document["structure_policy"] = "sometimes"
+        document["comparison_base"] = "main"
+        errors = "; ".join(review_state.validate_document(document))
+        self.assertIn("review_kind", errors)
+        self.assertIn("structure_policy", errors)
+        self.assertIn("comparison_base", errors)
+
+    def test_structure_round_history_rejects_structure_debt(self) -> None:
+        document = review_state.new_document(
+            "abcdefgh", "review", None, "structure"
+        )
+        final = event("final_review", 1)
+        final.update(
+            {
+                "source_snapshot": snapshot("1"),
+                "resolutions": [],
+                "gap_resolutions": [],
+                "decision": "LGTM",
+                "validation": validation(),
+                "structure_debt": structure_debt(["a.py"]),
+            }
+        )
+        review_state.append_event(document, final)
+        errors = "; ".join(review_state.validate_document(document))
+        self.assertIn("structure round records no structure_debt", errors)
+
+    # --- thread paths ---
+
+    def test_thread_paths_must_be_unique_strings(self) -> None:
+        candidate = review_event()
+        candidate["threads"] = [{**thread(), "paths": "a.py"}]
+        errors = review_state.validate_event(candidate)
+        self.assertTrue(any(".paths" in error for error in errors))
+        candidate["threads"] = [{**thread(), "paths": ["a.py", "a.py"]}]
+        errors = review_state.validate_event(candidate)
+        self.assertTrue(any(".paths" in error for error in errors))
+        candidate["threads"] = [{**thread(), "paths": ["a.py", "b.py"]}]
+        self.assertEqual(review_state.validate_event(candidate), [])
+
+    # --- structure_debt shape ---
+
+    def final_with_debt(self, debt: dict[str, Any]) -> dict[str, Any]:
+        value = event("final_review", 1)
+        value.update(
+            {
+                "source_snapshot": snapshot("1"),
+                "resolutions": [],
+                "gap_resolutions": [],
+                "decision": "LGTM",
+                "validation": validation(),
+                "structure_debt": debt,
+            }
+        )
+        return value
+
+    def test_valid_structure_debt_passes_event_validation(self) -> None:
+        candidate = self.final_with_debt(structure_debt(["a.py"]))
+        self.assertEqual(review_state.validate_event(candidate), [])
+
+    def test_structure_debt_rejects_bad_disposition_and_empty_paths(self) -> None:
+        candidate = self.final_with_debt(
+            {"disposition": "ignored", "flagged_paths": [], "message": ""}
+        )
+        errors = "; ".join(review_state.validate_event(candidate))
+        self.assertIn("structure_debt.disposition", errors)
+        self.assertIn("structure_debt.flagged_paths must not be empty", errors)
+        self.assertIn("structure_debt.message", errors)
+
+    def test_structure_debt_rejects_unknown_fields(self) -> None:
+        candidate = self.final_with_debt({**structure_debt(["a.py"]), "extra": 1})
+        errors = "; ".join(review_state.validate_event(candidate))
+        self.assertIn("unknown fields", errors)
+
+    # --- template prefill ---
+
+    def test_blank_thread_carries_an_empty_paths_list(self) -> None:
+        self.assertEqual(review_state.blank_thread()["paths"], [])
+
+    def test_final_review_template_prefills_structure_debt_when_flagged(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        template = review_state.contextual_event_template(
+            document, "final_review", snapshot("1"), ["b.py", "a.py"]
+        )
+        self.assertEqual(
+            template["structure_debt"],
+            {"disposition": "", "flagged_paths": ["a.py", "b.py"], "message": ""},
+        )
+
+    def test_final_review_template_omits_structure_debt_when_clean(self) -> None:
+        document = review_state.new_document("abcdefgh", "review")
+        template = review_state.contextual_event_template(
+            document, "final_review", snapshot("1"), []
+        )
+        self.assertNotIn("structure_debt", template)
+
+
 if __name__ == "__main__":
     unittest.main()

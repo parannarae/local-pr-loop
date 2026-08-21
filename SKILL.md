@@ -3,7 +3,7 @@ name: local-pr-loop
 description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and a skim-first Markdown summary report — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
 license: MIT
 metadata:
-  version: "0.6.0"
+  version: "0.7.0"
 ---
 
 # Local PR Loop
@@ -19,7 +19,7 @@ a random `REVIEW_ID`. Each loop uses:
 - `REVIEW_ID.json`: canonical state and immutable event history;
 - `REVIEW_ID.latest.md`: regenerable report cache;
 - `REVIEW_ID.event.json`: temporary event created by `template` and removed by
-  `publish`; and
+  `publish`;
 - `REVIEW_ID.publish.json`: durable publication receipt, present only while
   cleanup or recovery remains;
 - `REVIEW_ID.lease.json`: permission-restricted local lock capability; and
@@ -58,9 +58,11 @@ Use stable `T<N>` IDs as durable review conversations:
 - `final_review` resolves every remaining open thread and approves the current
   source, or approves an initial review with no findings.
 
-- **Reviewer:** Verify source and evidence. Open threads with `review`; use
-  `reviewer_update` for partial progress and `source_update` for source-basis
-  changes. Publish `final_review` only when all remaining threads can be resolved.
+- **Reviewer:** Verify source and evidence. Open threads with `review`, naming
+  the files each finding concerns in its `paths` — the accretion ledger counts
+  threads per file; use `reviewer_update` for partial progress and
+  `source_update` for source-basis changes. Publish `final_review` only when
+  all remaining threads can be resolved.
 - **Owner:** Reply to every open thread. Apply justified changes, explain declined
   or blocked work, synchronize behavior guides, and record evidence.
 
@@ -89,10 +91,13 @@ terminal event: the loop progresses until every thread is resolved at `LGTM` or
 the recorded timeout. The user starts the loop and reads the outcome, and is
 never the message bus between handoffs.
 
-The only legal stops are: a terminal event; an `exhausted` `await-handoff`
-result; ambiguity, another agent's lock, or material unexplained drift; and a
-scoping question that must be settled before the first event. Returning to the
-user at any other point, including after publishing an event, is a stall.
+The only legal stops are: a terminal event whose dashboard recommends no
+successor command; an `exhausted` `await-handoff` result; ambiguity, another
+agent's lock, or material unexplained drift; and a scoping question that must
+be settled before the first event. Returning to the user at any other point,
+including after publishing an event, is a stall. A terminal that recommends
+`start-follow-up --kind structure` is a continuation point: run the structure
+round to its own terminal and report one combined outcome.
 
 - **Delegating owner:** the spawn blocks, so no file waiting is involved, but
   the delegate's report is another agent's claim. Before acting on it, run
@@ -111,6 +116,10 @@ state and requested scope; ask when more than one loop is plausible.
 
 Determine the comparison base and complete guarded scope as described in
 [source-state.md](references/source-state.md); ask when either is ambiguous.
+Record the base with `init --base-ref` — `HEAD` for uncommitted-only work —
+so the accretion ledger can measure growth. `init --kind structure` starts a structure round and
+`init --structure auto|defer|off` sets the chaining policy; the defaults
+produce an auto-chaining correctness loop.
 After review begins, publish `source_update` before further owner work whenever
 the guarded basis changes. Record only actual thread impacts, and add any
 findings discovered in the replacement source as sequential new threads.
@@ -120,6 +129,27 @@ the blocker. Finish that loop, `retire` it when it has published no events, use
 `start-follow-up` to supersede it, or make the scopes disjoint. `retire` applies
 only to a loop with no events, draft, guard, or lock; anything that published an
 event keeps the ordinary terminal and timeout paths.
+
+## Structure Rounds
+
+The accretion ledger flags a guarded file when raised threads or growth since
+the comparison base cross its thresholds; `inspect` shows the flagged set while
+the loop is active. A correctness `final_review` over flagged files must carry
+the `structure_debt` acknowledgment its template prefills —
+`structure_reviewed` when the flags do not reflect real accretion or a
+structure round already covered them, `structure_deferred` when the debt is
+real. Publication enforces this; the report lifts a deferral into Notes for
+You.
+
+A deferred terminal under policy `auto` recommends
+`start-follow-up NAME-structure --kind structure`. A structure round reviews
+the shape of its whole guarded scope while preserving behavior: read
+[structure-review.md](references/structure-review.md) before opening it.
+Verification is behavior preservation — the full test suite passes with test
+files unchanged — instead of diff locality, and its LGTM asserts "same
+behavior, better shape". Correctness findings discovered mid-round are flagged
+with `add-note` and routed to a new correctness loop, never mixed in. One
+structure round consumes the flag set that triggered it.
 
 ## Role and Routing
 

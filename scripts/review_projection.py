@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -11,7 +12,9 @@ from review_schema import (
     FORMAT_REVISION,
     GAP_ID_PATTERN,
     REVIEW_ID_PATTERN,
+    REVIEW_KINDS,
     REVIEW_NAME_PATTERN,
+    STRUCTURE_POLICIES,
     TERMINAL_OUTCOME_BY_KIND,
     THREAD_ID_PATTERN,
     parse_timestamp,
@@ -21,6 +24,8 @@ from review_schema import (
     snapshot_scope_basis,
     validate_event,
 )
+
+COMPARISON_BASE_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 __all__ = [
     "default_state",
@@ -463,11 +468,46 @@ def validate_document(document: Any) -> list[str]:
             "review_id",
             "prior_review_id",
             "name",
+            "review_kind",
+            "structure_policy",
+            "comparison_base",
             "state",
             "history",
         },
         "document",
     )
+    require(
+        errors,
+        document.get("review_kind") in REVIEW_KINDS,
+        "review_kind must be one of " + ", ".join(sorted(REVIEW_KINDS)),
+    )
+    require(
+        errors,
+        document.get("structure_policy") in STRUCTURE_POLICIES,
+        "structure_policy must be one of " + ", ".join(sorted(STRUCTURE_POLICIES)),
+    )
+    comparison_base = document.get("comparison_base")
+    require(
+        errors,
+        comparison_base is None
+        or (
+            isinstance(comparison_base, str)
+            and bool(COMPARISON_BASE_PATTERN.fullmatch(comparison_base))
+        ),
+        "comparison_base must be null or a full lowercase commit SHA",
+    )
+    if document.get("review_kind") == "structure":
+        history_events = document.get("history")
+        require(
+            errors,
+            not isinstance(history_events, list)
+            or not any(
+                isinstance(event, dict) and "structure_debt" in event
+                for event in history_events
+            ),
+            "a structure round records no structure_debt; the acknowledgment belongs "
+            "to the correctness loop that flagged the files",
+        )
     parse_timestamp(errors, document.get("created_at"), "created_at")
     revision = document.get("format_revision")
     require(errors, document.get("format") == FORMAT, f"format must be {FORMAT}")

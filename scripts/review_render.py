@@ -244,6 +244,24 @@ def summary_notes(document: dict[str, Any]) -> list[dict[str, str]]:
             notes.append(
                 {"text": generated, "source": str(reply.get("thread_id", ""))}
             )
+    for event in document.get("history", []):
+        debt = event.get("structure_debt")
+        if (
+            isinstance(debt, dict)
+            and debt.get("disposition") == "structure_deferred"
+        ):
+            paths = ", ".join(
+                path for path in debt.get("flagged_paths", []) if isinstance(path, str)
+            )
+            notes.append(
+                {
+                    "text": (
+                        f"[structure] Accretion-flagged files deferred without a "
+                        f"structure round: {paths} — {debt.get('message', '')}"
+                    ),
+                    "source": "",
+                }
+            )
     terminal = state.get("terminal")
     if isinstance(terminal, dict) and terminal.get("outcome") in TIMEOUT_OUTCOMES:
         open_threads = ", ".join(state["threads"]["open"]) or "none"
@@ -363,6 +381,8 @@ def render_header(document: dict[str, Any], note_count: int) -> list[str]:
     prior_review_id = document.get("prior_review_id")
     if prior_review_id:
         lines.append(f"- Prior review: `{prior_review_id}`")
+    if document.get("review_kind") == "structure":
+        lines.append("- Kind: structure round — behavior-preserving shape review")
     if note_count:
         lines.append(
             f"- **Attention: {note_count} note{'s' if note_count != 1 else ''}"

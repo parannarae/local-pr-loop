@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import review_ledger
 import review_scope
 import review_state
 from review_io import atomic_bytes, load_object
@@ -182,10 +183,33 @@ def snapshot_arguments(args: argparse.Namespace) -> list[str]:
     )
 
 
+def resolve_comparison_base(root: Path, base_ref: str) -> str:
+    """Resolve the recorded growth baseline to the merge base with HEAD.
+
+    Resolved once at init because refs move: the ledger must measure every later
+    inspection against the same commit.
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(root), "merge-base", "HEAD", base_ref],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ValueError(
+            f"cannot resolve comparison base from {base_ref}: "
+            + completed.stderr.strip()
+        )
+    return completed.stdout.strip()
+
+
 def command_init(args: argparse.Namespace) -> int:
     repository = repository_paths(args.repo)
     if not REVIEW_NAME_PATTERN.fullmatch(args.name):
         raise ValueError(f"invalid review name: {args.name}")
+    comparison_base = args.comparison_base
+    if args.base_ref:
+        comparison_base = resolve_comparison_base(repository.root, args.base_ref)
     repository.reviews.mkdir(parents=True, exist_ok=True)
     while True:
         review_id = "".join(
@@ -203,9 +227,19 @@ def command_init(args: argparse.Namespace) -> int:
         )
         if not any(path.exists() or path.is_symlink() for path in artifacts):
             break
-    init_args = ["init", review_id, args.name]
+    init_args = [
+        "init",
+        review_id,
+        args.name,
+        "--review-kind",
+        args.review_kind,
+        "--structure-policy",
+        args.structure_policy,
+    ]
     if args.prior_review_id:
         init_args.extend(["--prior-review-id", args.prior_review_id])
+    if comparison_base:
+        init_args.extend(["--comparison-base", comparison_base])
     canonical = captured_helper(STATE_SCRIPT, init_args)
     validation = run_helper(
         STATE_SCRIPT,
@@ -427,9 +461,23 @@ def command_template(args: argparse.Namespace) -> int:
         )
     if paths.receipt.exists() or paths.receipt.is_symlink():
         raise ValueError(f"publication recovery is required first: {paths.receipt}")
+    flagged_arguments: list[str] = []
+    if args.kind == "final_review":
+        # Prefill the acknowledgment the publish gate will demand, computed from the
+        # same guarded tree the fingerprint pins.
+        document = load_object(paths.canonical)
+        snapshot = load_object(paths.guard).get("source_snapshot") or {}
+        flagged = review_ledger.flagged_paths(
+            str(paths.repository.root),
+            document,
+            snapshot.get("scope") or [],
+            snapshot.get("exclusions") or [],
+        )
+        if flagged:
+            flagged_arguments = ["--flagged-json", json.dumps(flagged)]
     event = captured_helper(
         STATE_SCRIPT,
-        ["context-template", args.kind, str(paths.guard)],
+        ["context-template", args.kind, str(paths.guard), *flagged_arguments],
         input_bytes=paths.canonical.read_bytes(),
     )
     atomic_bytes(paths.event, event, mode=0o600)
@@ -761,10 +809,16 @@ def command_start_follow_up(args: argparse.Namespace) -> int:
     document = load_object(prior.canonical)
     if document["state"]["workflow"]["phase"] != "terminal":
         raise ValueError("follow-up requires a terminal prior review")
+    # The growth baseline and chaining policy carry over unless overridden, so a
+    # successor keeps measuring the same branch the same way.
     init_args = argparse.Namespace(
         repo=str(prior.repository.root),
         name=args.name,
         prior_review_id=args.prior_review_id,
+        review_kind=args.review_kind,
+        structure_policy=args.structure_policy or document.get("structure_policy"),
+        comparison_base=document.get("comparison_base"),
+        base_ref=args.base_ref,
     )
     return command_init(init_args)
 
@@ -788,7 +842,24 @@ def build_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init")
     init.add_argument("repo")
     init.add_argument("name")
-    init.set_defaults(handler=command_init, prior_review_id=None)
+    init.add_argument(
+        "--kind",
+        dest="review_kind",
+        choices=("correctness", "structure"),
+        default="correctness",
+    )
+    init.add_argument(
+        "--structure",
+        dest="structure_policy",
+        choices=("auto", "defer", "off"),
+        default="auto",
+    )
+    init.add_argument(
+        "--base-ref",
+        dest="base_ref",
+        help="Comparison base ref; its merge base with HEAD anchors the growth signal",
+    )
+    init.set_defaults(handler=command_init, prior_review_id=None, comparison_base=None)
 
     validate = commands.add_parser("validate")
     add_review_selection(validate)
@@ -889,6 +960,23 @@ def build_parser() -> argparse.ArgumentParser:
     follow_up.add_argument("repo")
     follow_up.add_argument("prior_review_id")
     follow_up.add_argument("name")
+    follow_up.add_argument(
+        "--kind",
+        dest="review_kind",
+        choices=("correctness", "structure"),
+        default="correctness",
+    )
+    follow_up.add_argument(
+        "--structure",
+        dest="structure_policy",
+        choices=("auto", "defer", "off"),
+        help="Chaining policy; inherited from the prior review when omitted",
+    )
+    follow_up.add_argument(
+        "--base-ref",
+        dest="base_ref",
+        help="Override the inherited comparison base with this ref's merge base",
+    )
     follow_up.set_defaults(handler=command_start_follow_up)
 
     retire = commands.add_parser("retire")

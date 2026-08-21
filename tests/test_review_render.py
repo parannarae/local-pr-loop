@@ -513,3 +513,45 @@ class ReviewRenderTest(unittest.TestCase):
         )
         self.assertIn("evil\\|cell", row)
         self.assertIn("&lt;script&gt;", row)
+
+
+class StructureRenderTest(unittest.TestCase):
+    def deferred_document(self, disposition: str) -> dict[str, Any]:
+        return make_document(
+            [
+                {
+                    "kind": "final_review",
+                    "structure_debt": {
+                        "disposition": disposition,
+                        "flagged_paths": ["src/reconciler.py"],
+                        "message": "Real accretion.",
+                    },
+                }
+            ]
+        )
+
+    def test_deferred_structure_debt_surfaces_in_notes(self) -> None:
+        report = review_render.render_report(
+            self.deferred_document("structure_deferred")
+        )
+        self.assertIn("**[structure]**", report)
+        self.assertIn("src/reconciler.py", report)
+        self.assertIn("Real accretion.", report)
+
+    def test_reviewed_structure_debt_stays_out_of_notes(self) -> None:
+        report = review_render.render_report(
+            self.deferred_document("structure_reviewed")
+        )
+        self.assertNotIn("[structure]", report)
+
+    def test_structure_round_header_names_its_kind(self) -> None:
+        document = make_document([])
+        document["review_kind"] = "structure"
+        report = review_render.render_report(document)
+        self.assertIn(
+            "- Kind: structure round — behavior-preserving shape review", report
+        )
+        document["review_kind"] = "correctness"
+        self.assertNotIn(
+            "Kind: structure round", review_render.render_report(document)
+        )

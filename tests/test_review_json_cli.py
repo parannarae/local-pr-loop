@@ -868,6 +868,101 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertTrue(dashboard["source"]["approval_stale"])
         self.assertIn("start-follow-up", dashboard["recommended_next_command"])
 
+    # --- accretion ledger and structure chaining ---
+
+    def cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return run(sys.executable, str(SCRIPT), *args, cwd=self.repo, check=check)
+
+    def test_accretion_flags_chain_a_structure_round(self) -> None:
+        base = run("git", "rev-parse", "HEAD", cwd=self.repo).stdout.strip()
+        output = self.cli(
+            "init", str(self.repo), "accretion-review", "--base-ref", "HEAD"
+        ).stdout
+        review_id = next(
+            line.split(": ", 1)[1]
+            for line in output.splitlines()
+            if line.startswith("review_id: ")
+        )
+        reviews = self.repo / ".local" / "reviews"
+        canonical = reviews / f"{review_id}.json"
+        self.assertEqual(json.loads(canonical.read_text())["comparison_base"], base)
+
+        # Grow the guarded file well past the 20% threshold, then walk the guarded
+        # final_review path: the ledger must flag it and the template must prefill
+        # the acknowledgment.
+        (self.repo / "example.txt").write_text("before\n" * 10)
+        self.cli("lock", "acquire", str(self.repo), review_id)
+        dashboard = json.loads(
+            self.cli("inspect", str(self.repo), review_id, "--json", "example.txt").stdout
+        )
+        self.assertEqual(dashboard["accretion"]["flagged"], ["example.txt"])
+        self.cli("template", str(self.repo), review_id, "final_review")
+        draft_path = reviews / f"{review_id}.event.json"
+        draft = json.loads(draft_path.read_text())
+        self.assertEqual(draft["structure_debt"]["flagged_paths"], ["example.txt"])
+        draft["decision"] = "LGTM"
+        draft["validation"]["performed"] = [
+            {"check": "source inspection", "result": "passed"}
+        ]
+
+        # Publishing without the acknowledgment fails before the commit point.
+        unacknowledged = {
+            key: value for key, value in draft.items() if key != "structure_debt"
+        }
+        write_json(draft_path, unacknowledged)
+        refused = json.loads(
+            self.cli("publish", str(self.repo), review_id, check=False).stdout
+        )
+        self.assertEqual(refused["status"], "precommit_failed")
+        self.assertIn("structure_debt", refused["detail"])
+
+        draft["structure_debt"].update(
+            {
+                "disposition": "structure_deferred",
+                "message": "Real accretion; chain a structure round.",
+            }
+        )
+        write_json(draft_path, draft)
+        self.assertTrue(
+            json.loads(self.cli("publish", str(self.repo), review_id).stdout)[
+                "committed"
+            ]
+        )
+
+        # The deferred terminal recommends chaining the structure round.
+        dashboard = json.loads(
+            self.cli("inspect", str(self.repo), review_id, "--json", "example.txt").stdout
+        )
+        self.assertEqual(dashboard["workflow"]["phase"], "terminal")
+        recommended = dashboard["recommended_next_command"]
+        self.assertIn("start-follow-up", recommended)
+        self.assertIn("--kind structure", recommended)
+
+        follow_up = self.cli(
+            "start-follow-up",
+            str(self.repo),
+            review_id,
+            "accretion-review-structure",
+            "--kind",
+            "structure",
+        ).stdout
+        successor_id = next(
+            line.split(": ", 1)[1]
+            for line in follow_up.splitlines()
+            if line.startswith("review_id: ")
+        )
+        successor = json.loads((reviews / f"{successor_id}.json").read_text())
+        self.assertEqual(successor["review_kind"], "structure")
+        self.assertEqual(successor["prior_review_id"], review_id)
+        self.assertEqual(successor["comparison_base"], base)
+
+        # One structure round consumes the flag set: the prior terminal stops
+        # recommending another.
+        dashboard = json.loads(
+            self.cli("inspect", str(self.repo), review_id, "--json", "example.txt").stdout
+        )
+        self.assertEqual(dashboard["recommended_next_command"], "none")
+
 
 if __name__ == "__main__":
     unittest.main()

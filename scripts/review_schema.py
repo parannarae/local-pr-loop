@@ -17,15 +17,18 @@ __all__ = [
     "EVIDENCE_BASES",
     "FORMAT",
     "FORMAT_REVISION",
+    "REVIEW_KINDS",
     "SHA256_PATTERN",
+    "STRUCTURE_DEBT_DISPOSITIONS",
+    "STRUCTURE_POLICIES",
     "load_json",
     "reject_duplicate_keys",
     "validate_event",
 ]
 
 FORMAT = "local-pr-loop"
-FORMAT_REVISION = "2026-08-18.1"
-CREATOR_VERSION = "0.6.0"
+FORMAT_REVISION = "2026-08-21.1"
+CREATOR_VERSION = "0.7.0"
 
 ACTOR_BY_KIND = {
     "review": "reviewer",
@@ -44,6 +47,16 @@ TERMINAL_OUTCOME_BY_KIND = {
     "initial_review_timeout": "initial_review_timeout",
 }
 THREAD_PRIORITIES = {"P0", "P1", "P2", "P3"}
+# What one loop reviews for. A correctness loop finds defects at sites; a structure loop
+# reviews shape across its whole scope while preserving behavior.
+REVIEW_KINDS = {"correctness", "structure"}
+# Whether a correctness terminal with accretion-flagged files chains a structure round
+# automatically, records the deferral for the user, or ignores the ledger entirely.
+STRUCTURE_POLICIES = {"auto", "defer", "off"}
+# How a correctness final_review disposed of accretion-flagged files. "structure_reviewed"
+# never means a check ran here; it records the reviewer's judgment that the flagged growth
+# is not accretion or is already covered by a structure round.
+STRUCTURE_DEBT_DISPOSITIONS = {"structure_reviewed", "structure_deferred"}
 # How a validation gap was disposed of. A gap that is still material is not resolved at
 # all: it stays open and blocks LGTM, so it has no disposition value here.
 GAP_DISPOSITIONS = {
@@ -450,9 +463,12 @@ def validate_thread(errors: list[str], thread: Any, prefix: str) -> None:
             "evidence",
             "required_behavior",
             "message",
+            "paths",
         },
         prefix,
     )
+    if "paths" in thread:
+        validate_string_list(errors, thread["paths"], f"{prefix}.paths", unique=True)
     message = thread.get("message")
     require(
         errors,
@@ -494,6 +510,41 @@ def validate_thread(errors: list[str], thread: Any, prefix: str) -> None:
             f"{prefix}: external-contract P1/P2 evidence must use "
             "live_probe, captured_fixture, or authoritative_contract",
         )
+
+
+def validate_structure_debt(errors: list[str], value: Any, prefix: str) -> None:
+    """Validate the acknowledgment of accretion-flagged files on a final_review.
+
+    Presence is enforced at publish time against the current ledger, not here: whether
+    files are flagged depends on the guarded tree, and projection must stay valid after
+    the tree moves on.
+    """
+
+    require(errors, isinstance(value, dict), f"{prefix} must be a mapping")
+    if not isinstance(value, dict):
+        return
+    reject_unknown(
+        errors, value, {"disposition", "flagged_paths", "message"}, prefix
+    )
+    require(
+        errors,
+        value.get("disposition") in STRUCTURE_DEBT_DISPOSITIONS,
+        f"{prefix}.disposition must be one of "
+        + ", ".join(sorted(STRUCTURE_DEBT_DISPOSITIONS)),
+    )
+    validate_string_list(
+        errors, value.get("flagged_paths"), f"{prefix}.flagged_paths", unique=True
+    )
+    require(
+        errors,
+        bool(value.get("flagged_paths")),
+        f"{prefix}.flagged_paths must not be empty",
+    )
+    require(
+        errors,
+        isinstance(value.get("message"), str) and bool(value["message"]),
+        f"{prefix}.message must be a non-empty string",
+    )
 
 
 def validate_action(
@@ -594,6 +645,7 @@ def validate_event(event: Any) -> list[str]:
             "gap_resolutions",
             "decision",
             "validation",
+            "structure_debt",
         },
         "reviewer_timeout": {"reason", "started_at", "deadline"},
         "owner_timeout": {"reason", "started_at", "deadline"},
@@ -764,6 +816,8 @@ def validate_event(event: Any) -> list[str]:
             "decision must be a non-empty string",
         )
         validate_validation(errors, event.get("validation"), "validation")
+        if "structure_debt" in event:
+            validate_structure_debt(errors, event["structure_debt"], "structure_debt")
     else:
         require(
             errors,

@@ -1,17 +1,20 @@
 # Review Artifact Format
 
-The skill version is `0.6.0`. Persisted compatibility uses an independent
+The skill version is `0.7.0`. Persisted compatibility uses an independent
 calendar revision:
 
 ```json
 {
   "format": "local-pr-loop",
-  "format_revision": "2026-08-18.1",
-  "created_by": {"version": "0.6.0"},
+  "format_revision": "2026-08-21.1",
+  "created_by": {"version": "0.7.0"},
   "created_at": "2026-08-15T01:00:00+00:00",
   "review_id": "k7m3q9wx",
   "prior_review_id": null,
   "name": "feature-review",
+  "review_kind": "correctness",
+  "structure_policy": "auto",
+  "comparison_base": null,
   "state": {
     "workflow": {
       "phase": "awaiting_initial_review",
@@ -35,6 +38,12 @@ Canonical state is a pure projection of immutable history. Operation state,
 deadlines becoming eligible, drafts, locks, reports, and publication recovery
 never enter canonical history. Old revisions are preserved but rejected; create
 a new loop rather than migrating them.
+
+`review_kind` is `correctness` or `structure`; `structure_policy` is `auto`,
+`defer`, or `off`; `comparison_base` is null or the full merge-base commit SHA
+recorded by `init --base-ref`. A structure round's history may never carry a
+`structure_debt` field — the acknowledgment belongs to the correctness loop
+that flagged the files.
 
 ## Event Envelope and Routing
 
@@ -76,9 +85,14 @@ Thread IDs are globally gap-free `T<N>` values and remain stable:
     "sanitized_result": "The service accepted the malformed field.",
     "artifact_digest": "lowercase-sha256-when-present"
   },
-  "required_behavior": "Reject before persistence."
+  "required_behavior": "Reject before persistence.",
+  "paths": ["src/service/ingest.py"]
 }
 ```
+
+`paths` names the repository-relative files a finding concerns; the accretion
+ledger counts raised threads per guarded file, so leaving it empty hides the
+finding from the ledger, and an out-of-scope path never participates.
 
 Evidence bases are `source_inspection`, `test_result`, `live_probe`,
 `captured_fixture`, and `authoritative_contract`. External-contract P1/P2
@@ -135,6 +149,38 @@ gap remains open or any final check failed.
 
 A still-material gap has no disposition, because it is not resolved: it stays
 open and blocks LGTM.
+
+## Accretion Ledger and Structure Debt
+
+The ledger is derived state, never written to canonical history. It flags a
+guarded file when raised threads name it at least 5 times, or when its net
+line growth from `comparison_base` to the working tree exceeds 20% of its
+base line count. Both signals are confined to the guarded scope minus
+exclusions; a thread path outside the scope is dropped, never flagged. A file
+absent or empty at the base is authored whole on the branch and is judged by
+the reviewer instead of auto-flagged; an unreachable base degrades to the
+thread signal and the dashboard reports it.
+
+A correctness `final_review` over flagged files must carry `structure_debt`,
+which its template prefills from the guarded tree:
+
+```json
+{
+  "disposition": "structure_deferred",
+  "flagged_paths": ["src/service/reconciler.py"],
+  "message": "Real accretion; a structure round should follow."
+}
+```
+
+`structure_reviewed` records the judgment that the flags do not reflect real
+accretion or that a structure round already covered them; `structure_deferred`
+records real debt left for a later round and surfaces in Notes for You.
+Presence and the exact flagged set are enforced at publish time, where the
+source fingerprint pins the guarded tree; projection never re-checks them, so
+terminal history stays valid after the tree moves on. A terminal whose
+deferral is unconsumed and whose policy is `auto` recommends
+`start-follow-up --kind structure`; an existing structure successor suppresses
+the recommendation.
 
 ## Conversation Events
 

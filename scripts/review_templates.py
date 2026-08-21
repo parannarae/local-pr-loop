@@ -48,6 +48,7 @@ def blank_thread() -> dict[str, Any]:
         "risk": "",
         "evidence": blank_evidence(),
         "required_behavior": "",
+        "paths": [],
     }
 
 
@@ -138,9 +139,17 @@ def _latest_owner_replies(
 
 
 def contextual_event_template(
-    document: dict[str, Any], kind: str, guarded_snapshot: dict[str, Any]
+    document: dict[str, Any],
+    kind: str,
+    guarded_snapshot: dict[str, Any],
+    flagged_paths: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build a draft prefilled from projected workflow obligations."""
+    """Build a draft prefilled from projected workflow obligations.
+
+    `flagged_paths` is the accretion ledger's flagged set, computed by the caller
+    against the guarded tree; a non-empty value prefills the `structure_debt`
+    acknowledgment a final_review must then carry.
+    """
     template = event_template(kind)
     open_threads = document["state"]["threads"]["open"]
     open_gaps = document["state"]["validation_gaps"]["open"]
@@ -190,6 +199,15 @@ def contextual_event_template(
             }
             for gap_id in open_gaps
         ]
+        if kind == "final_review" and flagged_paths:
+            template["structure_debt"] = {
+                # "structure_reviewed" when the flagged growth is not accretion or a
+                # structure round already covered it; "structure_deferred" when the debt
+                # is real and left for a later structure round. The message records why.
+                "disposition": "",
+                "flagged_paths": sorted(flagged_paths),
+                "message": "",
+            }
     elif kind in {"owner_timeout", "reviewer_timeout", "initial_review_timeout"}:
         latest = document["state"].get("latest_event")
         started_text = (

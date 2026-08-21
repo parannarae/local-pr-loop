@@ -8,7 +8,7 @@ inside the target Git worktree; the helper resolves its root.
 Ensure `REPO/.local/` is ignored, then initialize:
 
 ```bash
-python3 "$SKILL_DIR/scripts/review_cli.py" init REPO feature-review
+python3 "$SKILL_DIR/scripts/review_cli.py" init REPO feature-review [--base-ref BASE_REF]
 ```
 
 `init` returns an eight-character random `REVIEW_ID` and creates canonical JSON
@@ -17,8 +17,12 @@ plus the latest report beneath `.local/reviews/`. Keep the ID unchanged.
 ## Determine the Guarded Scope
 
 Determine the comparison base from the user's request or pull-request metadata.
-Ask when more than one base is plausible. Collect the mechanical candidate set
-with one command; omit `BASE_REF` when reviewing uncommitted work only:
+Ask when more than one base is plausible. Pass the same base to
+`init --base-ref BASE_REF`, which records its merge base with HEAD as the
+accretion ledger's growth baseline — for uncommitted-only work pass
+`--base-ref HEAD`; without a recorded base the ledger falls back to its
+thread signal alone. Collect the mechanical candidate set with one command;
+omit `BASE_REF` from `scope-candidates` when reviewing uncommitted work only:
 
 ```bash
 python3 "$SKILL_DIR/scripts/review_cli.py" scope-candidates REPO [BASE_REF]
