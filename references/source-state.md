@@ -3,6 +3,39 @@
 Commands assume the skill directory is `SKILL_DIR`. `REPO` may be any path
 inside the target Git worktree; the helper resolves its root.
 
+## Discover Resumable Loops
+
+When no review ID is supplied, determine the resumable loops from canonical
+state:
+
+```bash
+python3 "$SKILL_DIR/scripts/review_cli.py" discover REPO [--json]
+```
+
+Only canonical `REVIEW_ID.json` files count as loops; auxiliary artifacts
+(`.event.json`, `.latest.md`, `.lease.json`, `.guard.json`, `.publish.json`,
+`.retired.json`) are ignored. Each canonical file is validated before it can be
+a candidate: a corrupted or unsupported artifact is reported under `invalid`
+and never selected, and terminal loops are listed under `terminal` and
+excluded. Selection reads canonical content only, never file modification time.
+
+The result reports one `status` with the matching `guidance`:
+
+- `selected` — exactly one valid non-terminal loop; `selected_review_id` names
+  it. Resuming still requires `inspect`: act only if your role's action is
+  currently allowed.
+- `ambiguous` — several valid non-terminal loops. Each candidate carries a
+  compact summary (name, kind, phase, primary actor, threads, scope, latest
+  event or creation time, source drift, lock). Ask the user to choose a review
+  ID; never pick one automatically.
+- `none` — no resumable loop. This alone never authorizes `init`; see the
+  initialization rules in SKILL.md.
+
+Per-candidate `source_drift` is `clean`, `drifted`, `no_snapshot` before any
+snapshot event, or `unavailable` when the recorded scope can no longer be
+snapshotted. `lock.held` is `true`, `false`, or `null` when status is
+unavailable.
+
 ## Create an Isolated Loop
 
 Ensure `REPO/.local/` is ignored, then initialize:

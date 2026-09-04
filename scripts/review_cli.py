@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import review_discover
 import review_ledger
 import review_scope
 import review_state
@@ -86,8 +87,13 @@ def captured_helper(
     return completed.stdout
 
 
-def repository_paths(value: str) -> RepositoryPaths:
-    """Resolve and validate repository-local review storage."""
+def resolved_repository(value: str) -> RepositoryPaths:
+    """Resolve repository-local review storage without requiring the ignore rule.
+
+    Read-only discovery must still see loops in a repository whose ignore rule
+    was removed after they were created; every mutating path goes through
+    `repository_paths`, which enforces the rule.
+    """
     completed = subprocess.run(
         ["git", "-C", value, "rev-parse", "--show-toplevel"],
         capture_output=True,
@@ -101,6 +107,13 @@ def repository_paths(value: str) -> RepositoryPaths:
     reviews = local / "reviews"
     if local.is_symlink() or reviews.is_symlink():
         raise ValueError("review storage directories must not be symlinks")
+    return RepositoryPaths(root=root, local=local, reviews=reviews)
+
+
+def repository_paths(value: str) -> RepositoryPaths:
+    """Resolve and validate repository-local review storage."""
+    repository = resolved_repository(value)
+    root = repository.root
     ignored = subprocess.run(
         [
             "git",
@@ -115,7 +128,7 @@ def repository_paths(value: str) -> RepositoryPaths:
     )
     if ignored.returncode != 0:
         raise ValueError("REPO/.local must be ignored before creating a review loop")
-    return RepositoryPaths(root=root, local=local, reviews=reviews)
+    return repository
 
 
 def review_paths(repo: str, review_id: str) -> ReviewPaths:
@@ -201,6 +214,16 @@ def resolve_comparison_base(root: Path, base_ref: str) -> str:
             + completed.stderr.strip()
         )
     return completed.stdout.strip()
+
+
+def command_discover(args: argparse.Namespace) -> int:
+    repository = resolved_repository(args.repo)
+    result = review_discover.discover_loops(repository.root, repository.reviews)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(review_discover.render_discovery(result), end="")
+    return 0
 
 
 def command_init(args: argparse.Namespace) -> int:
@@ -330,13 +353,7 @@ def command_inspect(args: argparse.Namespace) -> int:
     validate_review(paths)
     lock_json = captured_helper(
         LOCK_SCRIPT,
-        [
-            "status",
-            "--repo",
-            str(paths.repository.root),
-            "--review-file",
-            str(paths.canonical),
-        ],
+        review_discover.lock_status_arguments(paths.repository.root, paths.canonical),
     )
     # One declaration serves both branches. Transporting it as structured data keeps the
     # guarded and unguarded snapshots identical for an identical request, which an argument
@@ -505,13 +522,9 @@ def command_lock(args: argparse.Namespace) -> int:
     if args.action == "status":
         return run_helper(
             LOCK_SCRIPT,
-            [
-                "status",
-                "--repo",
-                str(paths.repository.root),
-                "--review-file",
-                str(paths.canonical),
-            ],
+            review_discover.lock_status_arguments(
+                paths.repository.root, paths.canonical
+            ),
         ).returncode
     if args.action == "acquire":
         validate_review(paths)
@@ -838,6 +851,11 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the complete public command model."""
     parser = argparse.ArgumentParser(prog="review_cli.py")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    discover = commands.add_parser("discover")
+    discover.add_argument("repo")
+    discover.add_argument("--json", action="store_true")
+    discover.set_defaults(handler=command_discover)
 
     init = commands.add_parser("init")
     init.add_argument("repo")

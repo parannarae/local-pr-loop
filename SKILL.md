@@ -3,7 +3,7 @@ name: local-pr-loop
 description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and a skim-first Markdown summary report — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
 license: MIT
 metadata:
-  version: "0.7.0"
+  version: "0.8.0"
 ---
 
 # Local PR Loop
@@ -109,10 +109,23 @@ round to its own terminal and report one combined outcome.
 
 ## Starting and Scoping a Loop
 
-Inspect `.local/reviews/` first and preserve legacy review artifacts. If no loop
-exists and the user requested a review, initialize one with a concise name. For
-an existing loop, use its supplied ID or uniquely identify it from canonical
-state and requested scope; ask when more than one loop is plausible.
+A user-supplied review ID is used as given. Otherwise, before any `init`, run
+`discover REPO [--json]` — it classifies every canonical `REVIEW_ID.json` under
+`.local/reviews/`, ignoring auxiliary and invalid artifacts — and act on its
+status:
+
+- `selected`: resume the one non-terminal loop it names, then `inspect` and act
+  only if your role's action is currently allowed. Selection never grants the
+  other role's event.
+- `ambiguous`: ask the user to choose among the listed review IDs. Never pick
+  one yourself, newest included.
+- `none`: do not initialize a loop from this result alone. The owner
+  initializes only after deciding the source is ready for review; a reviewer
+  initializes only when the user explicitly requested a new local-pr-loop
+  review.
+
+Preserve legacy or invalid artifacts that discovery reports; never repair,
+delete, or select them. When initializing, use a concise name.
 
 Determine the comparison base and complete guarded scope as described in
 [source-state.md](references/source-state.md); ask when either is ambiguous.
@@ -179,7 +192,8 @@ phase action, and `inspect` names the changed paths.
 
 ## Common Procedure
 
-1. For a new loop, run `init REPO NAME` and retain its `REVIEW_ID`.
+1. Without a supplied ID, run `discover REPO` and follow its status. For a new
+   loop, run `init REPO NAME` and retain its `REVIEW_ID`.
 2. Run `inspect REPO REVIEW_ID ...` and follow its exact recommended command.
    Use `--json` for an agent-readable dashboard.
 3. Acquire the lock. The command stores an opaque 0600 lease and never prints

@@ -37,6 +37,7 @@ class ReviewCliTest(unittest.TestCase):
                 "add-gap",
                 "add-note",
                 "await-handoff",
+                "discover",
                 "evidence-template",
                 "init",
                 "inspect",
