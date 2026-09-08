@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -816,24 +817,115 @@ def retire_locked_review(paths: ReviewPaths, document: dict, reason: str) -> Non
     paths.report.unlink(missing_ok=True)
 
 
+@contextmanager
+def follow_up_claim(reviews: Path, prior_review_id: str, review_kind: str):
+    """Hold a short mutex over one chained follow-up while it is decided.
+
+    Creating a directory is atomic, so two callers cannot both observe no
+    successor and then both create one — the same guarantee the review lock
+    relies on, and the same reason the guard conflict check runs inside a
+    lease-verified critical section.
+
+    The claim is only mutual exclusion. Canonical review documents remain the
+    record of what exists, so a claim left behind by a killed process blocks
+    nothing beyond its own removal.
+    """
+    reviews.mkdir(parents=True, exist_ok=True)
+    claim = reviews / f".followup-{prior_review_id}-{review_kind}"
+    try:
+        claim.mkdir()
+    except FileExistsError:
+        raise ValueError(
+            f"another agent is deciding this follow-up: {claim}. Retry shortly; "
+            "if no other agent is running, remove that directory."
+        ) from None
+    try:
+        yield
+    finally:
+        try:
+            claim.rmdir()
+        except OSError:
+            pass
+
+
+def report_existing_successor(
+    repo: str, successor: dict[str, object], requested_name: str
+) -> int:
+    """Report the live successor a chained follow-up resolves to.
+
+    A different requested name means the caller wanted a different round than
+    the one already running, so it stops rather than quietly handing back
+    someone else's loop and its threads.
+    """
+    review_id = str(successor["review_id"])
+    if successor.get("name") != requested_name:
+        print(
+            f"a live successor already exists for this prior review and kind, "
+            f"under a different name: {review_id} is "
+            f"{successor.get('name')!r}, you asked for {requested_name!r}. "
+            "Join that review if it is the round you meant, or start an "
+            "independent review with init.",
+            file=sys.stderr,
+        )
+        return 1
+    paths = review_paths(repo, review_id)
+    print("status: existing")
+    for field in (
+        "review_id",
+        "name",
+        "review_kind",
+        "prior_review_id",
+        "phase",
+        "primary_actor",
+    ):
+        print(f"{field}: {successor.get(field)}")
+    # Reported as the paths themselves, not as a flag: this output is a text
+    # channel, and the caller's next act is to adopt this scope verbatim.
+    scope = successor.get("scope")
+    if not isinstance(scope, dict):
+        print("scope: not yet declared")
+    else:
+        print(f"scope: {' '.join(scope['scope'])}")
+        if scope["exclusions"]:
+            print(f"exclusions: {' '.join(scope['exclusions'])}")
+        if scope["additional_inputs"]:
+            print(f"additional_inputs: {' '.join(scope['additional_inputs'])}")
+    print(f"review_json: {paths.canonical}")
+    print(f"latest_report: {paths.report}")
+    return 0
+
+
 def command_start_follow_up(args: argparse.Namespace) -> int:
     prior = review_paths(args.repo, args.prior_review_id)
     validate_review(prior)
     document = load_object(prior.canonical)
     if document["state"]["workflow"]["phase"] != "terminal":
         raise ValueError("follow-up requires a terminal prior review")
-    # The growth baseline and chaining policy carry over unless overridden, so a
-    # successor keeps measuring the same branch the same way.
-    init_args = argparse.Namespace(
-        repo=str(prior.repository.root),
-        name=args.name,
-        prior_review_id=args.prior_review_id,
-        review_kind=args.review_kind,
-        structure_policy=args.structure_policy or document.get("structure_policy"),
-        comparison_base=document.get("comparison_base"),
-        base_ref=args.base_ref,
-    )
-    return command_init(init_args)
+    reviews = prior.repository.reviews
+    # Chaining is idempotent on the prior review and the kind of round: the
+    # terminal dashboard recommends this command to whichever role runs it, so
+    # both roles may reach it and only one successor may exist.
+    with follow_up_claim(reviews, args.prior_review_id, args.review_kind):
+        existing = review_discover.find_live_successor(
+            reviews, args.prior_review_id, args.review_kind
+        )
+        if existing is not None:
+            return report_existing_successor(
+                str(prior.repository.root), existing, args.name
+            )
+        # The growth baseline and chaining policy carry over unless overridden, so a
+        # successor keeps measuring the same branch the same way.
+        init_args = argparse.Namespace(
+            repo=str(prior.repository.root),
+            name=args.name,
+            prior_review_id=args.prior_review_id,
+            review_kind=args.review_kind,
+            structure_policy=args.structure_policy or document.get("structure_policy"),
+            comparison_base=document.get("comparison_base"),
+            base_ref=args.base_ref,
+        )
+        print("status: created")
+        return command_init(init_args)
 
 
 def add_scope_arguments(parser: argparse.ArgumentParser) -> None:

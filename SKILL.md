@@ -181,6 +181,22 @@ history immutable, start a new review ID, and mention the prior ID in the
 handoff. Prefer `start-follow-up` for any successor: it records `prior_review_id`,
 which plain `init` never attaches afterward.
 
+`start-follow-up` is idempotent on the prior review and the kind of round, so
+either role may run the command a terminal dashboard recommends without racing
+the other into two loops. It reports `status: created` when it made the
+successor and `status: existing` when one was already live; the same name is
+required either way, and a different name is refused rather than silently
+handed the running loop.
+
+On `status: existing`, run `inspect` on the returned ID before anything else and
+confirm its name, kind, and prior review are the round you meant. The report
+names the scope that loop already declares; use exactly that. When it reports
+`scope: not yet declared`, the successor has neither a guard nor an event, so
+whatever scope is declared first becomes the loop's scope — adopt the scope the
+prior review guarded rather than one you choose independently. Never guard an
+inherited loop with a scope you picked on your own; the mismatch surfaces much
+later, as a refused publish, or not at all.
+
 Read terminal state by outcome, not phase alone. `approval_stale` marks a
 recorded approval whose source moved, so it is never set for a timeout, which
 recorded no verification; that case reports `source_moved_since_terminal` and

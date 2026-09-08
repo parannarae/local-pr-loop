@@ -160,6 +160,81 @@ def candidate_summary(
     }
 
 
+def declared_scope(canonical: Path, document: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the scope a loop currently declares, or None when it declares none.
+
+    The guard holds the live declaration and is checked first; a loop can be
+    guarded before it has published anything, and reading only its history
+    would report such a loop as undeclared. The latest snapshot is the fallback
+    for a loop whose guard has been released.
+    """
+    guard = canonical.with_suffix(".guard.json")
+    if guard.is_file() and not guard.is_symlink():
+        try:
+            stored = load_object_safely(guard)
+        except (OSError, ValueError):
+            stored = None
+        scope = stored.get("scope") if isinstance(stored, dict) else None
+        if isinstance(scope, dict):
+            return {
+                "scope": list(scope.get("scope") or []),
+                "exclusions": list(scope.get("exclude") or []),
+                "additional_inputs": list(scope.get("additional_input") or []),
+            }
+    return scope_summary(latest_guarded_snapshot(document))
+
+
+def load_object_safely(path: Path) -> Any:
+    """Read one JSON object, rejecting duplicate keys as the schema requires."""
+    return json.loads(path.read_text(), object_pairs_hook=reject_duplicate_keys)
+
+
+def find_live_successor(
+    reviews: Path, prior_review_id: str, review_kind: str
+) -> dict[str, Any] | None:
+    """Return the live successor already chained from a prior review, if one exists.
+
+    A chained follow-up is identified by the prior review it continues and the
+    kind of round it runs, both of which every canonical document records. At
+    most one such successor may be live at a time: two would mean two agents
+    doing the same round with separate thread histories.
+
+    Terminal successors are ignored, so a later round of the same kind from the
+    same prior is still possible once the first one closes.
+    """
+    entries = sorted(reviews.iterdir()) if reviews.is_dir() else []
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
+        review_id = path.name[: -len(".json")]
+        if not REVIEW_ID_PATTERN.fullmatch(review_id):
+            continue
+        document, errors = load_canonical_candidate(path, review_id)
+        if errors:
+            continue
+        if document["state"]["workflow"]["phase"] == "terminal":
+            continue
+        if document.get("prior_review_id") != prior_review_id:
+            continue
+        if document.get("review_kind") != review_kind:
+            continue
+        workflow = document["state"]["workflow"]
+        return {
+            "review_id": review_id,
+            "name": document.get("name"),
+            "review_kind": document.get("review_kind"),
+            "prior_review_id": document.get("prior_review_id"),
+            "phase": workflow.get("phase"),
+            "primary_actor": workflow.get("primary_actor"),
+            # A successor that has neither a guard nor an event declares no
+            # scope yet, so whoever inspects it first decides what it covers.
+            # The caller is given the scope itself, which is what it must adopt,
+            # rather than a flag it would have to act on indirectly.
+            "scope": declared_scope(path, document),
+        }
+    return None
+
+
 def discover_loops(root: Path, reviews: Path) -> dict[str, Any]:
     """Classify every canonical loop and select the only resumable one, if any.
 
