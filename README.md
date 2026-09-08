@@ -8,6 +8,20 @@ Install or copy this repository as a skill named `local-pr-loop` in the director
 
 The package requires Git and Python 3.9 or newer. Its helpers use only the Python standard library; it does not require an account, network access, a hosted pull request service, or an agent-vendor SDK.
 
+## Development
+
+Contributors need [uv](https://docs.astral.sh/uv/); users of the skill do not. `uv sync` creates `.venv` and installs the lint tooling:
+
+```sh
+uv sync
+uv run ruff check .
+uv run python -m unittest discover -s tests
+```
+
+The environment is pinned to Python 3.9, the oldest version the skill supports and the one macOS ships, so syntax or library use that would fail for a user fails here first. That floor applies on every platform: a contributor on Linux or Windows gets 3.9 rather than whichever interpreter happens to be installed.
+
+Nothing in that environment reaches the code the skill runs. The helpers stay standard-library-only, and `python3 scripts/review_cli.py` works with no virtual environment and nothing installed. Keep `dependencies` in `pyproject.toml` empty and add tooling to the `dev` group.
+
 ## Vendor-specific adapters
 
 The workflow remains vendor-neutral: its portable behavior lives in `SKILL.md`, `scripts/`, and `references/`. Files beneath `agents/` are optional client-specific adapters that other Agent Skills implementations may ignore.

@@ -1,0 +1,23 @@
+[project]
+name = "local-pr-loop"
+version = "0.0.0"
+description = "Repository-local review loop for an owner agent and a reviewer agent"
+readme = "README.md"
+requires-python = ">=3.9"
+# Empty by design. The skill's helpers run on the standard library alone so a
+# user needs nothing but Git and Python; every dependency below is development
+# tooling and never reaches the code the skill executes.
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff>=0.14.0"]
+
+[tool.uv]
+# The helpers are executed as scripts, not imported from an installed
+# distribution, so there is nothing here to build or install.
+package = false
+
+[tool.ruff]
+# The oldest interpreter the skill supports, and the one macOS ships, so syntax
+# newer than 3.9 fails here rather than on a user's machine.
+target-version = "py39"
