@@ -183,10 +183,19 @@ which plain `init` never attaches afterward.
 
 `start-follow-up` is idempotent on the prior review and the kind of round, so
 either role may run the command a terminal dashboard recommends without racing
-the other into two loops. It reports `status: created` when it made the
-successor and `status: existing` when one was already live; the same name is
-required either way, and a different name is refused rather than silently
-handed the running loop.
+the other into two loops. Simultaneous callers settle on one successor and
+retire the duplicate, so a loop left behind by an interrupted caller is cleaned
+up by the next call rather than blocking it. A successor that has published
+anything is the one kept, and creation order decides only between successors
+that published nothing, so settling never discards review history. The command
+reports `status: created` when it made the successor and `status: existing` when
+one was already live; the same name is required either way, and a different name
+is refused rather than silently handed the running loop. A follow-up refused
+before it creates anything changes nothing, because the name is checked before
+any duplicate is retired. The one exception is a caller that already created its
+loop and only then lost to a concurrent round under a different name: it settles
+the duplicate first and refuses after, so that rejection does leave a retired
+loop behind.
 
 On `status: existing`, run `inspect` on the returned ID before anything else and
 confirm its name, kind, and prior review are the round you meant. The report

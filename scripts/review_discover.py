@@ -189,6 +189,52 @@ def load_object_safely(path: Path) -> Any:
     return json.loads(path.read_text(), object_pairs_hook=reject_duplicate_keys)
 
 
+def all_live_successors(
+    reviews: Path, prior_review_id: str, review_kind: str
+) -> list[dict[str, Any]]:
+    """Every live successor chained from a prior review of one kind.
+
+    Normally there is at most one. More than one means two agents created a
+    successor in the same instant, or a process died between creating one and
+    noticing another; the caller settles that from this list rather than by
+    holding a lock across creation.
+    """
+    found: list[dict[str, Any]] = []
+    entries = sorted(reviews.iterdir()) if reviews.is_dir() else []
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
+        review_id = path.name[: -len(".json")]
+        if not REVIEW_ID_PATTERN.fullmatch(review_id):
+            continue
+        document, errors = load_canonical_candidate(path, review_id)
+        if errors:
+            continue
+        if document["state"]["workflow"]["phase"] == "terminal":
+            continue
+        if document.get("prior_review_id") != prior_review_id:
+            continue
+        if document.get("review_kind") != review_kind:
+            continue
+        workflow = document["state"]["workflow"]
+        found.append(
+            {
+                "review_id": review_id,
+                "name": document.get("name"),
+                "review_kind": document.get("review_kind"),
+                "prior_review_id": document.get("prior_review_id"),
+                "phase": workflow.get("phase"),
+                "primary_actor": workflow.get("primary_actor"),
+                "created_at": document.get("created_at") or "",
+                # A loop that published nothing may be retired; one that
+                # published anything holds review history and may not.
+                "has_events": bool(document.get("history")),
+                "scope": declared_scope(path, document),
+            }
+        )
+    return found
+
+
 def find_live_successor(
     reviews: Path, prior_review_id: str, review_kind: str
 ) -> dict[str, Any] | None:
