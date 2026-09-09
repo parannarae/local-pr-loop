@@ -6,7 +6,11 @@ import secrets
 from datetime import datetime, timezone
 from typing import Any
 
-from review_contract import SOURCE_FIELD_BY_KIND, TIMEOUT_DURATION_BY_KIND
+from review_contract import (
+    SOURCE_FIELD_BY_KIND,
+    TIMEOUT_DURATION_BY_KIND,
+    source_field_for,
+)
 
 
 def blank_snapshot() -> dict[str, Any]:
@@ -118,7 +122,7 @@ def _current_snapshot(document: dict[str, Any]) -> dict[str, Any] | None:
     for event in reversed(document.get("history", [])):
         if not isinstance(event, dict):
             continue
-        field = SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        field = source_field_for(event.get("kind"))
         value = event.get(field) if field else None
         if isinstance(value, dict):
             return value

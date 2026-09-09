@@ -139,7 +139,7 @@ class RecoverWithoutReceiptTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def recover(self) -> dict:
+    def recover(self) -> tuple[dict, int]:
         completed = run(
             sys.executable,
             str(CLI),

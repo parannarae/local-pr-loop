@@ -1,13 +1,13 @@
 # Review Artifact Format
 
-The skill version is `0.9.0`. Persisted compatibility uses an independent
+The skill version is `0.9.1`. Persisted compatibility uses an independent
 calendar revision:
 
 ```json
 {
   "format": "local-pr-loop",
   "format_revision": "2026-08-21.1",
-  "created_by": {"version": "0.9.0"},
+  "created_by": {"version": "0.9.1"},
   "created_at": "2026-08-15T01:00:00+00:00",
   "review_id": "k7m3q9wx",
   "prior_review_id": null,

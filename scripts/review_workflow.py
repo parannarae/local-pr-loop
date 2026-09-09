@@ -337,7 +337,8 @@ def add_note(args: argparse.Namespace) -> int:
     event_path = Path(args.event)
     require_secure_regular(event_path, "draft")
     event = load_object(event_path)
-    field = NOTE_ENTRY_FIELD_BY_KIND.get(event.get("kind"))
+    kind = event.get("kind")
+    field = NOTE_ENTRY_FIELD_BY_KIND.get(kind) if isinstance(kind, str) else None
     entries = event.get(field, []) if field else []
     entry = next(
         (

@@ -10,8 +10,13 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Literal, overload
 
 
+@overload
+def git(repo: Path, *args: str) -> bytes: ...
+@overload
+def git(repo: Path, *args: str, text: Literal[True]) -> str: ...
 def git(repo: Path, *args: str, text: bool = False) -> bytes | str:
     result = subprocess.run(
         ["git", "-C", str(repo), *args],

@@ -339,5 +339,21 @@ class ReviewPublishFaultTest(unittest.TestCase):
         self.assertTrue(self.journal.exists())
 
 
+# --- review_publish.lease_token ---
+
+
+class LeaseTokenTest(unittest.TestCase):
+    def test_returns_the_recorded_string_token(self) -> None:
+        self.assertEqual(publisher.lease_token({"token": "t0k3n"}), "t0k3n")
+
+    def test_refuses_a_lease_without_a_token(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no usable token"):
+            publisher.lease_token({})
+
+    def test_refuses_a_non_string_token_as_corruption(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no usable token"):
+            publisher.lease_token({"token": 123})
+
+
 if __name__ == "__main__":
     unittest.main()

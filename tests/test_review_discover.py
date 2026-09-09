@@ -14,6 +14,7 @@ from typing import Any
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import review_discover
 import review_lock
 import review_state
 
@@ -29,6 +30,51 @@ def run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProces
         text=True,
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
+
+
+class LoadCanonicalCandidateTest(unittest.TestCase):
+    """The loading contract: a document, or CandidateError naming every reason."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_returns_the_document_for_a_valid_canonical_file(self) -> None:
+        document = review_state.new_document("abcdefgh", "demo")
+        path = self.directory / "abcdefgh.json"
+        path.write_text(json.dumps(document))
+
+        loaded = review_discover.load_canonical_candidate(path, "abcdefgh")
+
+        self.assertEqual(loaded["review_id"], "abcdefgh")
+
+    def test_raises_candidate_error_with_structured_reasons_for_unreadable_json(
+        self,
+    ) -> None:
+        path = self.directory / "abcdefgh.json"
+        path.write_text("{not json")
+
+        with self.assertRaises(review_discover.CandidateError) as caught:
+            review_discover.load_canonical_candidate(path, "abcdefgh")
+
+        self.assertEqual(len(caught.exception.errors), 1)
+        self.assertIn("unreadable canonical JSON", caught.exception.errors[0])
+
+    def test_a_mismatched_review_id_is_appended_to_validation_errors(self) -> None:
+        document = review_state.new_document("abcdefgh", "demo")
+        path = self.directory / "other123.json"
+        path.write_text(json.dumps(document))
+
+        with self.assertRaises(review_discover.CandidateError) as caught:
+            review_discover.load_canonical_candidate(path, "other123")
+
+        self.assertIn(
+            "review_id does not match the artifact file name",
+            caught.exception.errors,
+        )
 
 
 class ReviewDiscoverTest(unittest.TestCase):

@@ -88,9 +88,8 @@ def default_state() -> dict[str, Any]:
 
 
 def sorted_thread_ids(values: set[str]) -> list[str]:
-    return sorted(
-        values, key=lambda value: int(THREAD_ID_PATTERN.fullmatch(value).group(1))
-    )
+    # Validated IDs match T<N>, so the number is everything after the prefix.
+    return sorted(values, key=lambda value: int(value[1:]))
 
 
 def material_gaps(event: dict[str, Any]) -> bool:
@@ -436,13 +435,14 @@ def project_history(
             "resolved": sorted_thread_ids(set(threads) - open_ids),
         },
         "validation_gaps": {
+            # Validated IDs match G<N>, so the number is everything after the prefix.
             "open": sorted(
                 (gap_id for gap_id, gap in gaps.items() if gap["status"] == "open"),
-                key=lambda value: int(GAP_ID_PATTERN.fullmatch(value).group(1)),
+                key=lambda value: int(value[1:]),
             ),
             "resolved": sorted(
                 (gap_id for gap_id, gap in gaps.items() if gap["status"] == "resolved"),
-                key=lambda value: int(GAP_ID_PATTERN.fullmatch(value).group(1)),
+                key=lambda value: int(value[1:]),
             ),
         },
         "latest_event": latest_event,

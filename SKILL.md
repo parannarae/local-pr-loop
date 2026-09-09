@@ -3,7 +3,7 @@ name: local-pr-loop
 description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and a skim-first Markdown summary report — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
 license: MIT
 metadata:
-  version: "0.9.0"
+  version: "0.9.1"
 ---
 
 # Local PR Loop

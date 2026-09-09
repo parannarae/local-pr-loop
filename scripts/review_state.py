@@ -13,7 +13,10 @@ from typing import Any
 import review_render
 import review_schema
 import review_templates
-from review_contract import SOURCE_FIELD_BY_KIND, TIMEOUT_DURATION_BY_KIND
+from review_contract import (
+    TIMEOUT_DURATION_BY_KIND,
+    source_field_for,
+)
 from review_projection import (
     default_state,
     project_history,
@@ -225,7 +228,7 @@ def main() -> int:
         return emit_validation(validate_event(value))
     if args.command == "source-snapshot":
         kind = args.kind or (value.get("kind") if isinstance(value, dict) else None)
-        field = SOURCE_FIELD_BY_KIND.get(kind)
+        field = source_field_for(kind)
         print(
             json.dumps(value.get(field))
             if field and isinstance(value, dict)

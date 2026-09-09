@@ -61,7 +61,8 @@ class ReviewCliTest(unittest.TestCase):
     def test_package_version_references_are_consistent(self) -> None:
         skill_text = (ROOT / "SKILL.md").read_text()
         match = re.search(r'^  version: "([^"]+)"$', skill_text, re.MULTILINE)
-        self.assertIsNotNone(match)
+        if match is None:
+            self.fail("SKILL.md must declare a metadata version")
         version = match.group(1)
         self.assertEqual(version, review_schema.CREATOR_VERSION)
         schema_document = (ROOT / "references" / "review-schema.md").read_text()

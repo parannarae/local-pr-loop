@@ -243,7 +243,8 @@ def gap_records(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                     records[gap["gap_id"]] = {"gap": gap, "resolution": None}
         for resolution in event.get("gap_resolutions", []):
             if isinstance(resolution, dict):
-                record = records.get(resolution.get("gap_id"))
+                gap_id = resolution.get("gap_id")
+                record = records.get(gap_id) if isinstance(gap_id, str) else None
                 if record is not None:
                     record["resolution"] = resolution.get("message", "")
                     record["disposition"] = resolution.get("disposition")
@@ -361,7 +362,11 @@ def end_picture(item: dict[str, Any], workflow: dict[str, Any]) -> str:
                 last_decision = action["decision"]
             if entry["kind"] == "final_review" or action.get("action") == "resolve":
                 resolution_message = action.get("message", "")
-        label = RESOLUTION_LABEL_BY_DECISION.get(last_decision, "**Resolved.**")
+        label = (
+            RESOLUTION_LABEL_BY_DECISION.get(last_decision, "**Resolved.**")
+            if isinstance(last_decision, str)
+            else "**Resolved.**"
+        )
         return f"{label} {resolution_message}".strip()
     awaiting = workflow.get("primary_actor") or "none"
     if conversation:

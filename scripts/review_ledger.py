@@ -150,11 +150,12 @@ def ledger(
     # A base this clone cannot reach degrades to the thread signal instead of failing:
     # blocking final_review over a missing baseline commit would brick the loop on any
     # machine that lacks it, and the dashboard reports the degradation instead.
-    base_reachable = isinstance(comparison_base, str) and bool(comparison_base)
+    base_reachable = False
     growth: dict[str, dict[str, Any]] = {}
-    if base_reachable:
+    if isinstance(comparison_base, str) and comparison_base:
         try:
             growth = growth_by_file(repository_root, comparison_base, scope, exclusions)
+            base_reachable = True
         except ValueError:
             base_reachable = False
     files: dict[str, dict[str, Any]] = {}
@@ -293,4 +294,9 @@ def structure_follow_up_due(document: dict[str, Any], reviews_directory: Path) -
         return False
     if deferred_structure_debt(document) is None:
         return False
-    return not has_structure_successor(reviews_directory, document.get("review_id"))
+    review_id = document.get("review_id")
+    # Fail closed on a document with no usable identifier rather than matching
+    # successors against None.
+    return isinstance(review_id, str) and not has_structure_successor(
+        reviews_directory, review_id
+    )

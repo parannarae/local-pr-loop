@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import review_scope
-from review_contract import SOURCE_FIELD_BY_KIND
+from review_contract import source_field_for
 from review_projection import validate_document
 from review_schema import REVIEW_ID_PATTERN, reject_duplicate_keys
 
@@ -39,25 +39,31 @@ def lock_status_arguments(root: Path, canonical: Path) -> list[str]:
     return ["status", "--repo", str(root), "--review-file", str(canonical)]
 
 
-def load_canonical_candidate(
-    path: Path, review_id: str
-) -> tuple[dict[str, Any] | None, list[str]]:
-    """Load one canonical review file; any returned error disqualifies it."""
+class CandidateError(ValueError):
+    """One canonical review file is disqualified; `errors` records every reason."""
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+def load_canonical_candidate(path: Path, review_id: str) -> dict[str, Any]:
+    """Load one canonical review file, raising `CandidateError` if disqualified."""
     if not path.is_file() or path.is_symlink():
-        return None, ["canonical review must be a regular non-symlink file"]
+        raise CandidateError(["canonical review must be a regular non-symlink file"])
     try:
         document = json.loads(
             path.read_text(),
             object_pairs_hook=reject_duplicate_keys,
         )
     except (OSError, ValueError) as error:
-        return None, [f"unreadable canonical JSON: {error}"]
+        raise CandidateError([f"unreadable canonical JSON: {error}"]) from error
     errors = validate_document(document)
     if isinstance(document, dict) and document.get("review_id") != review_id:
         errors.append("review_id does not match the artifact file name")
     if errors:
-        return None, errors
-    return document, []
+        raise CandidateError(errors)
+    return document
 
 
 def latest_guarded_snapshot(document: dict[str, Any]) -> dict[str, Any] | None:
@@ -66,17 +72,15 @@ def latest_guarded_snapshot(document: dict[str, Any]) -> dict[str, Any] | None:
     for event in document["history"]:
         if not isinstance(event, dict):
             continue
-        field = SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        field = source_field_for(event.get("kind"))
         value = event.get(field) if field else None
         if isinstance(value, dict):
             snapshot = value
     return snapshot
 
 
-def scope_summary(snapshot: dict[str, Any] | None) -> dict[str, list[str]] | None:
+def scope_summary(snapshot: dict[str, Any]) -> dict[str, list[str]]:
     """Summarize the guarded scope recorded by the latest snapshot."""
-    if snapshot is None:
-        return None
     return {
         "scope": list(snapshot.get("scope") or []),
         "exclusions": list(snapshot.get("exclusions") or []),
@@ -154,7 +158,7 @@ def candidate_summary(
         "latest_event": state["latest_event"],
         "open_threads": len(state["threads"]["open"]),
         "resolved_threads": len(state["threads"]["resolved"]),
-        "scope": scope_summary(snapshot),
+        "scope": scope_summary(snapshot) if snapshot is not None else None,
         "source_drift": snapshot_drift(root, snapshot),
         "lock": lock_summary(root, canonical),
     }
@@ -181,7 +185,8 @@ def declared_scope(canonical: Path, document: dict[str, Any]) -> dict[str, Any] 
                 "exclusions": list(scope.get("exclude") or []),
                 "additional_inputs": list(scope.get("additional_input") or []),
             }
-    return scope_summary(latest_guarded_snapshot(document))
+    snapshot = latest_guarded_snapshot(document)
+    return scope_summary(snapshot) if snapshot is not None else None
 
 
 def load_object_safely(path: Path) -> Any:
@@ -207,8 +212,9 @@ def all_live_successors(
         review_id = path.name[: -len(".json")]
         if not REVIEW_ID_PATTERN.fullmatch(review_id):
             continue
-        document, errors = load_canonical_candidate(path, review_id)
-        if errors:
+        try:
+            document = load_canonical_candidate(path, review_id)
+        except CandidateError:
             continue
         if document["state"]["workflow"]["phase"] == "terminal":
             continue
@@ -255,8 +261,9 @@ def find_live_successor(
         review_id = path.name[: -len(".json")]
         if not REVIEW_ID_PATTERN.fullmatch(review_id):
             continue
-        document, errors = load_canonical_candidate(path, review_id)
-        if errors:
+        try:
+            document = load_canonical_candidate(path, review_id)
+        except CandidateError:
             continue
         if document["state"]["workflow"]["phase"] == "terminal":
             continue
@@ -300,10 +307,11 @@ def discover_loops(root: Path, reviews: Path) -> dict[str, Any]:
         review_id = path.name[: -len(".json")]
         if not REVIEW_ID_PATTERN.fullmatch(review_id):
             continue
-        document, errors = load_canonical_candidate(path, review_id)
-        if errors:
+        try:
+            document = load_canonical_candidate(path, review_id)
+        except CandidateError as error:
             invalid.append(
-                {"review_id": review_id, "path": str(path), "errors": errors}
+                {"review_id": review_id, "path": str(path), "errors": error.errors}
             )
             continue
         if document["state"]["workflow"]["phase"] == "terminal":

@@ -87,7 +87,7 @@ def recorded_snapshot(document: dict[str, Any], state: Any) -> dict[str, Any] | 
     for event in reversed(document.get("history") or []):
         if not isinstance(event, dict):
             continue
-        field = state.SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        field = state.source_field_for(event.get("kind"))
         value = event.get(field) if field else None
         if isinstance(value, dict):
             return value
@@ -326,6 +326,19 @@ def validate_receipt(receipt: dict[str, Any], state: Any) -> None:
         raise ValueError("publication receipt commit_phase is invalid")
 
 
+def lease_token(lease: dict[str, Any]) -> str:
+    """Return the lease's lock token, refusing a lease that records none.
+
+    The lease is a 0600 file this skill wrote, so a missing or non-string token
+    means corruption; failing here names the artifact instead of surfacing as a
+    lock mismatch later.
+    """
+    token = lease.get("token")
+    if not isinstance(token, str) or not token:
+        raise ValueError("lease records no usable token; re-acquire the lock")
+    return token
+
+
 def write_report(state: Any, document: dict[str, Any], report: Path) -> None:
     atomic_bytes(report, state.render_report(document).encode())
 
@@ -348,7 +361,7 @@ def publish(args: argparse.Namespace) -> int:
         if args.lease:
             lease = load_secure_json(Path(args.lease), "lease")
             guard = load_secure_json(Path(args.guard), "inspection guard")
-            args.token = lease.get("token")
+            args.token = lease_token(lease)
             args.expected_review_sha = guard.get("review_sha256")
             snapshot = guard.get("source_snapshot")
             if not isinstance(snapshot, dict):
@@ -375,7 +388,7 @@ def publish(args: argparse.Namespace) -> int:
         snapshot = current_snapshot(args)
         if snapshot.get("fingerprint") != args.expected_source_fingerprint:
             raise ValueError("source fingerprint does not match expected fingerprint")
-        event_snapshot_field = state.SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        event_snapshot_field = state.source_field_for(event.get("kind"))
         if event_snapshot_field:
             event_snapshot = event.get(event_snapshot_field)
             identity_fields = (
@@ -592,7 +605,7 @@ def recover(args: argparse.Namespace) -> int:
     try:
         if args.lease and Path(args.lease).exists():
             lease = load_secure_json(Path(args.lease), "lease")
-            args.token = lease.get("token")
+            args.token = lease_token(lease)
         if not journal.exists():
             return recover_without_receipt(args, review, event_path, report, state)
         receipt = load_json(journal)
