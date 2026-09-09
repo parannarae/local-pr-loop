@@ -437,7 +437,7 @@ class ReviewRenderTest(unittest.TestCase):
         self.assertIn(
             "None recorded — neither agent flagged a design-shifting change", report
         )
-        rows = [line for line in lines if line.startswith("| T") or line.startswith("| G")]
+        rows = [line for line in lines if line.startswith(("| T", "| G"))]
         self.assertEqual(len(rows), 4)
         # Priority order: T1 (P1) before T2 and T3 (P2); gaps last.
         self.assertEqual(

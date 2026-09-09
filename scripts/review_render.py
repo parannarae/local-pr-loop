@@ -397,8 +397,10 @@ def render_header(document: dict[str, Any], note_count: int) -> list[str]:
     history = document.get("history", [])
     terminal = state.get("terminal")
     lines = [
-        f"# Review Summary — {flatten_inline(document['name'])} "
-        f"(`{document['review_id']}`)",
+        (
+            f"# Review Summary — {flatten_inline(document['name'])} "
+            f"(`{document['review_id']}`)"
+        ),
         "",
     ]
     if isinstance(terminal, dict):
@@ -558,10 +560,14 @@ def render_verification(document: dict[str, Any]) -> list[str]:
         )
     lines.extend(
         [
-            "- Approval freshness: run `inspect` — this page is a cache and does"
-            " not know current drift",
-            "- Full conversations: `threads` command or canonical JSON; this page"
-            " is intentionally a skim view",
+            (
+                "- Approval freshness: run `inspect` — this page is a cache "
+                "and does not know current drift"
+            ),
+            (
+                "- Full conversations: `threads` command or canonical JSON; "
+                "this page is intentionally a skim view"
+            ),
         ]
     )
     return lines

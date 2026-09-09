@@ -14,7 +14,6 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 from unittest import mock
 
 ROOT = Path(__file__).parents[1]
@@ -160,9 +159,8 @@ class ReviewWorkflowWaitTest(unittest.TestCase):
         # baseline captured once at entry.
         with mock.patch.object(
             review_workflow, "poll_for_change", side_effect=[timed_out, changed]
-        ) as poll:
-            with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                exit_code = review_workflow.await_handoff(args)
+        ) as poll, contextlib.redirect_stdout(io.StringIO()) as stdout:
+            exit_code = review_workflow.await_handoff(args)
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(

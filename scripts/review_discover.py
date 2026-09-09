@@ -358,12 +358,17 @@ def render_candidate(candidate: dict[str, Any]) -> list[str]:
     held = candidate["lock"]["held"]
     lock_text = {True: "held", False: "unlocked", None: "unknown"}[held]
     return [
-        f"- {candidate['review_id']} {candidate['name']} "
-        f"({candidate['review_kind']}) — phase {candidate['phase']}, "
-        f"actor {candidate['primary_actor']}, threads "
-        f"{candidate['open_threads']} open/{candidate['resolved_threads']} resolved",
-        f"  scope: {scope_text} | {when} | "
-        f"drift {candidate['source_drift']} | lock {lock_text}",
+        (
+            f"- {candidate['review_id']} {candidate['name']} "
+            f"({candidate['review_kind']}) — phase {candidate['phase']}, "
+            f"actor {candidate['primary_actor']}, threads "
+            f"{candidate['open_threads']} open/"
+            f"{candidate['resolved_threads']} resolved"
+        ),
+        (
+            f"  scope: {scope_text} | {when} | "
+            f"drift {candidate['source_drift']} | lock {lock_text}"
+        ),
     ]
 
 

@@ -35,11 +35,13 @@ def validate(value: object) -> dict[str, list[str]]:
     """Return a declaration read from transported or stored data.
 
     Raises:
-        ValueError: The value is not a declaration this package can act on.
+        TypeError: The value is not a JSON object at all, matching
+            `review_io.load_object` for the same shape failure.
+        ValueError: The object is not a declaration this package can act on.
     """
 
     if not isinstance(value, dict):
-        raise ValueError("scope declaration must be a JSON object")
+        raise TypeError("scope declaration must be a JSON object")
 
     result: dict[str, list[str]] = {}
     for field in DECLARATION_FIELDS:

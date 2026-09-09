@@ -934,11 +934,12 @@ def retire_displaced_successors(
         )
         try:
             command_retire(retire_arguments)
-        except Exception as error:
-            # Contention with another agent converging on the same duplicate and
-            # a genuine validation, permission, or I/O failure arrive here as the
-            # same exception types, so the error cannot tell them apart. Whether
-            # it mattered is settled below by whether the duplicate is gone.
+        # The complete refusal surface of command_retire: contention and validation
+        # refusals arrive as ValueError or RuntimeError and I/O failures as OSError
+        # or TypeError, and the types cannot tell contention from real failure, so
+        # whether it mattered is settled below by whether the duplicate is gone. A
+        # bug (KeyError, AttributeError) propagates instead of posing as contention.
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             failures.append(f"{duplicate['review_id']}: {error}")
 
     remaining = live_successors(reviews, prior_review_id, review_kind)

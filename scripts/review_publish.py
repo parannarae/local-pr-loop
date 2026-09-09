@@ -1094,8 +1094,10 @@ def operation(args: argparse.Namespace) -> int:
                     ),
                     *(
                         [
-                            "note: this loop ended without an approval; the source has "
-                            "moved since it was recorded"
+                            (
+                                "note: this loop ended without an approval; "
+                                "the source has moved since it was recorded"
+                            )
                         ]
                         if terminal_source_moved
                         else []

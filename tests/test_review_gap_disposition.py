@@ -15,7 +15,6 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import review_render
 import review_schema
 
-
 JUSTIFICATION = {
     "unperformed_check": "live probe of the media service",
     "fail_closed_behavior": "a missing validator raises before any byte is retained",
