@@ -66,10 +66,53 @@ def thread_conversations(document: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def render_conversations(document: dict[str, Any]) -> str:
+def thread_summaries(
+    document: dict[str, Any], open_only: bool = False
+) -> list[dict[str, Any]]:
+    """Project each thread's routing fields without its bodies or evidence.
+
+    Deciding whether an agent may act on a thread needs identity, priority, status,
+    title, and the files it concerns; `risk`, `required_behavior`, and every reply are
+    dropped rather than shortened, so nothing returned here is a summary of prose.
+    """
+    summaries = []
+    for item in thread_conversations(document):
+        if open_only and item["status"] != "open":
+            continue
+        thread = item["thread"]
+        summaries.append(
+            {
+                "id": thread["id"],
+                "priority": thread["priority"],
+                "status": item["status"],
+                "title": thread["title"],
+                "paths": list(thread.get("paths") or []),
+            }
+        )
+    return summaries
+
+
+def render_summaries(document: dict[str, Any], open_only: bool = False) -> str:
+    """Render the routing summary of the current threads as Markdown."""
+    heading = "Open Review Threads" if open_only else "Review Thread Summary"
+    lines = [f"# {heading}", ""]
+    for summary in thread_summaries(document, open_only):
+        paths = ", ".join(summary["paths"]) or "none"
+        lines.append(
+            f"- {summary['id']} [{summary['priority']}] {summary['status']}: "
+            f"{summary['title']} ({paths})"
+        )
+    if len(lines) == 2:
+        lines.append("No threads.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_conversations(document: dict[str, Any], open_only: bool = False) -> str:
     """Render the current durable thread conversations as Markdown."""
     lines = ["# Current Review Threads", ""]
     for item in thread_conversations(document):
+        if open_only and item["status"] != "open":
+            continue
         thread = item["thread"]
         lines.extend(
             [
@@ -354,8 +397,10 @@ def render_header(document: dict[str, Any], note_count: int) -> list[str]:
     history = document.get("history", [])
     terminal = state.get("terminal")
     lines = [
-        f"# Review Summary — {flatten_inline(document['name'])} "
-        f"(`{document['review_id']}`)",
+        (
+            f"# Review Summary — {flatten_inline(document['name'])} "
+            f"(`{document['review_id']}`)"
+        ),
         "",
     ]
     if isinstance(terminal, dict):
@@ -515,10 +560,14 @@ def render_verification(document: dict[str, Any]) -> list[str]:
         )
     lines.extend(
         [
-            "- Approval freshness: run `inspect` — this page is a cache and does"
-            " not know current drift",
-            "- Full conversations: `threads` command or canonical JSON; this page"
-            " is intentionally a skim view",
+            (
+                "- Approval freshness: run `inspect` — this page is a cache "
+                "and does not know current drift"
+            ),
+            (
+                "- Full conversations: `threads` command or canonical JSON; "
+                "this page is intentionally a skim view"
+            ),
         ]
     )
     return lines

@@ -160,6 +160,127 @@ def candidate_summary(
     }
 
 
+def declared_scope(canonical: Path, document: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the scope a loop currently declares, or None when it declares none.
+
+    The guard holds the live declaration and is checked first; a loop can be
+    guarded before it has published anything, and reading only its history
+    would report such a loop as undeclared. The latest snapshot is the fallback
+    for a loop whose guard has been released.
+    """
+    guard = canonical.with_suffix(".guard.json")
+    if guard.is_file() and not guard.is_symlink():
+        try:
+            stored = load_object_safely(guard)
+        except (OSError, ValueError):
+            stored = None
+        scope = stored.get("scope") if isinstance(stored, dict) else None
+        if isinstance(scope, dict):
+            return {
+                "scope": list(scope.get("scope") or []),
+                "exclusions": list(scope.get("exclude") or []),
+                "additional_inputs": list(scope.get("additional_input") or []),
+            }
+    return scope_summary(latest_guarded_snapshot(document))
+
+
+def load_object_safely(path: Path) -> Any:
+    """Read one JSON object, rejecting duplicate keys as the schema requires."""
+    return json.loads(path.read_text(), object_pairs_hook=reject_duplicate_keys)
+
+
+def all_live_successors(
+    reviews: Path, prior_review_id: str, review_kind: str
+) -> list[dict[str, Any]]:
+    """Every live successor chained from a prior review of one kind.
+
+    Normally there is at most one. More than one means two agents created a
+    successor in the same instant, or a process died between creating one and
+    noticing another; the caller settles that from this list rather than by
+    holding a lock across creation.
+    """
+    found: list[dict[str, Any]] = []
+    entries = sorted(reviews.iterdir()) if reviews.is_dir() else []
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
+        review_id = path.name[: -len(".json")]
+        if not REVIEW_ID_PATTERN.fullmatch(review_id):
+            continue
+        document, errors = load_canonical_candidate(path, review_id)
+        if errors:
+            continue
+        if document["state"]["workflow"]["phase"] == "terminal":
+            continue
+        if document.get("prior_review_id") != prior_review_id:
+            continue
+        if document.get("review_kind") != review_kind:
+            continue
+        workflow = document["state"]["workflow"]
+        found.append(
+            {
+                "review_id": review_id,
+                "name": document.get("name"),
+                "review_kind": document.get("review_kind"),
+                "prior_review_id": document.get("prior_review_id"),
+                "phase": workflow.get("phase"),
+                "primary_actor": workflow.get("primary_actor"),
+                "created_at": document.get("created_at") or "",
+                # A loop that published nothing may be retired; one that
+                # published anything holds review history and may not.
+                "has_events": bool(document.get("history")),
+                "scope": declared_scope(path, document),
+            }
+        )
+    return found
+
+
+def find_live_successor(
+    reviews: Path, prior_review_id: str, review_kind: str
+) -> dict[str, Any] | None:
+    """Return the live successor already chained from a prior review, if one exists.
+
+    A chained follow-up is identified by the prior review it continues and the
+    kind of round it runs, both of which every canonical document records. At
+    most one such successor may be live at a time: two would mean two agents
+    doing the same round with separate thread histories.
+
+    Terminal successors are ignored, so a later round of the same kind from the
+    same prior is still possible once the first one closes.
+    """
+    entries = sorted(reviews.iterdir()) if reviews.is_dir() else []
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
+        review_id = path.name[: -len(".json")]
+        if not REVIEW_ID_PATTERN.fullmatch(review_id):
+            continue
+        document, errors = load_canonical_candidate(path, review_id)
+        if errors:
+            continue
+        if document["state"]["workflow"]["phase"] == "terminal":
+            continue
+        if document.get("prior_review_id") != prior_review_id:
+            continue
+        if document.get("review_kind") != review_kind:
+            continue
+        workflow = document["state"]["workflow"]
+        return {
+            "review_id": review_id,
+            "name": document.get("name"),
+            "review_kind": document.get("review_kind"),
+            "prior_review_id": document.get("prior_review_id"),
+            "phase": workflow.get("phase"),
+            "primary_actor": workflow.get("primary_actor"),
+            # A successor that has neither a guard nor an event declares no
+            # scope yet, so whoever inspects it first decides what it covers.
+            # The caller is given the scope itself, which is what it must adopt,
+            # rather than a flag it would have to act on indirectly.
+            "scope": declared_scope(path, document),
+        }
+    return None
+
+
 def discover_loops(root: Path, reviews: Path) -> dict[str, Any]:
     """Classify every canonical loop and select the only resumable one, if any.
 
@@ -237,12 +358,17 @@ def render_candidate(candidate: dict[str, Any]) -> list[str]:
     held = candidate["lock"]["held"]
     lock_text = {True: "held", False: "unlocked", None: "unknown"}[held]
     return [
-        f"- {candidate['review_id']} {candidate['name']} "
-        f"({candidate['review_kind']}) — phase {candidate['phase']}, "
-        f"actor {candidate['primary_actor']}, threads "
-        f"{candidate['open_threads']} open/{candidate['resolved_threads']} resolved",
-        f"  scope: {scope_text} | {when} | "
-        f"drift {candidate['source_drift']} | lock {lock_text}",
+        (
+            f"- {candidate['review_id']} {candidate['name']} "
+            f"({candidate['review_kind']}) — phase {candidate['phase']}, "
+            f"actor {candidate['primary_actor']}, threads "
+            f"{candidate['open_threads']} open/"
+            f"{candidate['resolved_threads']} resolved"
+        ),
+        (
+            f"  scope: {scope_text} | {when} | "
+            f"drift {candidate['source_drift']} | lock {lock_text}"
+        ),
     ]
 
 

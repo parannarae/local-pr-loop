@@ -3,7 +3,7 @@ name: local-pr-loop
 description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and a skim-first Markdown summary report — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
 license: MIT
 metadata:
-  version: "0.8.0"
+  version: "0.9.0"
 ---
 
 # Local PR Loop
@@ -26,8 +26,7 @@ a random `REVIEW_ID`. Each loop uses:
 - `REVIEW_ID.guard.json`: permission-restricted opaque inspection handle.
 
 Keep the ID through handoffs. Never reuse another repository or worktree's
-artifacts or guess an ambiguous ID. Treat only canonical JSON as state; generate,
-never hand-edit, the Markdown report.
+artifacts or guess an ambiguous ID.
 
 ## Dependencies
 
@@ -38,8 +37,22 @@ all review operations through:
 python3 "$SKILL_DIR/scripts/review_cli.py" COMMAND ...
 ```
 
-Before mutation, read [review-schema.md](references/review-schema.md) for event
-contracts and [source-state.md](references/source-state.md) for exact commands.
+Read a reference before the act that needs it rather than before every act:
+
+- [review-schema.md](references/review-schema.md) before authoring or validating
+  an event;
+- [source-state.md](references/source-state.md) before declaring scope,
+  snapshotting, or publishing; and
+- [structure-review.md](references/structure-review.md) before the first event of
+  any loop whose `review_kind` is `structure`.
+
+The operating card that `inspect --agent` prints supersedes those rereads for
+the routine action it names: it carries that action's whole sequence and its typed
+obligations, so a fresh context can finish an ordinary phase from the card, the
+`template` draft, and the thread bodies its reply needs. The card names a
+reference whenever the routine sequence is not sufficient, and reading it is then
+mandatory — as it always is for a scope declaration or change, source drift,
+publication recovery, a timeout, an open validation gap, or a structure round.
 
 The cooperative lock lives under the target worktree's Git metadata. Require
 permission to write that metadata before acquiring it. If the environment blocks
@@ -164,6 +177,27 @@ behavior, better shape". Correctness findings discovered mid-round are flagged
 with `add-note` and routed to a new correctness loop, never mixed in. One
 structure round consumes the flag set that triggered it.
 
+## Reading State
+
+Read state through `inspect` and `threads`. Never read `REVIEW_ID.json` whole: it
+is authoritative but grows with every event, and everything an agent routes on —
+phase, primary actor, allowed events, drift, open threads, the recommended
+command — is what `inspect` derives from it. Pick the view by what you are about
+to do:
+
+- `inspect --agent` for the operating card alone, which is the ordinary agent
+  read;
+- `inspect --json` for the full dashboard, plus `--accretion` when you need the
+  ledger in a phase where no `final_review` is allowed;
+- `inspect` with no flag for the human form, which also carries the card;
+- `threads --summary --open --json` to route, decide whether you may act, or
+  count open threads; and
+- `threads --json` when you are drafting replies and need the full bodies.
+
+`REVIEW_ID.latest.md` stays current through the whole loop as the user's
+skim-first report. It is not a state or routing interface: read it for what to
+tell the user, not for what to do next.
+
 ## Role and Routing
 
 Run `inspect` and route on `.state.workflow`. Read `phase`, `primary_actor`,
@@ -181,6 +215,22 @@ history immutable, start a new review ID, and mention the prior ID in the
 handoff. Prefer `start-follow-up` for any successor: it records `prior_review_id`,
 which plain `init` never attaches afterward.
 
+`start-follow-up` is idempotent on the prior review and round kind. Concurrent
+callers converge on one successor, keeping published history over an unpublished
+duplicate; otherwise creation order decides. It reports `status: created` or
+`status: existing`, and requires the same name either way. A different name is
+refused rather than silently handing over a running loop. The only exception is
+a concurrently created loser with a different name: it is retired before that
+caller is refused.
+
+On `status: existing`, run `inspect` on the returned ID before anything else and
+confirm its name, kind, and prior review are the round you meant. The report
+names the scope that loop already declares; use exactly that. When it reports
+`scope: not yet declared`, the successor has neither a guard nor an event, so
+whatever scope is declared first becomes the loop's scope — adopt the scope the
+prior review guarded, never one you picked on your own. The mismatch surfaces
+much later, as a refused publish, or not at all.
+
 Read terminal state by outcome, not phase alone. `approval_stale` marks a
 recorded approval whose source moved, so it is never set for a timeout, which
 recorded no verification; that case reports `source_moved_since_terminal` and
@@ -195,13 +245,14 @@ phase action, and `inspect` names the changed paths.
 1. Without a supplied ID, run `discover REPO` and follow its status. For a new
    loop, run `init REPO NAME` and retain its `REVIEW_ID`.
 2. Run `inspect REPO REVIEW_ID ...` and follow its exact recommended command.
-   Use `--json` for an agent-readable dashboard.
+   Use `--agent` for the operating card and `--json` for the full dashboard.
 3. Acquire the lock. The command stores an opaque 0600 lease and never prints
    its token.
 4. Repeat `inspect` under the lease to create an opaque guard for the declared
    source scope.
 5. Create a state-aware draft with `template REPO REVIEW_ID KIND`. Read
-   `threads` when handling a multi-turn conversation.
+   `threads` when handling a multi-turn conversation, and
+   `threads --summary --open` when you only need to route.
 6. Populate the remaining blanks. Use `add-check`, `add-gap`, and
    `evidence-template` for correctly shaped validation records, and `add-note`
    for user-facing notes on design-shifting changes.
@@ -264,9 +315,11 @@ Use priorities consistently:
 - Before reporting a loop complete, run terminal `inspect` and confirm
   `approval_stale` is false. If it is true, run the recommended
   `start-follow-up` before making any completion claim.
-- Never delegate your own waiting to the user. While the other actor holds the
-  handoff, keep re-arming `wait` — `await-handoff` does this with a bound — and
-  treat a lapsed `wait` as silence, not a handoff.
+- Never delegate your own waiting to the user. Use bounded `await-handoff` while
+  the other actor holds the handoff; a lapsed poll is silence, not a handoff.
+  `timeout_eligible` permits, but does not require, a terminal timeout. For a
+  known delay, choose another deliberate bounded wait; after `exhausted`, report
+  the outcome rather than silently starting another wait cycle.
 - Treat canonical JSON as authoritative if it disagrees with a draft, receipt,
   report, terminal output, or another agent. The report is only a cache.
 - Never break a lock using PID or elapsed age. Lock status deliberately omits its

@@ -56,8 +56,10 @@ class ReviewScopeDeclarationTest(unittest.TestCase):
 
         self.assertIn("notes.md", str(caught.exception))
 
-    def test_rejects_a_non_object_declaration(self) -> None:
-        with self.assertRaises(ValueError):
+    def test_rejects_a_non_object_declaration_as_a_type_error(self) -> None:
+        # TypeError, matching load_object's identical top-level shape check;
+        # malformed content inside a real object stays ValueError.
+        with self.assertRaises(TypeError):
             review_scope.validate(["src/app.py"])
 
 

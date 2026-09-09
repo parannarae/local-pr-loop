@@ -9,9 +9,11 @@ import io
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 from unittest import mock
 
 ROOT = Path(__file__).parents[1]
@@ -34,6 +36,28 @@ def write_waiting_document(path: Path, marker: str) -> str:
                 "primary_action": {"kind": "publish_initial_review"},
             },
             "latest_event": None,
+        },
+    }
+    path.write_text(json.dumps(document))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_handoff_document(path: Path, marker: str, elapsed: float) -> str:
+    """Write a reviewer_verification document whose handoff started `elapsed` ago.
+
+    The reviewer handoff runs 1800s, so `elapsed` above that puts the deadline in
+    the past and below it leaves the deadline that many seconds ahead.
+    """
+    occurred = datetime.now(timezone.utc) - timedelta(seconds=elapsed)
+    document = {
+        "name": marker,
+        "state": {
+            "workflow": {
+                "phase": "reviewer_verification",
+                "primary_actor": "reviewer",
+                "primary_action": {"kind": "verify_owner_reply"},
+            },
+            "latest_event": {"occurred_at": occurred.isoformat()},
         },
     }
     path.write_text(json.dumps(document))
@@ -65,6 +89,61 @@ class ReviewWorkflowWaitTest(unittest.TestCase):
 
         self.assertEqual(result, {"status": "timeout", "canonical_sha256": baseline})
 
+    def test_a_handoff_deadline_still_ahead_cuts_the_wait_short(self) -> None:
+        # The waiting actor should learn a timeout became eligible promptly rather
+        # than sitting out a bound many times longer than the deadline.
+        baseline = write_handoff_document(self.review, "nearly-due", 1799.5)
+
+        started = time.monotonic()
+        result = review_workflow.poll_for_change(self.review, 30, baseline)
+
+        self.assertEqual(result["status"], "deadline_reached")
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_passed_handoff_deadline_no_longer_shortens_the_wait(self) -> None:
+        # The defect: with the deadline behind it, the loop's own deadline was in the
+        # past, so the call returned without polling and every later call did too.
+        baseline = write_handoff_document(self.review, "overdue", 3600)
+
+        started = time.monotonic()
+        result = review_workflow.poll_for_change(self.review, 1, baseline)
+
+        self.assertEqual(
+            result, {"status": "deadline_reached", "canonical_sha256": baseline}
+        )
+        self.assertGreaterEqual(time.monotonic() - started, 0.9)
+
+    def test_a_change_after_a_passed_deadline_is_reported_rather_than_missed(
+        self,
+    ) -> None:
+        baseline = write_handoff_document(self.review, "overdue", 3600)
+        changed: list[str] = []
+
+        def publish_during_the_wait() -> None:
+            time.sleep(0.05)
+            changed.append(write_handoff_document(self.review, "published", 3600))
+
+        writer = threading.Thread(target=publish_during_the_wait)
+        writer.start()
+        try:
+            result = review_workflow.poll_for_change(self.review, 1, baseline)
+        finally:
+            writer.join()
+
+        self.assertEqual(
+            result, {"status": "changed", "canonical_sha256": changed[0]}
+        )
+
+    def test_the_caller_bound_still_wins_over_a_distant_handoff_deadline(self) -> None:
+        # A deadline ahead of the bound must not extend the wait past what was asked.
+        baseline = write_handoff_document(self.review, "fresh", 0)
+
+        started = time.monotonic()
+        result = review_workflow.poll_for_change(self.review, 1, baseline)
+
+        self.assertEqual(result, {"status": "timeout", "canonical_sha256": baseline})
+        self.assertLess(time.monotonic() - started, 5)
+
     # --- await_handoff ---
 
     def test_every_round_polls_against_the_entry_baseline(self) -> None:
@@ -80,9 +159,8 @@ class ReviewWorkflowWaitTest(unittest.TestCase):
         # baseline captured once at entry.
         with mock.patch.object(
             review_workflow, "poll_for_change", side_effect=[timed_out, changed]
-        ) as poll:
-            with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                exit_code = review_workflow.await_handoff(args)
+        ) as poll, contextlib.redirect_stdout(io.StringIO()) as stdout:
+            exit_code = review_workflow.await_handoff(args)
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(

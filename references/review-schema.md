@@ -1,13 +1,13 @@
 # Review Artifact Format
 
-The skill version is `0.8.0`. Persisted compatibility uses an independent
+The skill version is `0.9.0`. Persisted compatibility uses an independent
 calendar revision:
 
 ```json
 {
   "format": "local-pr-loop",
   "format_revision": "2026-08-21.1",
-  "created_by": {"version": "0.8.0"},
+  "created_by": {"version": "0.9.0"},
   "created_at": "2026-08-15T01:00:00+00:00",
   "review_id": "k7m3q9wx",
   "prior_review_id": null,
@@ -160,6 +160,11 @@ exclusions; a thread path outside the scope is dropped, never flagged. A file
 absent or empty at the base is authored whole on the branch and is judged by
 the reviewer instead of auto-flagged; an unreachable base degrades to the
 thread signal and the dashboard reports it.
+
+`inspect --json` carries the ledger only where a `final_review` is allowed,
+which is the only event whose template consumes it; `--accretion` includes it in
+any other phase. The human form keeps its flagged-set line throughout an active
+loop.
 
 A correctness `final_review` over flagged files must carry `structure_debt`,
 which its template prefills from the guarded tree:

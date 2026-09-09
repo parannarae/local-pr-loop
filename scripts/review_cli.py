@@ -9,10 +9,12 @@ import secrets
 import shlex
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import review_discover
 import review_ledger
@@ -62,14 +64,21 @@ def run_helper(
     *,
     input_bytes: bytes | None = None,
     capture: bool = False,
+    suppress_stderr: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
-    """Run one bundled Python helper without invoking a shell."""
+    """Run one bundled Python helper without invoking a shell.
+
+    Set `suppress_stderr` only where a nonzero result is an expected outcome the
+    caller handles itself; helpers report refusals on stderr, which is otherwise
+    inherited so real failures stay visible.
+    """
     # Flush buffered parent output first so child output cannot precede it.
     sys.stdout.flush()
     return subprocess.run(
         [sys.executable, str(script), *arguments],
         input=input_bytes,
         stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.DEVNULL if suppress_stderr else None,
         check=False,
     )
 
@@ -276,6 +285,11 @@ def command_init(args: argparse.Namespace) -> int:
     report = captured_helper(STATE_SCRIPT, ["report"], input_bytes=canonical)
     atomic_bytes(paths.canonical, canonical)
     atomic_bytes(paths.report, report)
+    if getattr(args, "created_review_id", None) is not None:
+        # A caller that must inspect the result before announcing it — the
+        # chained follow-up — reads the id here and prints its own lines.
+        args.created_review_id.append(review_id)
+        return 0
     print(f"review_id: {review_id}")
     print(f"review_json: {paths.canonical}")
     print(f"latest_report: {paths.report}")
@@ -388,7 +402,10 @@ def command_inspect(args: argparse.Namespace) -> int:
         )
     snapshot_value = json.loads(snapshot_json)
     source = snapshot_value.get("source_snapshot", snapshot_value)
-    if not args.json:
+    # Both machine views replace the human report rather than decorating it, so neither
+    # carries the state dump, the artifact paths, or the raw snapshot.
+    compact = args.json or args.agent
+    if not compact:
         print("workflow:")
         completed = run_helper(
             STATE_SCRIPT,
@@ -432,8 +449,12 @@ def command_inspect(args: argparse.Namespace) -> int:
         operation_args.append("--lease-present")
     if args.json:
         operation_args.append("--json")
+    if args.agent:
+        operation_args.append("--agent")
+    if args.accretion:
+        operation_args.append("--accretion")
     result = run_helper(PUBLISH_SCRIPT, operation_args)
-    if result.returncode != 0 or args.json:
+    if result.returncode != 0 or compact:
         return result.returncode
     print(f"review_json: {paths.canonical}")
     print(f"latest_report: {paths.report}")
@@ -584,6 +605,10 @@ def command_threads(args: argparse.Namespace) -> int:
     state_args = ["threads"]
     if args.json:
         state_args.append("--json")
+    if args.summary:
+        state_args.append("--summary")
+    if args.open_only:
+        state_args.append("--open")
     return run_helper(
         STATE_SCRIPT,
         state_args,
@@ -748,11 +773,19 @@ def command_retire(args: argparse.Namespace) -> int:
     # Take the cooperative lock and re-check inside it. Guard creation verifies a lease
     # and publication verifies the lock, so holding it is what stops either from starting
     # between the checks and the removal of canonical state.
+    # Convergence races another agent for this same duplicate and handles the
+    # loss itself, so its diagnostics would only make a successful run look
+    # broken. Every other caller reports the refusal.
+    expects_contention = getattr(args, "quiet", False)
     acquired = run_helper(
-        WORKFLOW_SCRIPT, ["acquire", *workflow_arguments(paths)], capture=True
+        WORKFLOW_SCRIPT,
+        ["acquire", *workflow_arguments(paths)],
+        capture=True,
+        suppress_stderr=expects_contention,
     )
     if acquired.returncode != 0:
-        sys.stderr.buffer.write(acquired.stdout)
+        if not expects_contention:
+            sys.stderr.buffer.write(acquired.stdout)
         raise RuntimeError(
             f"review {paths.review_id} could not be locked for retirement; another "
             "process holds it"
@@ -816,24 +849,261 @@ def retire_locked_review(paths: ReviewPaths, document: dict, reason: str) -> Non
     paths.report.unlink(missing_ok=True)
 
 
+def live_successors(
+    reviews: Path, prior_review_id: str, review_kind: str
+) -> list[dict[str, Any]]:
+    """Every live successor chained from a prior review, in tie-break order.
+
+    Ordered by creation time then review id, so two agents reading the same
+    canonical set independently agree on which one is the winner.
+    """
+    found = review_discover.all_live_successors(
+        reviews, prior_review_id, review_kind
+    )
+    return sorted(found, key=lambda item: (item["created_at"], item["review_id"]))
+
+
+def select_successor(
+    reviews: Path, prior_review_id: str, review_kind: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Choose the live successor that wins, and the duplicates it displaces.
+
+    Reads canonical documents and decides; it retires nothing. Keeping the
+    decision free of side effects is what lets a caller reject the request —
+    a follow-up naming a different round — before any loop is touched.
+
+    A successor that published anything holds review history and wins outright.
+    Creation order decides only among loops that published nothing, so the
+    tie-break can never discard history to satisfy an ordering.
+
+    Raises:
+        ValueError: Two successors have published events, so neither can be
+            discarded without destroying review history. A person chooses.
+    """
+    live = live_successors(reviews, prior_review_id, review_kind)
+    if not live:
+        return None, []
+    published = [item for item in live if item["has_events"]]
+    if len(published) > 1:
+        raise ValueError(
+            "more than one live successor has published events for this prior "
+            "review and kind: "
+            + ", ".join(item["review_id"] for item in published)
+            + ". Continue the one you meant and retire or supersede the other."
+        )
+    winner = published[0] if published else live[0]
+    # Every duplicate is eventless here: at most one successor has history, and
+    # that one is the winner. Retirability is what the rule protects.
+    duplicates = [item for item in live if item["review_id"] != winner["review_id"]]
+    return winner, duplicates
+
+
+def retire_displaced_successors(
+    repo: str,
+    reviews: Path,
+    prior_review_id: str,
+    review_kind: str,
+    winner: dict[str, Any],
+    duplicates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Retire the displaced duplicates and return the successor that survived.
+
+    Two agents can pass the scan in the same instant and both create, so rather
+    than hold a lock across creation this settles the outcome afterwards from
+    the canonical documents themselves. Both agents select the same winner, and
+    the loser retires its own loop — which is exactly what retirement is for,
+    since a just-created loop has published nothing.
+
+    Settling afterwards also repairs a duplicate left by a process that died
+    between creating and checking, which a lock could not do.
+
+    Raises:
+        RuntimeError: Duplicates outlived the attempt to retire them, so the
+            caller cannot be handed the one live successor it asked for.
+    """
+    failures: list[str] = []
+    for duplicate in duplicates:
+        retire_arguments = argparse.Namespace(
+            repo=repo,
+            review_id=duplicate["review_id"],
+            quiet=True,
+            reason=(
+                "duplicate chained follow-up: another successor for the same "
+                f"prior review and kind won the tie-break ({winner['review_id']})"
+            ),
+        )
+        try:
+            command_retire(retire_arguments)
+        # The complete refusal surface of command_retire: contention and validation
+        # refusals arrive as ValueError or RuntimeError and I/O failures as OSError
+        # or TypeError, and the types cannot tell contention from real failure, so
+        # whether it mattered is settled below by whether the duplicate is gone. A
+        # bug (KeyError, AttributeError) propagates instead of posing as contention.
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            failures.append(f"{duplicate['review_id']}: {error}")
+
+    remaining = live_successors(reviews, prior_review_id, review_kind)
+    if len(remaining) > 1 and failures:
+        # An agent retiring the same duplicate is briefly mid-flight; give it the
+        # window creation already uses before treating leftovers as a real failure.
+        time.sleep(SUCCESSOR_SETTLE_SECONDS)
+        remaining = live_successors(reviews, prior_review_id, review_kind)
+    if len(remaining) > 1:
+        raise RuntimeError(
+            "chained successors did not converge to one: "
+            + ", ".join(item["review_id"] for item in remaining)
+            + ". Retirement did not take effect ("
+            + ("; ".join(failures) if failures else "no failure was reported")
+            + "). Retire the duplicate yourself, then run this command again."
+        )
+    return remaining[0] if remaining else None
+
+
+def converge_successors(
+    repo: str, reviews: Path, prior_review_id: str, review_kind: str
+) -> dict[str, Any] | None:
+    """Select the winning successor and retire the duplicates it displaces.
+
+    For a caller that has already created its own loop, where settling cannot be
+    withheld pending a name check: the creation has happened either way, so the
+    duplicate it made must be resolved. Such a caller can still refuse the
+    request afterwards, when the winner turns out to carry a different name.
+    """
+    winner, duplicates = select_successor(reviews, prior_review_id, review_kind)
+    if winner is None:
+        return None
+    return retire_displaced_successors(
+        repo, reviews, prior_review_id, review_kind, winner, duplicates
+    )
+
+
+def report_existing_successor(
+    repo: str, successor: dict[str, object], requested_name: str
+) -> int:
+    """Report the live successor a chained follow-up resolves to.
+
+    A different requested name means the caller wanted a different round than
+    the one already running, so it stops rather than quietly handing back
+    someone else's loop and its threads.
+    """
+    review_id = str(successor["review_id"])
+    if successor.get("name") != requested_name:
+        print(
+            f"a live successor already exists for this prior review and kind, "
+            f"under a different name: {review_id} is "
+            f"{successor.get('name')!r}, you asked for {requested_name!r}. "
+            "Join that review if it is the round you meant, or start an "
+            "independent review with init.",
+            file=sys.stderr,
+        )
+        return 1
+    paths = review_paths(repo, review_id)
+    print("status: existing")
+    for field in (
+        "review_id",
+        "name",
+        "review_kind",
+        "prior_review_id",
+        "phase",
+        "primary_actor",
+    ):
+        print(f"{field}: {successor.get(field)}")
+    # Reported as the paths themselves, not as a flag: this output is a text
+    # channel, and the caller's next act is to adopt this scope verbatim.
+    scope = successor.get("scope")
+    if not isinstance(scope, dict):
+        print("scope: not yet declared")
+    else:
+        print(f"scope: {' '.join(scope['scope'])}")
+        if scope["exclusions"]:
+            print(f"exclusions: {' '.join(scope['exclusions'])}")
+        if scope["additional_inputs"]:
+            print(f"additional_inputs: {' '.join(scope['additional_inputs'])}")
+    print(f"review_json: {paths.canonical}")
+    print(f"latest_report: {paths.report}")
+    return 0
+
+
+# How long a freshly created successor waits before deciding which loop won.
+# Covers the skew between two agents writing their canonical files; it is not a
+# correctness bound, and a competitor slower than this still converges on the
+# next command that scans successors.
+SUCCESSOR_SETTLE_SECONDS = 0.4
+
+
 def command_start_follow_up(args: argparse.Namespace) -> int:
     prior = review_paths(args.repo, args.prior_review_id)
     validate_review(prior)
     document = load_object(prior.canonical)
     if document["state"]["workflow"]["phase"] != "terminal":
         raise ValueError("follow-up requires a terminal prior review")
+    repo = str(prior.repository.root)
+    reviews = prior.repository.reviews
+
+    # Chaining is idempotent on the prior review and the kind of round: the
+    # terminal dashboard recommends this command to whichever role runs it, so
+    # both roles may reach it and only one successor may be live.
+    #
+    # Selection is read-only, so a request naming a different round is refused
+    # while the loops are still untouched. A refusal must leave the repository
+    # exactly as it found it; only an accepted request settles duplicates.
+    existing, displaced = select_successor(
+        reviews, args.prior_review_id, args.review_kind
+    )
+    if existing is not None:
+        if existing.get("name") != args.name:
+            return report_existing_successor(repo, existing, args.name)
+        settled = retire_displaced_successors(
+            repo, reviews, args.prior_review_id, args.review_kind, existing, displaced
+        )
+        # A competitor can retire the selected loop between the two steps, which
+        # leaves nothing to join; falling through creates the round as asked.
+        if settled is not None:
+            return report_existing_successor(repo, settled, args.name)
+
     # The growth baseline and chaining policy carry over unless overridden, so a
     # successor keeps measuring the same branch the same way.
+    created: list[str] = []
     init_args = argparse.Namespace(
-        repo=str(prior.repository.root),
+        repo=repo,
         name=args.name,
         prior_review_id=args.prior_review_id,
         review_kind=args.review_kind,
         structure_policy=args.structure_policy or document.get("structure_policy"),
         comparison_base=document.get("comparison_base"),
         base_ref=args.base_ref,
+        created_review_id=created,
     )
-    return command_init(init_args)
+    result = command_init(init_args)
+    if result != 0 or not created:
+        return result
+
+    # Check again now the loop exists: a second agent may have created one in
+    # the same instant. Whoever loses the selection has its own loop retired
+    # here and reports the winner instead of a second round nobody wanted.
+    #
+    # The no-side-effect promise made above does not reach this path and cannot:
+    # this call has already created a loop, so every outcome from here changes
+    # state, and undoing the creation would itself be a retirement. A loser
+    # whose winner carries a different name therefore settles first and refuses
+    # after, which is the one rejection that leaves a retired duplicate behind.
+    #
+    # Settle first. Convergence can only weigh the successors it can see, so a
+    # caller that scans before a competitor's file lands would announce an ID
+    # that competitor is about to retire. Both callers reach this point within
+    # milliseconds of each other, so pausing longer than that skew makes each
+    # one visible to the other before either decides.
+    time.sleep(SUCCESSOR_SETTLE_SECONDS)
+    winner = converge_successors(repo, reviews, args.prior_review_id, args.review_kind)
+    if winner is not None and winner["review_id"] != created[0]:
+        return report_existing_successor(repo, winner, args.name)
+
+    paths = review_paths(repo, created[0])
+    print("status: created")
+    print(f"review_id: {created[0]}")
+    print(f"review_json: {paths.canonical}")
+    print(f"latest_report: {paths.report}")
+    return 0
 
 
 def add_scope_arguments(parser: argparse.ArgumentParser) -> None:
@@ -889,7 +1159,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect = commands.add_parser("inspect")
     add_review_selection(inspect)
-    inspect.add_argument("--json", action="store_true")
+    view = inspect.add_mutually_exclusive_group()
+    view.add_argument("--json", action="store_true")
+    view.add_argument(
+        "--agent",
+        action="store_true",
+        help="Print only the phase-scoped operating card",
+    )
+    inspect.add_argument(
+        "--accretion",
+        action="store_true",
+        help="Include the accretion ledger even when no final_review is allowed",
+    )
     add_scope_arguments(inspect)
     inspect.set_defaults(handler=command_inspect)
 
@@ -901,6 +1182,17 @@ def build_parser() -> argparse.ArgumentParser:
     threads = commands.add_parser("threads")
     add_review_selection(threads)
     threads.add_argument("--json", action="store_true")
+    threads.add_argument(
+        "--summary",
+        action="store_true",
+        help="Return identity, priority, status, title, and paths without bodies",
+    )
+    threads.add_argument(
+        "--open",
+        dest="open_only",
+        action="store_true",
+        help="Restrict the output to threads that are currently open",
+    )
     threads.set_defaults(handler=command_threads)
 
     add_check = commands.add_parser("add-check")

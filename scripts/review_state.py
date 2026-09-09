@@ -87,12 +87,27 @@ def contextual_event_template(
     )
 
 
-def thread_conversations(document: dict[str, Any]) -> list[dict[str, Any]]:
-    return review_render.thread_conversations(document)
+def thread_conversations(
+    document: dict[str, Any], open_only: bool = False
+) -> list[dict[str, Any]]:
+    conversations = review_render.thread_conversations(document)
+    if not open_only:
+        return conversations
+    return [item for item in conversations if item["status"] == "open"]
 
 
-def render_conversations(document: dict[str, Any]) -> str:
-    return review_render.render_conversations(document)
+def render_conversations(document: dict[str, Any], open_only: bool = False) -> str:
+    return review_render.render_conversations(document, open_only)
+
+
+def thread_summaries(
+    document: dict[str, Any], open_only: bool = False
+) -> list[dict[str, Any]]:
+    return review_render.thread_summaries(document, open_only)
+
+
+def render_summaries(document: dict[str, Any], open_only: bool = False) -> str:
+    return review_render.render_summaries(document, open_only)
 
 
 def append_event(document: Any, event: Any) -> dict[str, Any]:
@@ -164,6 +179,8 @@ def main() -> int:
     )
     threads_parser = subparsers.add_parser("threads")
     threads_parser.add_argument("--json", action="store_true")
+    threads_parser.add_argument("--summary", action="store_true")
+    threads_parser.add_argument("--open", dest="open_only", action="store_true")
     evidence_parser = subparsers.add_parser("evidence-template")
     evidence_parser.add_argument("basis", choices=EVIDENCE_BASES)
     subparsers.add_parser("eligible-timeout")
@@ -267,10 +284,14 @@ def main() -> int:
         print(kind)
         return 0
     if args.command == "threads":
-        if args.json:
-            print(json.dumps(thread_conversations(value), indent=2))
+        if args.summary and args.json:
+            print(json.dumps(thread_summaries(value, args.open_only), indent=2))
+        elif args.summary:
+            print(render_summaries(value, args.open_only), end="")
+        elif args.json:
+            print(json.dumps(thread_conversations(value, args.open_only), indent=2))
         else:
-            print(render_conversations(value), end="")
+            print(render_conversations(value, args.open_only), end="")
         return 0
     if args.command == "state":
         print(json.dumps(value["state"], indent=2))

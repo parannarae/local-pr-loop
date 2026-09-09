@@ -10,10 +10,12 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import review_cli
 import review_state
 
 CLI = ROOT / "scripts" / "review_cli.py"
@@ -164,6 +166,59 @@ class RetireReviewTest(unittest.TestCase):
         self.assertTrue(self.canonical.is_file())
         self.assertFalse(self.retired.exists())
 
+
+# --- review_cli.retire_displaced_successors ---
+
+
+class RetireDisplacedSuccessorsExceptionTest(unittest.TestCase):
+    """Convergence absorbs the skill's own refusal types and nothing else."""
+
+    def converge(self, reviews: Path) -> object:
+        return review_cli.retire_displaced_successors(
+            "unused-repo",
+            reviews,
+            "prior123",
+            "correctness",
+            {"review_id": "winner12"},
+            [{"review_id": "loser123"}],
+        )
+
+    def test_a_refusal_is_absorbed_and_settled_by_observation(self) -> None:
+        # The duplicate is gone by the time convergence looks, so the refusal —
+        # another agent got there first — did not matter and no error escapes.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            review_cli,
+            "command_retire",
+            side_effect=RuntimeError("could not be locked for retirement"),
+        ), mock.patch.object(
+            review_cli,
+            "live_successors",
+            return_value=[{"review_id": "winner12"}],
+        ):
+            survivor = self.converge(Path(directory))
+
+        self.assertEqual(survivor, {"review_id": "winner12"})
+
+    def test_a_refusal_with_the_duplicate_still_live_reports_the_failure(self) -> None:
+        remaining = [{"review_id": "winner12"}, {"review_id": "loser123"}]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            review_cli,
+            "command_retire",
+            side_effect=ValueError("still has a lock lease"),
+        ), mock.patch.object(
+            review_cli, "live_successors", return_value=remaining
+        ), mock.patch.object(review_cli.time, "sleep"), self.assertRaisesRegex(
+            RuntimeError, "still has a lock lease"
+        ):
+            self.converge(Path(directory))
+
+    def test_a_programming_error_propagates_instead_of_posing_as_contention(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            review_cli, "command_retire", side_effect=KeyError("review_id")
+        ), self.assertRaises(KeyError):
+            self.converge(Path(directory))
 
 if __name__ == "__main__":
     unittest.main()

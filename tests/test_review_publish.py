@@ -141,6 +141,8 @@ class ReviewPublishFaultTest(unittest.TestCase):
             current_source_fingerprint="1" * 64,
             lease_present=True,
             json=True,
+            agent=False,
+            accretion=False,
             command_prefix="python3 review_cli.py",
         )
         with mock.patch("builtins.print") as output:
@@ -197,6 +199,8 @@ class ReviewPublishFaultTest(unittest.TestCase):
             current_source_fingerprint="1" * 64,
             lease_present=False,
             json=True,
+            agent=False,
+            accretion=False,
             command_prefix="python3 review_cli.py",
         )
 
@@ -241,6 +245,8 @@ class ReviewPublishFaultTest(unittest.TestCase):
             current_source_fingerprint="2" * 64,
             lease_present=False,
             json=True,
+            agent=False,
+            accretion=False,
             command_prefix="python3 review_cli.py",
         )
         with mock.patch("builtins.print") as output:
@@ -302,6 +308,8 @@ class ReviewPublishFaultTest(unittest.TestCase):
             current_source_fingerprint=None,
             lease_present=False,
             json=True,
+            agent=False,
+            accretion=False,
             command_prefix="python3 review_cli.py",
         )
         with mock.patch("builtins.print") as output:
