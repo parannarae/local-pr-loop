@@ -18,7 +18,7 @@ uv run ruff check .
 uv run python -m unittest discover -s tests
 ```
 
-The environment is pinned to Python 3.9, the oldest version the skill supports and the one macOS ships, so syntax or library use that would fail for a user fails here first. That floor applies on every platform: a contributor on Linux or Windows gets 3.9 rather than whichever interpreter happens to be installed.
+The environment is pinned to Python 3.9, the oldest version the skill supports, so syntax or library use that would fail for a user running the skill with macOS's built-in Python fails here first. That floor applies on every platform: a contributor on Linux or Windows gets 3.9 rather than whichever interpreter happens to be installed.
 
 Nothing in that environment reaches the code the skill runs. The helpers stay standard-library-only, and `python3 scripts/review_cli.py` works with no virtual environment and nothing installed. Keep `dependencies` in `pyproject.toml` empty and add tooling to the `dev` group.
 

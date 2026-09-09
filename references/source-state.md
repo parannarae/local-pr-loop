@@ -226,11 +226,11 @@ handoff deadline: `awaiting_initial_review` anchors on the document's
 `created_at`, the other phases on their latest handoff event.
 
 A deadline still ahead cuts the wait short, so eligibility is reported promptly.
-Once it has passed it keeps reporting `deadline_reached` but stops shortening
-anything: the bound you asked for is waited in full, and a change landing inside
-it still returns `changed`. Re-arming therefore remains a real option for a
-counterpart that is late rather than absent, which matters because the deadline
-anchors on the latest event and so stays passed until the next one lands.
+A deadline already passed keeps reporting `deadline_reached` but no longer
+shortens anything: the requested bound is waited in full and a change landing
+inside it still returns `changed`, so a counterpart that is late rather than
+absent can be waited for even though the deadline stays passed until the next
+event lands.
 
 Span a handoff with one bounded call instead of hand-rolling that re-arm loop:
 
@@ -246,19 +246,16 @@ deadline exists, then re-arms `wait` per round until one structured outcome:
 |---|---|---|
 | `changed` | 0 | re-`inspect` and act on the new phase |
 | `terminal` | 0 | run the terminal `inspect` and check `approval_stale` |
-| `timeout_eligible` | 4 | decide: `publish-timeout --if-eligible`, or keep waiting |
+| `timeout_eligible` | 4 | decide: `publish-timeout --if-eligible`, or another bounded wait |
 | `exhausted` | 5 | report to the user; do not silently continue or loop again |
 
-`timeout_eligible` is a decision, not an instruction. Publishing the timeout is
-terminal and immutable: it ends the loop with no approval and leaves open threads
-open, so it fits a counterpart that has genuinely gone absent. When the delay has
-a known cause, re-arming the wait is the better answer and now behaves as one.
-
-The round bound is mandatory, and exhausting it is a reportable result, not a
-reason to re-enter. A stalled `awaiting_initial_review` becomes
-`timeout_eligible` once the creation-anchored deadline passes, so
-`publish-timeout --if-eligible` can terminate a loop whose reviewer never
-appeared.
+`timeout_eligible` permits, but does not require, a terminal timeout. Use it
+when a counterpart has gone absent: the terminal is immutable, carries no
+approval, and leaves open threads open. For a known delay, choose another
+bounded wait. `exhausted` remains reportable rather than a reason to silently
+start another cycle. A stalled `awaiting_initial_review` becomes eligible once
+its creation-anchored deadline passes, so `publish-timeout --if-eligible` can
+terminate a loop whose reviewer never appeared.
 
 Publish a timeout only when eligible:
 

@@ -26,8 +26,7 @@ a random `REVIEW_ID`. Each loop uses:
 - `REVIEW_ID.guard.json`: permission-restricted opaque inspection handle.
 
 Keep the ID through handoffs. Never reuse another repository or worktree's
-artifacts or guess an ambiguous ID. Treat only canonical JSON as state; generate,
-never hand-edit, the Markdown report.
+artifacts or guess an ambiguous ID.
 
 ## Dependencies
 
@@ -52,9 +51,8 @@ the routine action it names: it carries that action's whole sequence and its typ
 obligations, so a fresh context can finish an ordinary phase from the card, the
 `template` draft, and the thread bodies its reply needs. The card names a
 reference whenever the routine sequence is not sufficient, and reading it is then
-mandatory — as it always is when declaring or changing scope, handling source
-drift, publication recovery, a timeout, or an open validation gap, or opening a
-structure round.
+mandatory — as it always is for a scope declaration or change, source drift,
+publication recovery, a timeout, an open validation gap, or a structure round.
 
 The cooperative lock lives under the target worktree's Git metadata. Require
 permission to write that metadata before acquiring it. If the environment blocks
@@ -217,30 +215,21 @@ history immutable, start a new review ID, and mention the prior ID in the
 handoff. Prefer `start-follow-up` for any successor: it records `prior_review_id`,
 which plain `init` never attaches afterward.
 
-`start-follow-up` is idempotent on the prior review and the kind of round, so
-either role may run the command a terminal dashboard recommends without racing
-the other into two loops. Simultaneous callers settle on one successor and
-retire the duplicate, so a loop left behind by an interrupted caller is cleaned
-up by the next call rather than blocking it. A successor that has published
-anything is the one kept, and creation order decides only between successors
-that published nothing, so settling never discards review history. The command
-reports `status: created` when it made the successor and `status: existing` when
-one was already live; the same name is required either way, and a different name
-is refused rather than silently handed the running loop. A follow-up refused
-before it creates anything changes nothing, because the name is checked before
-any duplicate is retired. The one exception is a caller that already created its
-loop and only then lost to a concurrent round under a different name: it settles
-the duplicate first and refuses after, so that rejection does leave a retired
-loop behind.
+`start-follow-up` is idempotent on the prior review and round kind. Concurrent
+callers converge on one successor, keeping published history over an unpublished
+duplicate; otherwise creation order decides. It reports `status: created` or
+`status: existing`, and requires the same name either way. A different name is
+refused rather than silently handing over a running loop. The only exception is
+a concurrently created loser with a different name: it is retired before that
+caller is refused.
 
 On `status: existing`, run `inspect` on the returned ID before anything else and
 confirm its name, kind, and prior review are the round you meant. The report
 names the scope that loop already declares; use exactly that. When it reports
 `scope: not yet declared`, the successor has neither a guard nor an event, so
 whatever scope is declared first becomes the loop's scope — adopt the scope the
-prior review guarded rather than one you choose independently. Never guard an
-inherited loop with a scope you picked on your own; the mismatch surfaces much
-later, as a refused publish, or not at all.
+prior review guarded, never one you picked on your own. The mismatch surfaces
+much later, as a refused publish, or not at all.
 
 Read terminal state by outcome, not phase alone. `approval_stale` marks a
 recorded approval whose source moved, so it is never set for a timeout, which
@@ -326,12 +315,11 @@ Use priorities consistently:
 - Before reporting a loop complete, run terminal `inspect` and confirm
   `approval_stale` is false. If it is true, run the recommended
   `start-follow-up` before making any completion claim.
-- Never delegate your own waiting to the user. While the other actor holds the
-  handoff, keep re-arming `wait` — `await-handoff` does this with a bound — and
-  treat a lapsed `wait` as silence, not a handoff. An eligible timeout is a
-  decision rather than an instruction: publishing one is terminal and immutable,
-  so take it for a counterpart that has gone absent, and keep waiting when the
-  delay has a known cause.
+- Never delegate your own waiting to the user. Use bounded `await-handoff` while
+  the other actor holds the handoff; a lapsed poll is silence, not a handoff.
+  `timeout_eligible` permits, but does not require, a terminal timeout. For a
+  known delay, choose another deliberate bounded wait; after `exhausted`, report
+  the outcome rather than silently starting another wait cycle.
 - Treat canonical JSON as authoritative if it disagrees with a draft, receipt,
   report, terminal output, or another agent. The report is only a cache.
 - Never break a lock using PID or elapsed age. Lock status deliberately omits its
