@@ -169,6 +169,133 @@ def seven_event_lgtm_document() -> dict[str, Any]:
     )
 
 
+def two_thread_document() -> dict[str, Any]:
+    """One resolved and one open thread, each with a reply body to drop or keep."""
+    open_thread = make_thread("T2", "P2", "Version skew", "Package and artifact differ")
+    open_thread["paths"] = ["b.py"]
+    resolved_thread = make_thread("T1", "P1", "Baseline race", "Change absorbed")
+    resolved_thread["paths"] = ["a.py"]
+    return make_document(
+        [
+            {
+                "kind": "review",
+                "event_id": "evt_review0000",
+                "occurred_at": "2026-08-14T01:00:00+00:00",
+                "threads": [resolved_thread, open_thread],
+            },
+            {
+                "kind": "owner_reply",
+                "event_id": "evt_reply00001",
+                "occurred_at": "2026-08-14T02:00:00+00:00",
+                "replies": [
+                    {
+                        "thread_id": "T1",
+                        "decision": "applied",
+                        "message": "Serialized the baseline write.",
+                    },
+                    {
+                        "thread_id": "T2",
+                        "decision": "applied",
+                        "message": "Bumped both manifests.",
+                    },
+                ],
+            },
+            {
+                "kind": "reviewer_update",
+                "event_id": "evt_update0001",
+                "occurred_at": "2026-08-14T03:00:00+00:00",
+                "decisions": [
+                    {
+                        "thread_id": "T1",
+                        "action": "resolve",
+                        "message": "Verified against the suite.",
+                    },
+                    {
+                        "thread_id": "T2",
+                        "action": "comment",
+                        "message": "Still checking the skew.",
+                    },
+                ],
+            },
+        ],
+        open_threads=["T2"],
+        resolved_threads=["T1"],
+    )
+
+
+class ThreadSummaryTest(unittest.TestCase):
+    # --- thread_summaries ---
+
+    def test_summary_returns_routing_fields_and_drops_every_body(self) -> None:
+        summaries = review_render.thread_summaries(two_thread_document())
+
+        self.assertEqual(
+            summaries,
+            [
+                {
+                    "id": "T1",
+                    "priority": "P1",
+                    "status": "resolved",
+                    "title": "Baseline race",
+                    "paths": ["a.py"],
+                },
+                {
+                    "id": "T2",
+                    "priority": "P2",
+                    "status": "open",
+                    "title": "Version skew",
+                    "paths": ["b.py"],
+                },
+            ],
+        )
+
+    def test_open_filter_excludes_a_resolved_thread(self) -> None:
+        summaries = review_render.thread_summaries(two_thread_document(), True)
+
+        self.assertEqual([item["id"] for item in summaries], ["T2"])
+
+    def test_a_thread_without_declared_paths_summarizes_as_an_empty_list(self) -> None:
+        document = two_thread_document()
+        del document["history"][0]["threads"][1]["paths"]
+
+        summaries = review_render.thread_summaries(document)
+
+        self.assertEqual(summaries[1]["paths"], [])
+
+    # --- render_summaries ---
+
+    def test_human_summary_names_each_thread_on_one_line(self) -> None:
+        rendered = review_render.render_summaries(two_thread_document(), True)
+
+        self.assertEqual(
+            rendered,
+            "# Open Review Threads\n\n- T2 [P2] open: Version skew (b.py)\n",
+        )
+
+    def test_human_summary_reports_an_empty_open_set(self) -> None:
+        rendered = review_render.render_summaries(make_document([]), True)
+
+        self.assertIn("No threads.", rendered)
+
+    # --- render_conversations ---
+
+    def test_full_conversations_keep_every_body(self) -> None:
+        rendered = review_render.render_conversations(two_thread_document())
+
+        self.assertIn("Serialized the baseline write.", rendered)
+        self.assertIn("Bumped both manifests.", rendered)
+        self.assertIn("Verified against the suite.", rendered)
+        self.assertIn("fixture required behavior", rendered)
+
+    def test_open_filter_drops_a_resolved_conversation_but_keeps_its_bodies(
+        self,
+    ) -> None:
+        rendered = review_render.render_conversations(two_thread_document(), True)
+
+        self.assertNotIn("Baseline race", rendered)
+        self.assertIn("Bumped both manifests.", rendered)
+
+
 class ReviewRenderTest(unittest.TestCase):
     # --- completed_rounds ---
 

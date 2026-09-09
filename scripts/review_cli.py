@@ -402,7 +402,10 @@ def command_inspect(args: argparse.Namespace) -> int:
         )
     snapshot_value = json.loads(snapshot_json)
     source = snapshot_value.get("source_snapshot", snapshot_value)
-    if not args.json:
+    # Both machine views replace the human report rather than decorating it, so neither
+    # carries the state dump, the artifact paths, or the raw snapshot.
+    compact = args.json or args.agent
+    if not compact:
         print("workflow:")
         completed = run_helper(
             STATE_SCRIPT,
@@ -446,8 +449,12 @@ def command_inspect(args: argparse.Namespace) -> int:
         operation_args.append("--lease-present")
     if args.json:
         operation_args.append("--json")
+    if args.agent:
+        operation_args.append("--agent")
+    if args.accretion:
+        operation_args.append("--accretion")
     result = run_helper(PUBLISH_SCRIPT, operation_args)
-    if result.returncode != 0 or args.json:
+    if result.returncode != 0 or compact:
         return result.returncode
     print(f"review_json: {paths.canonical}")
     print(f"latest_report: {paths.report}")
@@ -598,6 +605,10 @@ def command_threads(args: argparse.Namespace) -> int:
     state_args = ["threads"]
     if args.json:
         state_args.append("--json")
+    if args.summary:
+        state_args.append("--summary")
+    if args.open_only:
+        state_args.append("--open")
     return run_helper(
         STATE_SCRIPT,
         state_args,
@@ -1147,7 +1158,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect = commands.add_parser("inspect")
     add_review_selection(inspect)
-    inspect.add_argument("--json", action="store_true")
+    view = inspect.add_mutually_exclusive_group()
+    view.add_argument("--json", action="store_true")
+    view.add_argument(
+        "--agent",
+        action="store_true",
+        help="Print only the phase-scoped operating card",
+    )
+    inspect.add_argument(
+        "--accretion",
+        action="store_true",
+        help="Include the accretion ledger even when no final_review is allowed",
+    )
     add_scope_arguments(inspect)
     inspect.set_defaults(handler=command_inspect)
 
@@ -1159,6 +1181,17 @@ def build_parser() -> argparse.ArgumentParser:
     threads = commands.add_parser("threads")
     add_review_selection(threads)
     threads.add_argument("--json", action="store_true")
+    threads.add_argument(
+        "--summary",
+        action="store_true",
+        help="Return identity, priority, status, title, and paths without bodies",
+    )
+    threads.add_argument(
+        "--open",
+        dest="open_only",
+        action="store_true",
+        help="Restrict the output to threads that are currently open",
+    )
     threads.set_defaults(handler=command_threads)
 
     add_check = commands.add_parser("add-check")

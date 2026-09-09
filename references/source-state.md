@@ -103,10 +103,13 @@ python3 "$SKILL_DIR/scripts/review_cli.py" inspect \
   path/to/source path/to/tests path/to/guide.md
 ```
 
-`inspect` leads with a role-aware action dashboard and one exact recommended
-command. Add `--json` immediately after `REVIEW_ID` for the equivalent stable
-agent view. The snapshot covers scoped staged
-and unstaged diffs, non-ignored untracked contents, and additional-input
+`inspect` leads with a role-aware action dashboard, one exact recommended
+command, and the operating card for that command. Place a view flag immediately
+after `REVIEW_ID`: `--agent` returns the operating card alone, which is the
+ordinary agent read, and `--json` returns the full stable dashboard. The
+dashboard carries the accretion ledger only where a `final_review` is allowed;
+add `--accretion` to include it in any other phase. The snapshot covers scoped
+staged and unstaged diffs, non-ignored untracked contents, and additional-input
 metadata. A symlink digest covers its resolved regular-file content and records
 its link target.
 
@@ -142,6 +145,11 @@ python3 "$SKILL_DIR/scripts/review_cli.py" validate-event REPO REVIEW_ID
 
 The template prepopulates guarded snapshots and every role-required thread/gap
 entry. Populate only its remaining blanks. Use:
+
+`threads` returns full bodies by default, which is what drafting a reply needs.
+Add `--summary` for identity, priority, status, title, and paths alone, and
+`--open` to leave out threads that are already resolved; that pair is the
+routing read.
 
 ```bash
 python3 "$SKILL_DIR/scripts/review_cli.py" threads REPO REVIEW_ID --json

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import review_card
 import review_ledger
 import review_scope
 from review_io import (
@@ -820,13 +821,25 @@ def operation(args: argparse.Namespace) -> int:
     reviewer_may_replace_source = "source_update" in (
         workflow["allowed_events_by_actor"].get("reviewer") or []
     )
+    # The only obligation the ledger feeds is the structure_debt acknowledgment a
+    # correctness final_review must carry, so a caller that cannot publish one is
+    # charged for it only on request. The human renderer keeps its summary line, which
+    # is why the ledger is still computed for that form.
+    terminal_eligible = any(
+        "final_review" in kinds
+        for kinds in workflow["allowed_events_by_actor"].values()
+    )
+    ledger_wanted = (
+        args.accretion or terminal_eligible or not (args.json or args.agent)
+    )
     # Derived per inspection, like operation status. Active phases show the ledger so
     # the reviewer sees the flagged set before templating final_review; a terminal is
     # judged from the recorded structure_debt instead, because the tree may have moved
     # since the loop's guarded snapshot.
     accretion: dict[str, Any] | None = None
     if (
-        workflow["phase"] != "terminal"
+        ledger_wanted
+        and workflow["phase"] != "terminal"
         and document.get("review_kind") == "correctness"
         and document.get("structure_policy") != "off"
         and isinstance(current_snapshot_value, dict)
@@ -845,29 +858,42 @@ def operation(args: argparse.Namespace) -> int:
         quoted_arguments = " ".join(shlex.quote(argument) for argument in arguments)
         return f"{args.command_prefix} {quoted_arguments}"
 
+    # `action` names the goal the branch is working toward and `recommended` names the
+    # single command that advances it, so a branch whose command is only the lock keeps
+    # the goal visible and sets lock_first for the operating card's sequence.
+    lock_first = False
     if status == "committed_cleanup":
+        action = "recover_publication"
         recommended = recommended_command(
             "recover-publish", args.repo, args.review_id
         )
     elif lock is not None and not args.lease_present:
+        action = "wait_for_lock"
         recommended = recommended_command("wait", args.repo, args.review_id, "300")
     elif not args.lease_present and status != "clean":
+        action = review_card.ACTION_BY_OPERATION_STATUS[status]
+        lock_first = True
         recommended = recommended_command(
             "lock", "acquire", args.repo, args.review_id
         )
     elif status == "prepared_precommit":
+        action = "recover_publication"
         recommended = recommended_command(
             "recover-publish", args.repo, args.review_id
         )
     elif status == "stale_report":
+        action = "regenerate_report"
         recommended = recommended_command(
             "regenerate-report", args.repo, args.review_id
         )
     elif status == "ready_to_publish":
+        action = "publish_draft"
         recommended = recommended_command("publish", args.repo, args.review_id)
     elif status in {"editing_draft", "corrupt_artifact"}:
+        action = "abort_draft"
         recommended = recommended_command("abort-draft", args.repo, args.review_id)
     elif approval_stale:
+        action = "start_follow_up"
         recommended = recommended_command(
             "start-follow-up",
             args.repo,
@@ -875,6 +901,7 @@ def operation(args: argparse.Namespace) -> int:
             f"{document['name']}-follow-up",
         )
     elif structure_due:
+        action = "start_structure_follow_up"
         recommended = recommended_command(
             "start-follow-up",
             args.repo,
@@ -884,10 +911,13 @@ def operation(args: argparse.Namespace) -> int:
             "structure",
         )
     elif workflow["phase"] == "terminal":
+        action = "none"
         recommended = "none"
     elif source_drift and reviewer_may_replace_source:
         # Drift is a safety stop, not a step to work around. Until a replacement basis is
         # recorded, the only correct route is a guarded source_update.
+        action = "publish_source_update"
+        lock_first = not args.lease_present
         recommended = (
             recommended_command("lock", "acquire", args.repo, args.review_id)
             if not args.lease_present
@@ -896,23 +926,67 @@ def operation(args: argparse.Namespace) -> int:
             )
         )
     elif not args.lease_present:
+        action = review_card.ACTION_BY_PHASE[workflow["phase"]]
+        lock_first = True
         recommended = recommended_command(
             "lock", "acquire", args.repo, args.review_id
         )
     elif workflow["phase"] == "awaiting_initial_review":
+        action = "publish_initial_review"
         recommended = recommended_command(
             "template", args.repo, args.review_id, "review"
         )
     elif workflow["phase"] == "owner_response":
+        action = "publish_owner_reply"
         recommended = recommended_command(
             "template", args.repo, args.review_id, "owner_reply"
         )
     elif workflow["phase"] == "reviewer_verification":
+        action = "publish_reviewer_update"
         recommended = recommended_command(
             "template", args.repo, args.review_id, "reviewer_update"
         )
     else:
+        action = "none"
         recommended = "none"
+    # Ordered most-blocking first, so the human renderer and the card's required
+    # reading both read in the order an agent should act on them.
+    flag_conditions = (
+        ("publication_recovery", status in {"prepared_precommit", "committed_cleanup"}),
+        ("corrupt_artifact", status == "corrupt_artifact"),
+        ("source_drift", source_drift),
+        ("scope_undeclared", not document["state"]["source_fingerprint"]),
+        ("scope_changed", bool(drift_detail["scope_changes"])),
+        (
+            "timeout_eligible",
+            bool(timeout_eligibility and timeout_eligibility["eligible"]),
+        ),
+        ("open_validation_gaps", bool(document["state"]["validation_gaps"]["open"])),
+        ("structure_round", document.get("review_kind") == "structure"),
+        ("structure_follow_up_due", structure_due),
+        # Only a final_review disposes of flagged files, so the card raises the flag
+        # only where publishing one is allowed; the human summary line above stays
+        # unconditional so an active loop keeps showing the flagged set.
+        (
+            "accretion_flagged",
+            terminal_eligible and bool(accretion and accretion["flagged"]),
+        ),
+    )
+    card = review_card.operating_card(
+        workflow=workflow,
+        action=action,
+        next_command=recommended,
+        lock_first=lock_first,
+        open_threads=document["state"]["threads"]["open"],
+        open_validation_gaps=document["state"]["validation_gaps"]["open"],
+        flags=[flag for flag, present in flag_conditions if present],
+        flagged_paths=(
+            accretion["flagged"] if terminal_eligible and accretion else []
+        ),
+    )
+    if args.agent:
+        print(json.dumps(card, indent=2))
+        return 0
     operation_value = {
         "status": status,
         "lock": lock,
@@ -1028,6 +1102,7 @@ def operation(args: argparse.Namespace) -> int:
                     ),
                     "timeout: " + json.dumps(timeout_eligibility, sort_keys=True),
                     f"recommended_next_command: {recommended}",
+                    *review_card.render_card(card),
                 ]
             )
         )
@@ -1074,6 +1149,16 @@ def main() -> int:
     )
     operation_parser.add_argument("--lease-present", action="store_true")
     operation_parser.add_argument("--json", action="store_true")
+    operation_parser.add_argument(
+        "--agent",
+        action="store_true",
+        help="Emit only the phase-scoped operating card",
+    )
+    operation_parser.add_argument(
+        "--accretion",
+        action="store_true",
+        help="Include the accretion ledger in --json even when no final_review is allowed",
+    )
     operation_parser.add_argument("--command-prefix", required=True)
     args = parser.parse_args()
     if args.command == "publish":
