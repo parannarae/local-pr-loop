@@ -225,6 +225,13 @@ or it becomes eligible to publish a timeout event. Every phase carries a
 handoff deadline: `awaiting_initial_review` anchors on the document's
 `created_at`, the other phases on their latest handoff event.
 
+A deadline still ahead cuts the wait short, so eligibility is reported promptly.
+Once it has passed it keeps reporting `deadline_reached` but stops shortening
+anything: the bound you asked for is waited in full, and a change landing inside
+it still returns `changed`. Re-arming therefore remains a real option for a
+counterpart that is late rather than absent, which matters because the deadline
+anchors on the latest event and so stays passed until the next one lands.
+
 Span a handoff with one bounded call instead of hand-rolling that re-arm loop:
 
 ```bash
@@ -239,8 +246,13 @@ deadline exists, then re-arms `wait` per round until one structured outcome:
 |---|---|---|
 | `changed` | 0 | re-`inspect` and act on the new phase |
 | `terminal` | 0 | run the terminal `inspect` and check `approval_stale` |
-| `timeout_eligible` | 4 | run `publish-timeout --if-eligible` |
+| `timeout_eligible` | 4 | decide: `publish-timeout --if-eligible`, or keep waiting |
 | `exhausted` | 5 | report to the user; do not silently continue or loop again |
+
+`timeout_eligible` is a decision, not an instruction. Publishing the timeout is
+terminal and immutable: it ends the loop with no approval and leaves open threads
+open, so it fits a counterpart that has genuinely gone absent. When the delay has
+a known cause, re-arming the wait is the better answer and now behaves as one.
 
 The round bound is mandatory, and exhausting it is a reportable result, not a
 reason to re-enter. A stalled `awaiting_initial_review` becomes

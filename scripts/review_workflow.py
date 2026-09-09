@@ -383,10 +383,15 @@ def poll_for_change(
     several polls must capture it once and pass the same value to every poll,
     or a change landing between polls is absorbed into the next baseline and
     reported as no change.
+
+    A handoff deadline that has already passed still reports `deadline_reached`,
+    but no longer shortens the wait: the caller's bound is honored in full, so a
+    counterpart that is late rather than absent can still be waited for.
     """
     if initial is None:
         initial = hashlib.sha256(review.read_bytes()).hexdigest()
-    wall_deadline = datetime.now(timezone.utc).timestamp() + timeout
+    started_at = datetime.now(timezone.utc).timestamp()
+    wall_deadline = started_at + timeout
     document = load_object(review)
     workflow = document["state"]["workflow"]
     latest = document["state"].get("latest_event")
@@ -404,9 +409,14 @@ def poll_for_change(
     if started_text:
         started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
         handoff_deadline = started.timestamp() + seconds
-    deadline = min(
-        value for value in (wall_deadline, handoff_deadline) if value is not None
-    )
+    # A handoff deadline still ahead cuts this wait short, so the waiting actor learns
+    # it may publish a timeout without sitting out the whole bound. One already behind
+    # must not: the loop's deadline would then be in the past, this call would return
+    # without polling once, and every later call would do the same — leaving an actor
+    # whose counterpart is merely late with no way to keep waiting at all.
+    deadline = wall_deadline
+    if handoff_deadline is not None and handoff_deadline > started_at:
+        deadline = min(wall_deadline, handoff_deadline)
     while datetime.now(timezone.utc).timestamp() < deadline:
         remaining = deadline - datetime.now(timezone.utc).timestamp()
         time.sleep(min(2.0, max(0.0, remaining)))

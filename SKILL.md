@@ -328,7 +328,10 @@ Use priorities consistently:
   `start-follow-up` before making any completion claim.
 - Never delegate your own waiting to the user. While the other actor holds the
   handoff, keep re-arming `wait` — `await-handoff` does this with a bound — and
-  treat a lapsed `wait` as silence, not a handoff.
+  treat a lapsed `wait` as silence, not a handoff. An eligible timeout is a
+  decision rather than an instruction: publishing one is terminal and immutable,
+  so take it for a counterpart that has gone absent, and keep waiting when the
+  delay has a known cause.
 - Treat canonical JSON as authoritative if it disagrees with a draft, receipt,
   report, terminal output, or another agent. The report is only a cache.
 - Never break a lock using PID or elapsed age. Lock status deliberately omits its
