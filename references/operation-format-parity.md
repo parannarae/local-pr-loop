@@ -203,8 +203,13 @@ begin `[blocked]` and the duplicate is unreachable. The blocked-work alert now
 always surfaces, and the successor test asserts that an unrelated note on a
 blocked thread does not hide it.
 
-## Gates this inventory does not satisfy
+## Dogfood evidence
 
-Naming a successor is not running one. One gate stays open and a document
-cannot close it: a full dogfood loop on the new format, including one structure
-round and one timeout path.
+The operation format has also run through an isolated local loop. The reviewer,
+owner, and reviewer-update transactions published typed operations; the
+reviewer-update opened a replacement thread before resolving the final inherited
+one. A disjoint `structure` review published a clean `final_review` approval.
+The timeout template was exercised on a separate loop and refused publication
+before its deadline, as required; the post-deadline terminal path is covered by
+the timeout recovery tests. This completes the runtime gate that the inventory
+alone cannot establish.
