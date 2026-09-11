@@ -457,13 +457,13 @@ class ReviewJsonCliTest(unittest.TestCase):
         outstanding = json.loads(self.draft("show").stdout)
         self.assertEqual(outstanding["kind"], "owner_reply")
         self.assertIn("thread.reply T1", outstanding["operations"])
-        self.assertFalse(outstanding["publishable"])
+        self.assertFalse(outstanding["schema_valid"])
         self.assertTrue(outstanding["outstanding"])
 
         self.compose_owner_reply(["T1"])
         complete = json.loads(self.draft("show").stdout)
         self.assertEqual(complete["outstanding"], [])
-        self.assertTrue(complete["publishable"])
+        self.assertTrue(complete["schema_valid"])
 
     def test_composing_the_same_thread_twice_corrects_rather_than_duplicates(
         self,

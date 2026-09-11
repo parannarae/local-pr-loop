@@ -257,8 +257,11 @@ phase action, and `inspect` names the changed paths.
    `reply`, `comment`, `resolve`, `reopen`, `open-gap`, `resolve-gap`,
    `record-check`, `note`, `replace-source`, `approve`, and `reply-context`.
    Each one refuses bad input as you type it, and `--help` states its
-   arguments. Composing an act again corrects it; `draft REPO REVIEW_ID drop
-   OP TARGET` takes one back. Never edit the draft JSON yourself.
+   arguments. Composing an act again corrects it, except `note`, which
+   accumulates so one thread can carry several; correct a note with `draft
+   REPO REVIEW_ID drop note.attach T<N>`, which takes every note on that
+   thread, then compose the ones that stay. `draft REPO REVIEW_ID drop
+   OP TARGET` takes any other act back. Never edit the draft JSON yourself.
 7. Run `draft REPO REVIEW_ID show` and compose away whatever it lists as
    outstanding, repeat `inspect`, then run `publish REPO REVIEW_ID`.
 8. Read the structured publication result. After any nonzero result, inspect

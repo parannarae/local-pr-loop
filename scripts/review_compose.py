@@ -1007,7 +1007,14 @@ def reply_context(args: argparse.Namespace) -> int:
 
 
 def show(args: argparse.Namespace) -> int:
-    """Report what the draft carries and what it still owes, without dumping it."""
+    """Report what the draft carries and what it still owes, without dumping it.
+
+    `outstanding` and `schema_valid` cover the event format alone. The
+    transaction rules that read canonical history — one reply per open thread,
+    identifier continuity — belong to the projection, which the composer does
+    not import, so `publish` is where a draft that is well-formed but does not
+    answer its history is refused.
+    """
 
     draft = open_draft(args)
     outstanding = review_schema.validate_event(draft.value)
@@ -1019,7 +1026,7 @@ def show(args: argparse.Namespace) -> int:
                     operation_summary(item) for item in draft.operations
                 ],
                 "outstanding": outstanding,
-                "publishable": not outstanding,
+                "schema_valid": not outstanding,
             },
             indent=2,
             sort_keys=True,

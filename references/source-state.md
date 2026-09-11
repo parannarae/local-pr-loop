@@ -199,9 +199,12 @@ python3 "$SKILL_DIR/scripts/review_cli.py" validate-event REPO REVIEW_ID
 ```
 
 `draft show` names the operations composed so far and lists what remains
-outstanding. `validate-event` is the belt rather than an authoring step: the
-composer cannot write an invalid operation, but a file on disk can still be
-corrupted between commands.
+outstanding. Both it and its `schema_valid` flag cover the event format alone;
+the rules that read canonical history, such as one reply per open thread, are
+enforced at `publish`, so an empty `outstanding` is not by itself a promise that
+publication will be accepted. `validate-event` is the belt rather than an
+authoring step: the composer cannot write an invalid operation, but a file on
+disk can still be corrupted between commands.
 
 Every composer call restamps the draft's `occurred_at`, so evidence recorded
 after templating never postdates its transaction. Never hand-edit the timestamp.
@@ -220,6 +223,13 @@ This is how a prefilled resolution leaves a draft when its gap stays open. A gap
 that is still material is not resolved at all, so the skeleton `template` wrote
 for it can be filled only dishonestly; without `drop` the whole draft would have
 to be aborted over one obligation that was never owed.
+
+`note` is the one act that does not correct in place. A thread may carry several
+notes, so composing a second one adds it rather than replacing the first, and
+publishing a draft that accumulated a mistaken note records both texts in
+immutable history and renders both in Notes for You. Correct a note with `drop
+note.attach T<N>`, which removes every note on that thread, then compose the
+ones that stay.
 
 Removal reaches further than the operation named. A note goes with the thread act
 it annotates, because a transaction may not carry a note for a thread it no
