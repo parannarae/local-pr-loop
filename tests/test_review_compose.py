@@ -19,6 +19,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
@@ -105,6 +106,26 @@ def compose(draft: review_compose.Draft, args: argparse.Namespace):
     return review_compose.composed_operations(draft, args)
 
 
+class DraftReaderTest(unittest.TestCase):
+    def test_open_draft_refuses_a_foreign_storage_revision_before_reading_state(
+        self,
+    ) -> None:
+        draft = {"kind": "review", "operations": []}
+        foreign_document = {
+            "format": "local-pr-loop",
+            "format_revision": "2027-01-01.1",
+        }
+        args = argparse.Namespace(event="draft.json", review="review.json")
+
+        with (
+            patch.object(review_compose.review_workflow, "verify_lease"),
+            patch.object(review_compose, "require_secure_regular"),
+            patch.object(review_compose, "load_object", side_effect=[draft, foreign_document]),
+            self.assertRaisesRegex(ValueError, "unsupported storage contract"),
+        ):
+            review_compose.open_draft(args)
+
+
 class EvidenceRefusalTest(unittest.TestCase):
     def test_external_contract_finding_refuses_a_source_inspection_basis(self) -> None:
         draft = draft_for("review")
@@ -175,6 +196,42 @@ class ThreadActRefusalTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "template final_review"):
             compose(draft, arguments("resolve", thread_id="T1"))
+
+    def test_a_refused_resolve_names_both_ways_to_keep_the_round_open(self) -> None:
+        draft = draft_for("reviewer_update", open_threads=("T1",))
+
+        with self.assertRaisesRegex(ValueError, "open this round's thread first"):
+            compose(draft, arguments("resolve", thread_id="T1"))
+
+    def test_a_thread_this_draft_opens_keeps_the_last_resolve_available(self) -> None:
+        # Projection applies the whole transaction before it asks whether a
+        # reviewer_update left anything open, so a round that raises a finding may
+        # also close the last thread it inherited.
+        draft = draft_for("reviewer_update", open_threads=("T1",))
+
+        opened, thread_id = compose(draft, arguments("open-thread", **EVIDENCE))
+        self.assertEqual(thread_id, "T2")
+        draft.operations.extend(opened)
+
+        operations, _ = compose(draft, arguments("resolve", thread_id="T1"))
+        self.assertEqual(operations[0]["op"], "thread.resolve")
+        self.assertEqual(operations[0]["thread_id"], "T1")
+
+    def test_the_resolve_refused_before_the_thread_is_opened_composes_after(
+        self,
+    ) -> None:
+        # The refusal depends on what the draft carries, not on what the agent
+        # intends, so the same round composes once its new thread is in the draft.
+        draft = draft_for("reviewer_update", open_threads=("T1",))
+
+        with self.assertRaises(ValueError):
+            compose(draft, arguments("resolve", thread_id="T1"))
+
+        opened, _ = compose(draft, arguments("open-thread", **EVIDENCE))
+        draft.operations.extend(opened)
+        operations, _ = compose(draft, arguments("resolve", thread_id="T1"))
+
+        self.assertEqual(operations[0]["thread_id"], "T1")
 
     def test_a_reviewer_update_may_resolve_while_another_thread_stays_open(
         self,

@@ -63,8 +63,11 @@ absent; this format change does not depend on it.
 
 ## Test inventory
 
-The unit is a test function as written: **252 test functions across 20
-files**. Nothing is parametrized, so functions and cases match everywhere
+The baseline unit is a test function as written: **246 test functions across
+20 files** at the pre-operation-format revision (`e1e6219`). The completed
+operation-format suite has **327 test functions across 21 files**, including
+the new composer suite and regression coverage added while porting. Nothing is
+parametrized, so functions and cases match everywhere
 except `test_review_budgets.py`, which fans each function out over the
 budgeted views with `subTest`.
 
@@ -113,11 +116,12 @@ composer acknowledgments and did not grow against the 103-era numbers.
 `test_review_cli.py`'s version assertions move again in step 5, when the skill
 version bumps.
 
-Step 3 also adds 39 tests with no predecessor. Thirty-two of them are
+Step 3 adds 54 tests with no predecessor. Forty-four of them are
 `test_review_compose.py`, which pins the entry-time refusals the plan names —
 evidence of the wrong basis, evidence observed after its handoff, resolving the
-last open thread outside a `final_review` — plus identifier assignment and the
-one-act-per-thread slot. The remaining seven extend the ported suites: composed
+last open thread outside a `final_review`, including when the same transaction
+opens a replacement thread — plus identifier assignment and the
+one-act-per-thread slot. The remaining ten extend the ported suites: composed
 drafts and `draft show` end to end, a typed constructor for every operation in
 the vocabulary, the composer's place in the import graph, and the acknowledgment
 budgets.
@@ -128,9 +132,9 @@ budgets.
 | --- | --- | --- |
 | `test_review_ledger.py` | 30 | Accretion signals, flagged sets, structure-debt enforcement, follow-up due-ness |
 | `test_review_terminal.py` | 16 | Terminal reporting and follow-up convergence |
-| `test_review_discover.py` | 16 | Candidate selection, validity reporting, drift and lock status |
+| `test_review_discover.py` | 13 | Candidate selection, validity reporting, drift and lock status |
 
-**62 tests.** All three read history, and the first two read thread paths and
+**59 tests.** All three read history, and the first two read thread paths and
 `structure_debt` out of it, so their fixtures move when their readers do.
 `test_review_discover.py` converted rather than ported: its published-review
 fixture now composes the thread through `draft` instead of writing one into the
@@ -140,7 +144,7 @@ Three suites listed as unaffected turned out to need a fixture touch, and are
 carried here. `test_review_overlap.py` (9) and `test_review_retire.py` (8) each
 build a terminal through `append_event` from a hand-populated timeout, so their
 `reason`, `started_at`, and `deadline` move into `timeout.declare`.
-`test_review_publish.py` (11) injects faults around a `final_review` whose
+`test_review_publish.py` (8) injects faults around a `final_review` whose
 approval decision moves onto `review.approve`. The behavior all three assert —
 guard overlap, retirement eligibility, and the commit point — is untouched.
 
@@ -166,9 +170,9 @@ guard overlap, retirement eligibility, and the commit point — is untouched.
 | --- | --- |
 | Ported in step 2 | 65, plus 14 fixture-level touches |
 | Ported in step 3 | 55 |
-| Ported in step 4 | 62, plus 28 fixture-level touches |
+| Ported in step 4 | 59, plus 25 fixture-level touches |
 | Unchanged | 28 |
-| Total | 252 |
+| Total | 246 |
 
 ## Exceptions
 

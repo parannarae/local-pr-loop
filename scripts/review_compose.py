@@ -271,6 +271,9 @@ def open_draft(args: argparse.Namespace) -> Draft:
     if not isinstance(operations, list):
         raise TypeError("draft does not carry an operation list; template it again")
     document = load_object(Path(args.review))
+    boundary = review_schema.unsupported_revision_error(document)
+    if boundary is not None:
+        raise ValueError(boundary)
     state = document.get("state")
     if not isinstance(state, dict):
         raise TypeError("the canonical review document records no state")
@@ -687,18 +690,32 @@ def compose_reopen(
 
 
 def remaining_open_after_resolve(draft: Draft, thread_id: str) -> set[str]:
-    """Return the threads still open once this resolve joins the draft."""
+    """Return the threads still open once this resolve joins the draft.
 
+    A thread this draft opens counts as open. Projection applies the whole
+    transaction before asking whether a `reviewer_update` left anything open, so
+    a round that raises a new finding may also resolve the last thread it
+    inherited.
+    """
+
+    opened: set[str] = set()
     resolved = {thread_id}
     reopened: set[str] = set()
     for item in draft.operations:
-        if not isinstance(item, dict) or not isinstance(item.get("thread_id"), str):
+        if not isinstance(item, dict):
             continue
-        if item.get("op") == "thread.resolve":
+        name = item.get("op")
+        if name == "thread.open":
+            if isinstance(item.get("id"), str):
+                opened.add(item["id"])
+            continue
+        if not isinstance(item.get("thread_id"), str):
+            continue
+        if name == "thread.resolve":
             resolved.add(item["thread_id"])
-        elif item.get("op") == "thread.reopen":
+        elif name == "thread.reopen":
             reopened.add(item["thread_id"])
-    return (set(draft.open_threads) - resolved) | reopened
+    return ((set(draft.open_threads) | opened) - resolved) | reopened
 
 
 def compose_resolve(
@@ -710,8 +727,8 @@ def compose_resolve(
     ):
         raise ValueError(
             f"resolving {args.thread_id} would leave no thread open, which a "
-            "reviewer_update may not do; abort the draft and template final_review "
-            "instead"
+            "reviewer_update may not do; open this round's thread first and "
+            "resolve after, or abort the draft and template final_review instead"
         )
     declined = (
         review_templates.latest_owner_replies(draft.document)
