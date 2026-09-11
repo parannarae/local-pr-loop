@@ -8,8 +8,6 @@ from typing import Any
 
 from review_schema import (
     ACTOR_BY_KIND,
-    FORMAT,
-    FORMAT_REVISION,
     GAP_ID_PATTERN,
     REVIEW_ID_PATTERN,
     REVIEW_KINDS,
@@ -17,15 +15,28 @@ from review_schema import (
     STRUCTURE_POLICIES,
     TERMINAL_OUTCOME_BY_KIND,
     THREAD_ID_PATTERN,
+    operations_of,
     parse_timestamp,
     reject_unknown,
     require,
     snapshot_identity,
     snapshot_scope_basis,
+    unsupported_revision_error,
     validate_event,
 )
 
 COMPARISON_BASE_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+# The field naming the thread or gap each operation acts on.
+OPERATION_IDENTIFIER_FIELD = {
+    "thread.open": "id",
+    "thread.reply": "thread_id",
+    "thread.comment": "thread_id",
+    "thread.resolve": "thread_id",
+    "thread.reopen": "thread_id",
+    "gap.open": "gap_id",
+    "gap.resolve": "gap_id",
+}
 
 __all__ = [
     "default_state",
@@ -92,12 +103,39 @@ def sorted_thread_ids(values: set[str]) -> list[str]:
     return sorted(values, key=lambda value: int(value[1:]))
 
 
-def material_gaps(event: dict[str, Any]) -> bool:
-    validation = event.get("validation")
-    gaps = validation.get("gaps") if isinstance(validation, dict) else None
-    return isinstance(gaps, list) and any(
-        isinstance(gap, dict) and gap.get("material") is True for gap in gaps
+def record_of(operation: dict[str, Any], status: str) -> dict[str, Any]:
+    """Keep an opening operation's fields as a durable record, without its `op`."""
+
+    return {
+        **{key: value for key, value in operation.items() if key != "op"},
+        "status": status,
+    }
+
+
+def act_on_thread(
+    errors: list[str],
+    threads: dict[str, dict[str, Any]],
+    touched: set[str],
+    thread_id: str,
+    prefix: str,
+) -> bool:
+    """Record one lifecycle act on a known thread; report whether it stands.
+
+    Acting twice on one thread in one transaction is rejected rather than
+    resolved last-writer-wins, because the handoff would otherwise record two
+    conflicting answers with no way to tell which the agent meant.
+    """
+
+    require(errors, thread_id in threads, f"{prefix} references unknown thread")
+    if thread_id not in threads:
+        return False
+    require(
+        errors,
+        thread_id not in touched,
+        f"{prefix} acts on {thread_id} twice in one transaction",
     )
+    touched.add(thread_id)
+    return True
 
 
 def project_history(
@@ -123,29 +161,6 @@ def project_history(
     event_ids: set[str] = set()
     gaps: dict[str, dict[str, Any]] = {}
     next_gap = 1
-
-    def add_threads(items: Any, prefix: str) -> None:
-        nonlocal next_thread
-        if not isinstance(items, list):
-            return
-        for index, thread in enumerate(items):
-            if not isinstance(thread, dict):
-                continue
-            expected = f"T{next_thread}"
-            thread_id = thread.get("id")
-            require(
-                errors,
-                thread_id == expected,
-                f"{prefix}[{index}].id must be {expected}",
-            )
-            if isinstance(thread_id, str) and THREAD_ID_PATTERN.fullmatch(thread_id):
-                require(
-                    errors,
-                    thread_id not in threads,
-                    f"{prefix}[{index}].id is duplicated",
-                )
-                threads[thread_id] = {**thread, "status": "open"}
-                next_thread += 1
 
     for index, event in enumerate(history):
         prefix = f"history[{index}]"
@@ -186,83 +201,139 @@ def project_history(
 
         open_ids = {key for key, value in threads.items() if value["status"] == "open"}
         resolved_ids = set(threads) - open_ids
-        validation = event.get("validation")
-        event_gaps = validation.get("gaps") if isinstance(validation, dict) else []
-        if isinstance(event_gaps, list):
-            for gap_index, gap in enumerate(event_gaps):
-                if not isinstance(gap, dict):
-                    continue
-                gap_id = gap.get("gap_id")
+        # Per-transaction bookkeeping. `touched` is every thread this transaction
+        # opened or acted on: it bounds what a note may target and makes a second
+        # act on one thread in one handoff a rejection rather than a silent
+        # last-writer-wins.
+        touched: set[str] = set()
+        replied: set[str] = set()
+        addressed: set[str] = set()
+        transaction_replies: dict[str, dict[str, Any]] = {}
+        resolved_gap_ids: set[str] = set()
+        note_targets: list[tuple[str, str]] = []
+        failed_checks = False
+
+        for op_index, operation in enumerate(operations_of(event)):
+            if not isinstance(operation, dict):
+                continue
+            name = operation.get("op")
+            if not isinstance(name, str):
+                continue
+            op_prefix = f"{prefix}.operations[{op_index}]"
+            # An identifier that is not a string is already an event-validation
+            # error; skipping it here keeps set lookups from raising on it.
+            identifier_field = OPERATION_IDENTIFIER_FIELD.get(name)
+            if identifier_field is not None and not isinstance(
+                operation.get(identifier_field), str
+            ):
+                continue
+            if name == "thread.open":
+                expected = f"T{next_thread}"
+                thread_id = operation.get("id")
+                require(
+                    errors, thread_id == expected, f"{op_prefix}.id must be {expected}"
+                )
+                if THREAD_ID_PATTERN.fullmatch(thread_id):
+                    require(
+                        errors, thread_id not in threads, f"{op_prefix}.id is duplicated"
+                    )
+                    threads[thread_id] = record_of(operation, "open")
+                    touched.add(thread_id)
+                    next_thread += 1
+            elif name == "gap.open":
                 expected = f"G{next_gap}"
+                gap_id = operation.get("gap_id")
                 require(
                     errors,
                     gap_id == expected,
-                    f"{prefix}.validation.gaps[{gap_index}].gap_id must be {expected}",
+                    f"{op_prefix}.gap_id must be {expected}",
                 )
-                if isinstance(gap_id, str) and GAP_ID_PATTERN.fullmatch(gap_id):
+                if GAP_ID_PATTERN.fullmatch(gap_id):
                     require(
-                        errors,
-                        gap_id not in gaps,
-                        f"{prefix}.validation.gaps[{gap_index}].gap_id is duplicated",
+                        errors, gap_id not in gaps, f"{op_prefix}.gap_id is duplicated"
                     )
-                    gaps[gap_id] = {**gap, "status": "open"}
+                    gaps[gap_id] = record_of(operation, "open")
                     next_gap += 1
-        if kind in {"reviewer_update", "final_review"}:
-            resolutions = event.get("gap_resolutions", [])
-            resolution_ids = [
-                item.get("gap_id") for item in resolutions if isinstance(item, dict)
-            ]
-            require(
-                errors,
-                len(resolution_ids) == len(set(resolution_ids)),
-                f"{prefix}: gap resolution IDs must be unique",
-            )
-            for gap_id in resolution_ids:
+            elif name == "gap.resolve":
+                gap_id = operation.get("gap_id")
+                require(
+                    errors,
+                    gap_id not in resolved_gap_ids,
+                    f"{op_prefix} resolves {gap_id} twice in one transaction",
+                )
                 require(
                     errors,
                     gap_id in gaps and gaps[gap_id]["status"] == "open",
-                    f"{prefix}: gap resolution references a non-open gap",
+                    f"{op_prefix} references a non-open gap",
                 )
+                resolved_gap_ids.add(gap_id)
                 if gap_id in gaps:
                     gaps[gap_id]["status"] = "resolved"
-        if kind == "review":
-            add_threads(event.get("threads"), f"{prefix}.threads")
-            current_snapshot = event.get("source_snapshot")
-            handoff_started_at = event.get("occurred_at")
-        elif kind == "source_update":
-            seen: set[str] = set()
-            for action_index, action in enumerate(event.get("thread_impacts", [])):
-                if not isinstance(action, dict):
-                    continue
-                action_prefix = f"{prefix}.thread_impacts[{action_index}]"
-                thread_id = action.get("thread_id")
-                require(
-                    errors,
-                    thread_id in threads,
-                    f"{action_prefix} references unknown thread",
-                )
-                require(
-                    errors,
-                    thread_id not in seen,
-                    f"{action_prefix} duplicates a thread",
-                )
-                if not isinstance(thread_id, str) or thread_id not in threads:
-                    continue
-                seen.add(thread_id)
-                if action.get("action") == "reopen":
-                    require(
-                        errors,
-                        thread_id in resolved_ids,
-                        f"{action_prefix} can reopen only resolved",
-                    )
-                    threads[thread_id]["status"] = "open"
-                else:
+            elif name == "thread.reply":
+                thread_id = operation.get("thread_id")
+                if act_on_thread(errors, threads, touched, thread_id, op_prefix):
                     require(
                         errors,
                         thread_id in open_ids,
-                        f"{action_prefix} can comment only open",
+                        f"{op_prefix} can reply only to an open thread",
                     )
-            add_threads(event.get("new_threads"), f"{prefix}.new_threads")
+                    replied.add(thread_id)
+                    transaction_replies[thread_id] = operation
+            elif name == "thread.comment":
+                thread_id = operation.get("thread_id")
+                if act_on_thread(errors, threads, touched, thread_id, op_prefix):
+                    require(
+                        errors,
+                        thread_id in open_ids,
+                        f"{op_prefix} can comment only on an open thread",
+                    )
+                    addressed.add(thread_id)
+            elif name == "thread.resolve":
+                thread_id = operation.get("thread_id")
+                if act_on_thread(errors, threads, touched, thread_id, op_prefix):
+                    require(
+                        errors,
+                        thread_id in open_ids,
+                        f"{op_prefix} can resolve only an open thread",
+                    )
+                    prior = latest_reply.get(thread_id)
+                    if isinstance(prior, dict) and prior.get("decision") == "declined":
+                        verification = operation.get("verification")
+                        require(
+                            errors,
+                            isinstance(verification, dict)
+                            and verification.get("independent") is True,
+                            f"{op_prefix}: declined thread requires independent "
+                            "verification",
+                        )
+                    threads[thread_id]["status"] = "resolved"
+                    addressed.add(thread_id)
+            elif name == "thread.reopen":
+                thread_id = operation.get("thread_id")
+                if act_on_thread(errors, threads, touched, thread_id, op_prefix):
+                    require(
+                        errors,
+                        thread_id in resolved_ids,
+                        f"{op_prefix} can reopen only a resolved thread",
+                    )
+                    threads[thread_id]["status"] = "open"
+            elif name == "note.attach":
+                target = operation.get("target")
+                target_id = target.get("id") if isinstance(target, dict) else None
+                note_targets.append(
+                    (op_prefix, target_id if isinstance(target_id, str) else "")
+                )
+            elif name == "check.record" and operation.get("result") == "failed":
+                failed_checks = True
+
+        for note_prefix, target_id in note_targets:
+            require(
+                errors,
+                target_id in touched,
+                f"{note_prefix} targets a thread this transaction does not act on",
+            )
+
+        if kind in {"review", "source_update"}:
             current_snapshot = event.get("source_snapshot")
             handoff_started_at = event.get("occurred_at")
         elif kind == "owner_reply":
@@ -276,25 +347,15 @@ def project_history(
                 errors,
                 snapshot_scope_basis(event.get("completed_source_snapshot"))
                 == snapshot_scope_basis(current_snapshot),
-                f"{prefix}: completed snapshot changes guarded source basis; use source_update",
-            )
-            replies = event.get("replies", [])
-            ids = [
-                reply.get("thread_id") for reply in replies if isinstance(reply, dict)
-            ]
-            require(
-                errors, len(ids) == len(set(ids)), f"{prefix}: reply IDs must be unique"
+                f"{prefix}: completed snapshot changes guarded source basis; "
+                "use source_update",
             )
             require(
                 errors,
-                set(ids) == open_ids,
+                replied == open_ids,
                 f"{prefix}: replies must address every open thread",
             )
-            latest_reply = {
-                reply["thread_id"]: reply
-                for reply in replies
-                if isinstance(reply, dict) and isinstance(reply.get("thread_id"), str)
-            }
+            latest_reply = transaction_replies
             current_snapshot = event.get("completed_source_snapshot")
             handoff_started_at = event.get("occurred_at")
         elif kind in {"reviewer_update", "final_review"}:
@@ -307,66 +368,12 @@ def project_history(
                     == snapshot_identity(current_snapshot),
                     f"{prefix}: reviewer snapshot does not match current source",
                 )
-            actions = event.get(
-                "decisions" if kind == "reviewer_update" else "resolutions", []
-            )
-            ids = [
-                action.get("thread_id")
-                for action in actions
-                if isinstance(action, dict)
-            ]
-            require(
-                errors,
-                len(ids) == len(set(ids)),
-                f"{prefix}: thread IDs must be unique",
-            )
-            addressed = {
-                action.get("thread_id")
-                for action in actions
-                if isinstance(action, dict)
-                and action.get("thread_id") in open_ids
-                and (
-                    kind == "final_review"
-                    or action.get("action") in {"comment", "resolve"}
-                )
-            }
             require(
                 errors,
                 addressed == open_ids,
                 f"{prefix}: must address every open thread",
             )
-            for action_index, action in enumerate(actions):
-                if not isinstance(action, dict):
-                    continue
-                thread_id = action.get("thread_id")
-                action_prefix = f"{prefix}.{('decisions' if kind == 'reviewer_update' else 'resolutions')}[{action_index}]"
-                require(
-                    errors,
-                    thread_id in threads,
-                    f"{action_prefix} references unknown thread",
-                )
-                if thread_id not in threads:
-                    continue
-                resolving = kind == "final_review" or action.get("action") == "resolve"
-                if resolving:
-                    prior = latest_reply.get(thread_id)
-                    if isinstance(prior, dict) and prior.get("decision") == "declined":
-                        require(
-                            errors,
-                            isinstance(action.get("verification"), dict)
-                            and action["verification"].get("independent") is True,
-                            f"{action_prefix}: declined thread requires independent verification",
-                        )
-                    threads[thread_id]["status"] = "resolved"
-                elif action.get("action") == "reopen":
-                    require(
-                        errors,
-                        thread_id in resolved_ids,
-                        f"{action_prefix} can reopen only resolved",
-                    )
-                    threads[thread_id]["status"] = "open"
             if kind == "reviewer_update":
-                add_threads(event.get("new_threads"), f"{prefix}.new_threads")
                 require(
                     errors,
                     any(value["status"] == "open" for value in threads.values()),
@@ -374,11 +381,6 @@ def project_history(
                 )
                 handoff_started_at = event.get("occurred_at")
             else:
-                failed_checks = [
-                    item
-                    for item in event.get("validation", {}).get("performed", [])
-                    if isinstance(item, dict) and item.get("result") == "failed"
-                ]
                 require(
                     errors, not failed_checks, f"{prefix}: LGTM forbids failed checks"
                 )
@@ -405,9 +407,16 @@ def project_history(
             expected_start = (
                 created_at if kind == "initial_review_timeout" else handoff_started_at
             )
+            declarations = [
+                operation
+                for operation in operations_of(event)
+                if isinstance(operation, dict)
+                and operation.get("op") == "timeout.declare"
+            ]
             require(
                 errors,
-                event.get("started_at") == expected_start,
+                bool(declarations)
+                and declarations[0].get("started_at") == expected_start,
                 f"{prefix}: timeout start does not match active handoff",
             )
             terminal = {
@@ -451,12 +460,34 @@ def project_history(
     return errors, state, threads
 
 
+def structure_debt_operations(history: Any) -> list[dict[str, Any]]:
+    """Return every recorded `review.approve` acknowledgment in this history."""
+
+    found: list[dict[str, Any]] = []
+    if not isinstance(history, list):
+        return found
+    for event in history:
+        for operation in operations_of(event):
+            if (
+                isinstance(operation, dict)
+                and operation.get("op") == "review.approve"
+                and operation.get("structure_debt") is not None
+            ):
+                found.append(operation["structure_debt"])
+    return found
+
+
 def validate_document(document: Any) -> list[str]:
-    """Return document-envelope and stale-projection validation errors."""
+    """Return document-envelope and stale-projection validation errors.
+
+    The storage contract is checked first and alone: a document this reader
+    cannot interpret in full is refused before any other field is read, so an
+    unreadable revision can never reach a gate as an empty default.
+    """
+    boundary = unsupported_revision_error(document)
+    if boundary is not None:
+        return [boundary]
     errors: list[str] = []
-    require(errors, isinstance(document, dict), "document must be a mapping")
-    if not isinstance(document, dict):
-        return errors
     reject_unknown(
         errors,
         document,
@@ -497,26 +528,13 @@ def validate_document(document: Any) -> list[str]:
         "comparison_base must be null or a full lowercase commit SHA",
     )
     if document.get("review_kind") == "structure":
-        history_events = document.get("history")
         require(
             errors,
-            not isinstance(history_events, list)
-            or not any(
-                isinstance(event, dict) and "structure_debt" in event
-                for event in history_events
-            ),
+            not structure_debt_operations(document.get("history")),
             "a structure round records no structure_debt; the acknowledgment belongs "
             "to the correctness loop that flagged the files",
         )
     parse_timestamp(errors, document.get("created_at"), "created_at")
-    revision = document.get("format_revision")
-    require(errors, document.get("format") == FORMAT, f"format must be {FORMAT}")
-    require(
-        errors,
-        revision == FORMAT_REVISION,
-        f"unsupported format_revision {revision!r}; current revision is "
-        f"{FORMAT_REVISION}; preserve this artifact and start a new loop",
-    )
     creator = document.get("created_by")
     require(
         errors,

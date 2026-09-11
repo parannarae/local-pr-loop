@@ -21,8 +21,9 @@ JUSTIFICATION = {
 }
 
 
-def gap_event(disposition: str | None, justification: dict | None = None) -> dict:
+def gap_resolution(disposition: str | None, justification: dict | None = None) -> dict:
     resolution: dict = {
+        "op": "gap.resolve",
         "gap_id": "G1",
         "message": "The live probe was still unavailable.",
         "evidence": {
@@ -55,22 +56,20 @@ def document_with_resolved_gap(disposition: str) -> dict:
         "history": [
             {
                 "kind": "review",
-                "validation": {
-                    "performed": [],
-                    "gaps": [
-                        {
-                            "gap_id": "G1",
-                            "check": "live probe of the media service",
-                            "reason": "no network access in this environment",
-                            "material": False,
-                        }
-                    ],
-                },
+                "operations": [
+                    {
+                        "op": "gap.open",
+                        "gap_id": "G1",
+                        "check": "live probe of the media service",
+                        "reason": "no network access in this environment",
+                        "material": False,
+                    }
+                ],
             },
             {
                 "kind": "final_review",
-                "gap_resolutions": [
-                    gap_event(
+                "operations": [
+                    gap_resolution(
                         disposition,
                         JUSTIFICATION
                         if disposition == "unavailable_non_material"
@@ -90,29 +89,29 @@ class GapDispositionValidationTest(unittest.TestCase):
         event = {
             "event_id": "evt_" + "a" * 24,
             "kind": "final_review",
-            "gap_resolutions": [resolution],
             "occurred_at": "2026-08-17T12:00:00+00:00",
+            "operations": [resolution, {"op": "review.approve", "decision": "LGTM"}],
         }
         return review_schema.validate_event(event)
 
     def test_a_resolution_without_a_disposition_is_rejected(self) -> None:
-        messages = " ".join(self.errors_for(gap_event(None)))
+        messages = " ".join(self.errors_for(gap_resolution(None)))
 
         self.assertIn("disposition", messages)
 
     def test_an_unrecognized_disposition_is_rejected(self) -> None:
-        messages = " ".join(self.errors_for(gap_event("waived")))
+        messages = " ".join(self.errors_for(gap_resolution("waived")))
 
         self.assertIn("disposition", messages)
 
     def test_an_unavailable_check_requires_a_structured_justification(self) -> None:
         """The report states the check was not performed and that it fails closed.
 
-        Those claims must come from the event, not from the renderer, so a resolution
-        that omits them cannot be published.
+        Those claims must come from the operation, not from the renderer, so a
+        resolution that omits them cannot be published.
         """
 
-        messages = " ".join(self.errors_for(gap_event("unavailable_non_material")))
+        messages = " ".join(self.errors_for(gap_resolution("unavailable_non_material")))
 
         self.assertIn("justification", messages)
         self.assertIn("unperformed_check", messages)
@@ -121,7 +120,7 @@ class GapDispositionValidationTest(unittest.TestCase):
     def test_a_justification_missing_the_fail_closed_behavior_is_rejected(self) -> None:
         messages = " ".join(
             self.errors_for(
-                gap_event(
+                gap_resolution(
                     "unavailable_non_material",
                     {"unperformed_check": "live probe of the media service"},
                 )
@@ -133,7 +132,7 @@ class GapDispositionValidationTest(unittest.TestCase):
     def test_a_blank_justification_field_is_rejected(self) -> None:
         messages = " ".join(
             self.errors_for(
-                gap_event(
+                gap_resolution(
                     "unavailable_non_material",
                     {**JUSTIFICATION, "unperformed_check": ""},
                 )
@@ -145,7 +144,7 @@ class GapDispositionValidationTest(unittest.TestCase):
     def test_an_unknown_justification_field_is_rejected(self) -> None:
         messages = " ".join(
             self.errors_for(
-                gap_event(
+                gap_resolution(
                     "unavailable_non_material", {**JUSTIFICATION, "waiver": "approved"}
                 )
             )
@@ -154,16 +153,31 @@ class GapDispositionValidationTest(unittest.TestCase):
         self.assertIn("waiver", messages)
 
     def test_a_performed_check_may_not_carry_a_justification(self) -> None:
-        messages = " ".join(self.errors_for(gap_event("performed", JUSTIFICATION)))
+        messages = " ".join(self.errors_for(gap_resolution("performed", JUSTIFICATION)))
 
         self.assertIn("justification", messages)
 
     def test_a_complete_justification_is_accepted(self) -> None:
         messages = " ".join(
-            self.errors_for(gap_event("unavailable_non_material", JUSTIFICATION))
+            self.errors_for(gap_resolution("unavailable_non_material", JUSTIFICATION))
         )
 
         self.assertNotIn("justification", messages)
+
+    def test_a_gap_resolution_belongs_only_to_a_verifying_transaction(self) -> None:
+        event = {
+            "event_id": "evt_" + "b" * 24,
+            "kind": "owner_reply",
+            "occurred_at": "2026-08-17T12:00:00+00:00",
+            "operations": [gap_resolution("performed")],
+        }
+
+        self.assertTrue(
+            any(
+                "owner_reply does not allow gap.resolve" in error
+                for error in review_schema.validate_event(event)
+            )
+        )
 
     def test_the_supported_dispositions_do_not_include_a_material_gap(self) -> None:
         # A still-material gap is not resolved at all; it stays open and blocks LGTM.
@@ -184,7 +198,7 @@ class GapDispositionRenderingTest(unittest.TestCase):
         row = next(line for line in lines if "G1" in line)
 
         self.assertIn("without performing the check", row)
-        # The named check and fail-closed behavior are quoted from the event.
+        # The named check and fail-closed behavior are quoted from the operation.
         self.assertIn("live probe of the media service", row)
         self.assertIn("before any byte is retained", row)
 

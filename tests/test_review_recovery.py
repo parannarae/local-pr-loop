@@ -58,31 +58,37 @@ class UnpublishableDraftTest(unittest.TestCase):
         self.draft.write_text(json.dumps(value))
         return self.draft
 
+    def timeout_draft(self, occurred_at: str) -> dict:
+        return {
+            "kind": "reviewer_timeout",
+            "occurred_at": occurred_at,
+            "operations": [
+                {
+                    "op": "timeout.declare",
+                    "started_at": "2026-08-17T11:52:18+00:00",
+                    "deadline": "2026-08-17T12:22:18+00:00",
+                    "reason": "The active handoff deadline elapsed.",
+                }
+            ],
+        }
+
     def test_timeout_stamped_before_its_deadline_can_never_publish(self) -> None:
-        draft = self.write(
-            {
-                "kind": "reviewer_timeout",
-                "occurred_at": "2026-08-17T12:20:30+00:00",
-                "deadline": "2026-08-17T12:22:18+00:00",
-            }
-        )
+        draft = self.write(self.timeout_draft("2026-08-17T12:20:30+00:00"))
 
         self.assertIn("never succeed", publisher.unpublishable_draft_reason(draft))
 
     def test_timeout_stamped_after_its_deadline_may_publish(self) -> None:
-        draft = self.write(
-            {
-                "kind": "reviewer_timeout",
-                "occurred_at": "2026-08-17T12:22:39+00:00",
-                "deadline": "2026-08-17T12:22:18+00:00",
-            }
-        )
+        draft = self.write(self.timeout_draft("2026-08-17T12:22:39+00:00"))
 
         self.assertIsNone(publisher.unpublishable_draft_reason(draft))
 
     def test_a_non_timeout_draft_is_never_reported_as_unpublishable(self) -> None:
         draft = self.write(
-            {"kind": "owner_reply", "occurred_at": "2026-08-17T12:20:30+00:00"}
+            {
+                "kind": "owner_reply",
+                "occurred_at": "2026-08-17T12:20:30+00:00",
+                "operations": [],
+            }
         )
 
         self.assertIsNone(publisher.unpublishable_draft_reason(draft))
@@ -163,7 +169,7 @@ class RecoverWithoutReceiptTest(unittest.TestCase):
         self.assertIsNone(value["event_id"])
 
     def test_a_remaining_draft_is_reported_rather_than_treated_as_damage(self) -> None:
-        self.event.write_text(json.dumps({"kind": "owner_reply"}))
+        self.event.write_text(json.dumps({"kind": "owner_reply", "operations": []}))
 
         value, returncode = self.recover()
 

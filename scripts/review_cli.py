@@ -24,6 +24,7 @@ from review_io import atomic_bytes, load_object
 from review_schema import REVIEW_ID_PATTERN, REVIEW_NAME_PATTERN
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+COMPOSE_SCRIPT = SCRIPT_DIRECTORY / "review_compose.py"
 LOCK_SCRIPT = SCRIPT_DIRECTORY / "review_lock.py"
 PUBLISH_SCRIPT = SCRIPT_DIRECTORY / "review_publish.py"
 SNAPSHOT_SCRIPT = SCRIPT_DIRECTORY / "source_snapshot.py"
@@ -624,75 +625,28 @@ def command_abort_draft(args: argparse.Namespace) -> int:
     ).returncode
 
 
-def command_add_check(args: argparse.Namespace) -> int:
-    paths = review_paths(args.repo, args.review_id)
-    values = [
-        "add-check",
-        *workflow_arguments(paths),
-        "--event",
-        str(paths.event),
-        "--result",
-        args.result,
-        "--check",
-        args.check,
-    ]
-    evidence_values = (args.basis, args.provenance, args.sanitized_result)
-    if any(value is not None for value in evidence_values):
-        if not all(value is not None for value in evidence_values):
-            raise ValueError(
-                "basis, provenance, and sanitized result must be provided together"
-            )
-        values.extend(
-            [
-                "--basis",
-                args.basis,
-                "--provenance",
-                args.provenance,
-                "--sanitized-result",
-                args.sanitized_result,
-            ]
+def command_draft(args: argparse.Namespace) -> int:
+    """Run one composer subcommand against this review's leased draft.
+
+    The remaining arguments are forwarded verbatim, so `draft ... --help` reaches
+    the composer's own per-command help rather than being re-described here.
+    """
+    if not args.arguments:
+        raise ValueError(
+            "draft needs a subcommand; run it with --help to list them"
         )
-    if args.artifact_digest:
-        values.extend(["--artifact-digest", args.artifact_digest])
-    return run_helper(WORKFLOW_SCRIPT, values).returncode
-
-
-def command_add_gap(args: argparse.Namespace) -> int:
     paths = review_paths(args.repo, args.review_id)
-    values = [
-        "add-gap",
-        *workflow_arguments(paths),
-        "--event",
-        str(paths.event),
-        "--check",
-        args.check,
-        "--reason",
-        args.reason,
-    ]
-    if args.material:
-        values.append("--material")
-    return run_helper(WORKFLOW_SCRIPT, values).returncode
-
-
-def command_add_note(args: argparse.Namespace) -> int:
-    paths = review_paths(args.repo, args.review_id)
-    values = [
-        "add-note",
-        *workflow_arguments(paths),
-        "--event",
-        str(paths.event),
-        "--thread",
-        args.thread_id,
-        "--note",
-        args.note,
-    ]
-    if args.tag:
-        values.extend(["--tag", args.tag])
-    return run_helper(WORKFLOW_SCRIPT, values).returncode
-
-
-def command_evidence_template(args: argparse.Namespace) -> int:
-    return run_helper(STATE_SCRIPT, ["evidence-template", args.basis]).returncode
+    subcommand, *rest = args.arguments
+    return run_helper(
+        COMPOSE_SCRIPT,
+        [
+            subcommand,
+            *workflow_arguments(paths),
+            "--event",
+            str(paths.event),
+            *rest,
+        ],
+    ).returncode
 
 
 def command_regenerate_report(args: argparse.Namespace) -> int:
@@ -1195,35 +1149,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     threads.set_defaults(handler=command_threads)
 
-    add_check = commands.add_parser("add-check")
-    add_review_selection(add_check)
-    add_check.add_argument("result", choices=("passed", "failed"))
-    add_check.add_argument("check")
-    add_check.add_argument("basis", nargs="?")
-    add_check.add_argument("provenance", nargs="?")
-    add_check.add_argument("sanitized_result", nargs="?")
-    add_check.add_argument("artifact_digest", nargs="?")
-    add_check.set_defaults(handler=command_add_check)
-
-    add_gap = commands.add_parser("add-gap")
-    add_review_selection(add_gap)
-    add_gap.add_argument("check")
-    add_gap.add_argument("reason")
-    add_gap.add_argument("--material", action="store_true")
-    add_gap.set_defaults(handler=command_add_gap)
-
-    add_note = commands.add_parser("add-note")
-    add_review_selection(add_note)
-    add_note.add_argument("thread_id")
-    add_note.add_argument("note")
-    add_note.add_argument(
-        "--tag", choices=("action-required", "follow-up", "decision")
+    draft = commands.add_parser(
+        "draft",
+        help="Compose one typed operation into the leased draft",
     )
-    add_note.set_defaults(handler=command_add_note)
-
-    evidence = commands.add_parser("evidence-template")
-    evidence.add_argument("basis", choices=review_state.EVIDENCE_BASES)
-    evidence.set_defaults(handler=command_evidence_template)
+    add_review_selection(draft)
+    draft.add_argument(
+        "arguments",
+        nargs=argparse.REMAINDER,
+        help="Composer subcommand and its arguments; use --help to list them",
+    )
+    draft.set_defaults(handler=command_draft)
 
     snapshot = commands.add_parser("snapshot")
     snapshot.add_argument("repo")

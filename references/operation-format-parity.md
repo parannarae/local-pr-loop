@@ -11,9 +11,10 @@ This file is the record. It is development bookkeeping for the format change,
 not a reference a review loop reads;
 [review-schema.md](review-schema.md) is the format itself.
 
-**Status.** Nothing here has been ported or executed. At this point the
-document set describes the target format and this inventory states the plan;
-no parity claim in it has been demonstrated by a passing test.
+**Status.** Every suite below has been ported to the operation format — the
+step 3 ones through the composer, the step 4 ones by moving their fixtures to
+`operations`. The only gate this file cannot close is the dogfood loop, which
+is recorded at the end.
 
 ## What each compound field became
 
@@ -99,18 +100,27 @@ revision, and refuse a compound document to one that does.
 
 | Suite | Tests | What it pins |
 | --- | --- | --- |
-| `test_review_json_cli.py` | 22 | End-to-end CLI: publish, await-handoff, add-note, templates, scope candidates, ledger emission, thread views |
+| `test_review_json_cli.py` | 22 | End-to-end CLI: publish, await-handoff, notes, templates, scope candidates, ledger emission, thread views |
 | `test_review_card.py` | 22 | Operating card: phase obligations, routed references, recommended commands |
 | `test_review_budgets.py` | 4 | Byte ceilings on the compact views |
 | `test_review_cli.py` | 3 | Public command model and version-string consistency |
 | `test_review_module_boundaries.py` | 4 | Import direction across layers |
 
-**55 tests.** These convert rather than port: the card recommends composer
+**55 tests.** These converted rather than ported: the card recommends composer
 commands, the CLI tests drive `draft` subcommands instead of hand-populating
-drafts, and the boundary test gains the composer module. Budgets extend to
-composer acknowledgments and must not grow against the 103-era numbers.
+drafts, and the boundary test gained the composer module. Budgets extended to
+composer acknowledgments and did not grow against the 103-era numbers.
 `test_review_cli.py`'s version assertions move again in step 5, when the skill
 version bumps.
+
+Step 3 also adds 39 tests with no predecessor. Thirty-two of them are
+`test_review_compose.py`, which pins the entry-time refusals the plan names —
+evidence of the wrong basis, evidence observed after its handoff, resolving the
+last open thread outside a `final_review` — plus identifier assignment and the
+one-act-per-thread slot. The remaining seven extend the ported suites: composed
+drafts and `draft show` end to end, a typed constructor for every operation in
+the vocabulary, the composer's place in the import graph, and the acknowledgment
+budgets.
 
 ### Ported with the remaining machinery (step 4)
 
@@ -122,20 +132,33 @@ version bumps.
 
 **62 tests.** All three read history, and the first two read thread paths and
 `structure_debt` out of it, so their fixtures move when their readers do.
+`test_review_discover.py` converted rather than ported: its published-review
+fixture now composes the thread through `draft` instead of writing one into the
+template.
+
+Three suites listed as unaffected turned out to need a fixture touch, and are
+carried here. `test_review_overlap.py` (9) and `test_review_retire.py` (8) each
+build a terminal through `append_event` from a hand-populated timeout, so their
+`reason`, `started_at`, and `deadline` move into `timeout.declare`.
+`test_review_publish.py` (11) injects faults around a `final_review` whose
+approval decision moves onto `review.approve`. The behavior all three assert —
+guard overlap, retirement eligibility, and the commit point — is untouched.
+
+### Ported with the docs and version bump (step 5)
+
+`test_review_cli.py`'s version assertions moved with the skill version to
+`0.10.0`; the suite itself was already ported in step 3.
 
 ### Carrying over unchanged
 
 | Suite | Tests | Why it is unaffected |
 | --- | --- | --- |
 | `test_review_scope.py` | 17 | Scope declaration and path canonicalization, below the event format |
-| `test_review_publish.py` | 11 | Commit point, receipts, and lease handling, which the format does not touch |
-| `test_review_overlap.py` | 9 | Guard overlap between loops |
-| `test_review_retire.py` | 8 | Retirement, which asks only whether history is empty |
 | `test_review_drift.py` | 5 | Snapshot drift detail; envelope snapshots are unchanged |
 | `test_review_lock.py` | 3 | Lock acquisition and release |
 | `test_review_io.py` | 3 | Permission-restricted file handling |
 
-**56 tests.**
+**28 tests.**
 
 ### Counts
 
@@ -143,8 +166,8 @@ version bumps.
 | --- | --- |
 | Ported in step 2 | 65, plus 14 fixture-level touches |
 | Ported in step 3 | 55 |
-| Ported in step 4 | 62 |
-| Unchanged | 56 |
+| Ported in step 4 | 62, plus 28 fixture-level touches |
+| Unchanged | 28 |
 | Total | 252 |
 
 ## Exceptions
@@ -159,15 +182,25 @@ An exception discovered while porting is recorded here with the behavior it
 covered and the reason that behavior no longer exists — in the step that
 finds it, not at the end.
 
+**Step 3: the blank thread skeleton is gone, and with it its test.** A `review`
+template used to prefill one empty `thread.open`, and a test pinned its empty
+`paths` list as the prompt for the agent to name files. A review's findings are
+not a set the template can know, so it now opens with no operations at all and
+every thread arrives through `draft open-thread`, which requires `--paths`. The
+successor is that requirement, asserted where the composer refuses a thread
+without it.
+
+**Step 2: the blocked-alert duplicate suppression is gone.** The compound
+renderer dropped its automatic `[blocked]` note when a marked note in the same
+event was an exact normalized copy of it, because both were free prose and an
+agent could restate the blocker by hand. A `note.attach` carries a closed tag
+from `action-required`, `follow-up`, `decision`, so its rendered text can never
+begin `[blocked]` and the duplicate is unreachable. The blocked-work alert now
+always surfaces, and the successor test asserts that an unrelated note on a
+blocked thread does not hide it.
+
 ## Gates this inventory does not satisfy
 
-Naming a successor is not running one. Three gates stay open and none of them
-can be closed by a document:
-
-- ported parity tests green against constructed operation histories (step 2),
-  then against the composer (step 3);
-- byte budgets re-measured and extended to composer acknowledgments, with the
-  compact views no larger than the 103-era numbers (step 3); and
-- a full dogfood loop on the new format, including one structure round and one
-  timeout path, plus entry-refusal tests for the mistakes this skill's own
-  sessions made (step 5).
+Naming a successor is not running one. One gate stays open and a document
+cannot close it: a full dogfood loop on the new format, including one structure
+round and one timeout path.

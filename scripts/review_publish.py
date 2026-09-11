@@ -64,7 +64,17 @@ def unpublishable_draft_reason(event_path: Path) -> str | None:
     if draft.get("kind") not in TIMEOUT_EVENT_KINDS:
         return None
     occurred_at = draft.get("occurred_at")
-    deadline = draft.get("deadline")
+    operations = draft.get("operations")
+    declaration = next(
+        (
+            operation
+            for operation in (operations if isinstance(operations, list) else [])
+            if isinstance(operation, dict)
+            and operation.get("op") == "timeout.declare"
+        ),
+        {},
+    )
+    deadline = declaration.get("deadline")
     if not isinstance(occurred_at, str) or not isinstance(deadline, str):
         return None
     try:

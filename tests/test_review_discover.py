@@ -20,6 +20,16 @@ import review_state
 
 SCRIPT = ROOT / "scripts" / "review_cli.py"
 
+# The evidence every composed act in this suite carries, as the composer's flags.
+EVIDENCE = (
+    "--basis",
+    "source_inspection",
+    "--provenance",
+    "example.txt",
+    "--sanitized-result",
+    "The file contains the old value.",
+)
+
 
 def run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -117,9 +127,13 @@ class ReviewDiscoverTest(unittest.TestCase):
         document = review_state.new_document(review_id, name)
         document["created_at"] = created_at
         event = review_state.event_template("initial_review_timeout")
-        event["reason"] = "the reviewer never appeared"
-        event["started_at"] = created_at
-        event["deadline"] = "2026-08-17T12:00:00+00:00"
+        event["operations"][0].update(
+            {
+                "started_at": created_at,
+                "deadline": "2026-08-17T12:00:00+00:00",
+                "reason": "the reviewer never appeared",
+            }
+        )
         event["occurred_at"] = "2026-08-17T12:00:01+00:00"
         document = review_state.append_event(document, event)
         (self.reviews_dir() / f"{review_id}.json").write_text(
@@ -127,38 +141,39 @@ class ReviewDiscoverTest(unittest.TestCase):
         )
         return review_id
 
+    def draft(self, review_id: str, *args: str) -> None:
+        self.cli("draft", str(self.repo), review_id, *args)
+
     def publish_initial_review(
         self, review_id: str, additional_input: str | None = None
     ) -> None:
         declaration = ["example.txt"]
         if additional_input:
             declaration = ["--additional-input", additional_input, "example.txt"]
-        source = json.loads(
-            self.cli("snapshot", str(self.repo), *declaration).stdout
-        )
         self.cli("lock", "acquire", str(self.repo), review_id)
         self.cli("inspect", str(self.repo), review_id, "--json", *declaration)
         self.cli("template", str(self.repo), review_id, "review")
-        event_path = self.reviews_dir() / f"{review_id}.event.json"
-        event = json.loads(event_path.read_text())
-        event["source_snapshot"] = source
-        event["threads"][0].update(
-            {
-                "title": "Update example",
-                "risk": "Old result remains.",
-                "required_behavior": "Use the new result.",
-            }
+        self.draft(
+            review_id,
+            "open-thread",
+            "--title",
+            "Update example",
+            "--risk",
+            "Old result remains.",
+            "--required-behavior",
+            "Use the new result.",
+            "--paths",
+            "example.txt",
+            *EVIDENCE,
         )
-        event["threads"][0]["evidence"].update(
-            {
-                "provenance": "example.txt",
-                "sanitized_result": "The file contains the old value.",
-            }
+        self.draft(
+            review_id,
+            "record-check",
+            "--check",
+            "source inspection",
+            "--result",
+            "passed",
         )
-        event["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        event_path.write_text(json.dumps(event, indent=2) + "\n")
         self.cli("publish", str(self.repo), review_id)
 
     # --- discover: selection ---

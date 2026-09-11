@@ -19,16 +19,6 @@ from review_io import (
     require_secure_regular,
     secure_json,
 )
-from review_notes import NOTE_MARKER
-
-# Per-thread action entries a note joins first; threads raised in the draft
-# itself (review threads, new_threads) carry their own message as a fallback.
-NOTE_ENTRY_FIELD_BY_KIND = {
-    "owner_reply": "replies",
-    "reviewer_update": "decisions",
-    "final_review": "resolutions",
-    "source_update": "thread_impacts",
-}
 
 
 def verify_lease(args: argparse.Namespace) -> dict[str, Any]:
@@ -241,16 +231,6 @@ def refresh_guard(args: argparse.Namespace) -> int:
     return 0
 
 
-def refresh_draft_timestamp(event: dict[str, Any]) -> None:
-    """Restamp the draft's occurred_at at helper-write time.
-
-    Templates stamp occurred_at at creation, while helpers add evidence
-    observed later; without this refresh every helper-touched draft fails
-    validation because evidence must not postdate its event.
-    """
-    event["occurred_at"] = datetime.now(timezone.utc).isoformat()
-
-
 def abort_draft(args: argparse.Namespace) -> int:
     verify_lease(args)
     event = Path(args.event)
@@ -260,117 +240,6 @@ def abort_draft(args: argparse.Namespace) -> int:
     require_secure_regular(event, "draft")
     event.unlink()
     print(json.dumps({"status": "draft_aborted"}, sort_keys=True))
-    return 0
-
-
-def add_check(args: argparse.Namespace) -> int:
-    verify_lease(args)
-    event_path = Path(args.event)
-    require_secure_regular(event_path, "draft")
-    event = load_object(event_path)
-    validation = event.get("validation")
-    if not isinstance(validation, dict) or not isinstance(
-        validation.get("performed"), list
-    ):
-        raise TypeError("draft does not support validation checks")
-    check: dict[str, Any] = {"check": args.check, "result": args.result}
-    if args.basis:
-        check["evidence"] = {
-            "basis": args.basis,
-            "provenance": args.provenance,
-            "observed_at": datetime.now(timezone.utc).isoformat(),
-            "sanitized_result": args.sanitized_result,
-        }
-        if args.artifact_digest:
-            check["evidence"]["artifact_digest"] = args.artifact_digest
-    validation["performed"].append(check)
-    refresh_draft_timestamp(event)
-    secure_json(event_path, event)
-    print(
-        json.dumps({"status": "check_added", "draft": str(event_path)}, sort_keys=True)
-    )
-    return 0
-
-
-def add_gap(args: argparse.Namespace) -> int:
-    verify_lease(args)
-    event_path = Path(args.event)
-    require_secure_regular(event_path, "draft")
-    event = load_object(event_path)
-    review = load_object(Path(args.review))
-    validation = event.get("validation")
-    if not isinstance(validation, dict) or not isinstance(validation.get("gaps"), list):
-        raise TypeError("draft does not support validation gaps")
-    identifiers = [
-        *review["state"]["validation_gaps"]["open"],
-        *review["state"]["validation_gaps"]["resolved"],
-        *[item.get("gap_id") for item in validation["gaps"] if isinstance(item, dict)],
-    ]
-    numbers = [
-        int(value[1:])
-        for value in identifiers
-        if isinstance(value, str) and value.startswith("G") and value[1:].isdigit()
-    ]
-    gap_id = f"G{max(numbers, default=0) + 1}"
-    validation["gaps"].append(
-        {
-            "gap_id": gap_id,
-            "check": args.check,
-            "reason": args.reason,
-            "material": args.material,
-        }
-    )
-    refresh_draft_timestamp(event)
-    secure_json(event_path, event)
-    print(
-        json.dumps(
-            {"status": "gap_added", "gap_id": gap_id, "draft": str(event_path)},
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-def add_note(args: argparse.Namespace) -> int:
-    """Append a machine-formatted `Note to user:` line to a draft entry."""
-    verify_lease(args)
-    event_path = Path(args.event)
-    require_secure_regular(event_path, "draft")
-    event = load_object(event_path)
-    kind = event.get("kind")
-    field = NOTE_ENTRY_FIELD_BY_KIND.get(kind) if isinstance(kind, str) else None
-    entries = event.get(field, []) if field else []
-    entry = next(
-        (
-            item
-            for item in entries
-            if isinstance(item, dict) and item.get("thread_id") == args.thread
-        ),
-        None,
-    )
-    if entry is None:
-        entry = next(
-            (
-                thread
-                for thread in [*event.get("threads", []), *event.get("new_threads", [])]
-                if isinstance(thread, dict) and thread.get("id") == args.thread
-            ),
-            None,
-        )
-    if entry is None:
-        raise ValueError(f"draft has no entry for thread {args.thread}")
-    tag_prefix = f"[{args.tag}] " if args.tag else ""
-    note_line = f"{NOTE_MARKER} {tag_prefix}{args.note}"
-    message = entry.get("message", "")
-    entry["message"] = f"{message}\n{note_line}" if message else note_line
-    refresh_draft_timestamp(event)
-    secure_json(event_path, event)
-    print(
-        json.dumps(
-            {"status": "note_added", "thread_id": args.thread, "draft": str(event_path)},
-            sort_keys=True,
-        )
-    )
     return 0
 
 
@@ -490,16 +359,7 @@ def await_handoff(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in (
-        "acquire",
-        "verify",
-        "release",
-        "guard",
-        "abort-draft",
-        "add-check",
-        "add-gap",
-        "add-note",
-    ):
+    for name in ("acquire", "verify", "release", "guard", "abort-draft"):
         child = commands.add_parser(name)
         child.add_argument("--repo", required=True)
         child.add_argument("--review", required=True)
@@ -511,24 +371,6 @@ def main() -> int:
             child.add_argument("--scope-json", required=True)
         if name == "abort-draft":
             child.add_argument("--event", required=True)
-        if name == "add-check":
-            child.add_argument("--event", required=True)
-            child.add_argument("--result", choices=("passed", "failed"), required=True)
-            child.add_argument("--check", required=True)
-            child.add_argument("--basis")
-            child.add_argument("--provenance", default="")
-            child.add_argument("--sanitized-result", default="")
-            child.add_argument("--artifact-digest")
-        if name == "add-gap":
-            child.add_argument("--event", required=True)
-            child.add_argument("--check", required=True)
-            child.add_argument("--reason", required=True)
-            child.add_argument("--material", action="store_true")
-        if name == "add-note":
-            child.add_argument("--event", required=True)
-            child.add_argument("--thread", required=True)
-            child.add_argument("--note", required=True)
-            child.add_argument("--tag")
     wait_parser = commands.add_parser("wait")
     wait_parser.add_argument("--review", required=True)
     wait_parser.add_argument("--timeout", type=int, default=300)
@@ -549,12 +391,6 @@ def main() -> int:
         return refresh_guard(args)
     if args.command == "abort-draft":
         return abort_draft(args)
-    if args.command == "add-check":
-        return add_check(args)
-    if args.command == "add-gap":
-        return add_gap(args)
-    if args.command == "add-note":
-        return add_note(args)
     if args.command == "await-handoff":
         if not 1 <= args.round_seconds <= 86400:
             parser.error("--round-seconds must be between 1 and 86400 seconds")

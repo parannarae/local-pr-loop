@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -155,9 +156,13 @@ class StartFollowUpTest(unittest.TestCase):
         document = review_state.new_document(self.review_id, "review")
         document["created_at"] = created_at
         event = review_state.event_template("initial_review_timeout")
-        event["reason"] = "the reviewer never appeared"
-        event["started_at"] = created_at
-        event["deadline"] = "2026-08-17T12:00:00+00:00"
+        event["operations"][0].update(
+            {
+                "started_at": created_at,
+                "deadline": "2026-08-17T12:00:00+00:00",
+                "reason": "the reviewer never appeared",
+            }
+        )
         event["occurred_at"] = "2026-08-17T12:00:01+00:00"
         document = review_state.append_event(document, event)
         self.canonical.write_text(json.dumps(document, indent=2) + "\n")
@@ -190,9 +195,13 @@ class StartFollowUpTest(unittest.TestCase):
         document = review_state.new_document(self.review_id, "review")
         document["created_at"] = created_at
         event = review_state.event_template("initial_review_timeout")
-        event["reason"] = "the reviewer never appeared"
-        event["started_at"] = created_at
-        event["deadline"] = "2026-08-17T12:00:00+00:00"
+        event["operations"][0].update(
+            {
+                "started_at": created_at,
+                "deadline": "2026-08-17T12:00:00+00:00",
+                "reason": "the reviewer never appeared",
+            }
+        )
         event["occurred_at"] = "2026-08-17T12:00:01+00:00"
         document = review_state.append_event(document, event)
         self.canonical.write_text(json.dumps(document, indent=2) + "\n")
@@ -253,18 +262,26 @@ class StartFollowUpTest(unittest.TestCase):
                 "unstaged_sha256": "d" * 64,
             }
         )
-        thread = event["threads"][0]
-        thread.update(
+        evidence = review_state.blank_evidence()
+        evidence.update(
+            {"provenance": "src", "sanitized_result": "observed directly"}
+        )
+        event["operations"] = [
             {
+                "op": "thread.open",
+                "id": "T1",
+                "priority": "P1",
+                "contract": "internal",
                 "title": "a finding that must not be discarded",
                 "risk": "the behavior is wrong",
                 "required_behavior": "it should be right",
                 "paths": ["src"],
+                "evidence": evidence,
             }
-        )
-        thread["evidence"].update(
-            {"provenance": "src", "sanitized_result": "observed directly"}
-        )
+        ]
+        # Restamped after the evidence is built, because evidence may not be
+        # observed after the transaction that records it.
+        event["occurred_at"] = datetime.now(timezone.utc).isoformat()
         document = review_state.append_event(document, event)
         path.write_text(json.dumps(document, indent=2) + "\n")
 

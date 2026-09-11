@@ -29,9 +29,13 @@ EVIDENCE_BASES = review_schema.EVIDENCE_BASES
 EVENT_ID_PATTERN = review_schema.EVENT_ID_PATTERN
 FORMAT = review_schema.FORMAT
 FORMAT_REVISION = review_schema.FORMAT_REVISION
+OPERATION_FIELDS = review_schema.OPERATION_FIELDS
+OPERATIONS_BY_KIND = review_schema.OPERATIONS_BY_KIND
 SHA256_PATTERN = review_schema.SHA256_PATTERN
 load_json = review_schema.load_json
+operations_of = review_schema.operations_of
 reject_duplicate_keys = review_schema.reject_duplicate_keys
+unsupported_revision_error = review_schema.unsupported_revision_error
 validate_event = review_schema.validate_event
 
 
@@ -41,14 +45,6 @@ def blank_snapshot() -> dict[str, Any]:
 
 def blank_evidence() -> dict[str, Any]:
     return review_templates.blank_evidence()
-
-
-def blank_validation() -> dict[str, list[Any]]:
-    return review_templates.blank_validation()
-
-
-def blank_thread() -> dict[str, Any]:
-    return review_templates.blank_thread()
 
 
 def new_document(
@@ -184,17 +180,10 @@ def main() -> int:
     threads_parser.add_argument("--json", action="store_true")
     threads_parser.add_argument("--summary", action="store_true")
     threads_parser.add_argument("--open", dest="open_only", action="store_true")
-    evidence_parser = subparsers.add_parser("evidence-template")
-    evidence_parser.add_argument("basis", choices=EVIDENCE_BASES)
     subparsers.add_parser("eligible-timeout")
     args = parser.parse_args()
     if args.command == "template":
         print(json.dumps(event_template(args.kind), indent=2))
-        return 0
-    if args.command == "evidence-template":
-        value = blank_evidence()
-        value["basis"] = args.basis
-        print(json.dumps(value, indent=2))
         return 0
     if args.command == "init":
         document = new_document(

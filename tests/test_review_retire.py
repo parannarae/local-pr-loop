@@ -93,9 +93,13 @@ class RetireReviewTest(unittest.TestCase):
         document = review_state.new_document(self.review_id, "review")
         document["created_at"] = created_at
         event = review_state.event_template("initial_review_timeout")
-        event["reason"] = "the reviewer never appeared"
-        event["started_at"] = created_at
-        event["deadline"] = "2026-08-17T12:00:00+00:00"
+        event["operations"][0].update(
+            {
+                "started_at": created_at,
+                "deadline": "2026-08-17T12:00:00+00:00",
+                "reason": "the reviewer never appeared",
+            }
+        )
         event["occurred_at"] = "2026-08-17T12:00:01+00:00"
         document = review_state.append_event(document, event)
         self.canonical.write_text(json.dumps(document, indent=2) + "\n")

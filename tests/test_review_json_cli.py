@@ -1,4 +1,4 @@
-"""End-to-end tests for publication, recovery, lock, and waiting behavior."""
+"""End-to-end tests for composition, publication, recovery, lock, and waiting."""
 
 from __future__ import annotations
 
@@ -20,6 +20,17 @@ import review_state
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "review_cli.py"
 LOCK_SCRIPT = Path(__file__).parents[1] / "scripts" / "review_lock.py"
+
+# The evidence every composed act in this suite carries. Each command takes it as
+# typed flags, so there is no evidence JSON for a test to shape by hand.
+EVIDENCE = (
+    "--basis",
+    "source_inspection",
+    "--provenance",
+    "example.txt",
+    "--sanitized-result",
+    "The guarded path carries the observed value.",
+)
 
 
 def run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -51,11 +62,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         output = run(
             sys.executable, str(SCRIPT), "init", str(self.repo), "review", cwd=self.repo
         ).stdout
-        self.review_id = next(
-            line.split(": ", 1)[1]
-            for line in output.splitlines()
-            if line.startswith("review_id: ")
-        )
+        self.review_id = self.review_id_of(output)
         base = self.repo / ".local" / "reviews" / self.review_id
         self.review = base.with_suffix(".json").resolve()
         self.event = base.with_suffix(".event.json").resolve()
@@ -65,89 +72,199 @@ class ReviewJsonCliTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def snapshot(self) -> dict[str, Any]:
-        return json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "snapshot",
-                str(self.repo),
-                "example.txt",
-                cwd=self.repo,
-            ).stdout
+    # --- driving the CLI ---
+
+    def cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return run(sys.executable, str(SCRIPT), *args, cwd=self.repo, check=check)
+
+    def draft(
+        self, *args: str, review_id: str | None = None, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        return self.cli(
+            "draft", str(self.repo), review_id or self.review_id, *args, check=check
         )
 
-    def acquire(self) -> None:
-        output = run(
-            sys.executable,
-            str(SCRIPT),
-            "lock",
-            "acquire",
-            str(self.repo),
-            self.review_id,
-            cwd=self.repo,
+    def draft_path(self, review_id: str | None = None) -> Path:
+        return (
+            self.repo
+            / ".local"
+            / "reviews"
+            / f"{review_id or self.review_id}.event.json"
+        )
+
+    @staticmethod
+    def review_id_of(output: str) -> str:
+        return next(
+            line.split(": ", 1)[1]
+            for line in output.splitlines()
+            if line.startswith("review_id: ")
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        return json.loads(
+            self.cli("snapshot", str(self.repo), "example.txt").stdout
+        )
+
+    def acquire(self, review_id: str | None = None) -> None:
+        output = self.cli(
+            "lock", "acquire", str(self.repo), review_id or self.review_id
         ).stdout
         self.assertNotIn("token", output)
         self.assertEqual(json.loads(output)["status"], "acquired")
-        lease = self.repo / ".local" / "reviews" / f"{self.review_id}.lease.json"
+        lease = (
+            self.repo
+            / ".local"
+            / "reviews"
+            / f"{review_id or self.review_id}.lease.json"
+        )
         self.assertEqual(lease.stat().st_mode & 0o777, 0o600)
 
-    def prepare_review(self, source: dict[str, Any]) -> str:
-        run(
-            sys.executable,
-            str(SCRIPT),
+    def inspect(self, *flags: str, review_id: str | None = None) -> str:
+        return self.cli(
             "inspect",
             str(self.repo),
-            self.review_id,
-            "--json",
+            review_id or self.review_id,
+            *flags,
             "example.txt",
-            cwd=self.repo,
-        )
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "template",
-            str(self.repo),
-            self.review_id,
-            "review",
-            cwd=self.repo,
-        )
-        event = json.loads(self.event.read_text())
-        event["source_snapshot"] = source
-        event["threads"][0].update(
-            {
-                "title": "Update example",
-                "risk": "Old result remains.",
-                "required_behavior": "Use the new result.",
-            }
-        )
-        event["threads"][0]["evidence"].update(
-            {
-                "provenance": "example.txt",
-                "sanitized_result": "The file contains the old value.",
-            }
-        )
-        event["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        write_json(self.event, event)
-        return event["event_id"]
+        ).stdout
+
+    def template(self, kind: str, review_id: str | None = None) -> None:
+        self.cli("template", str(self.repo), review_id or self.review_id, kind)
+
+    def guarded_template(self, kind: str, review_id: str | None = None) -> None:
+        """Lock, guard, and open a draft of one kind."""
+        self.acquire(review_id)
+        self.inspect("--json", review_id=review_id)
+        self.template(kind, review_id)
 
     def publish(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-        return run(
-            sys.executable,
-            str(SCRIPT),
-            "publish",
-            str(self.repo),
-            self.review_id,
-            cwd=self.repo,
-            check=check,
+        return self.cli("publish", str(self.repo), self.review_id, check=check)
+
+    def publish_committed(self, review_id: str | None = None) -> None:
+        published = self.cli(
+            "publish", str(self.repo), review_id or self.review_id, check=False
+        )
+        self.assertTrue(json.loads(published.stdout)["committed"], published.stdout)
+
+    # --- composing whole transactions ---
+
+    def compose_threads(self, count: int, review_id: str | None = None) -> None:
+        for index in range(1, count + 1):
+            self.draft(
+                "open-thread",
+                "--title",
+                "Update example" if index == 1 else f"Finding {index}",
+                "--risk",
+                "Old result remains.",
+                "--required-behavior",
+                "Use the new result.",
+                "--paths",
+                "example.txt",
+                *EVIDENCE,
+                review_id=review_id,
+            )
+        self.draft(
+            "record-check",
+            "--check",
+            "source inspection",
+            "--result",
+            "passed",
+            review_id=review_id,
         )
 
+    def prepare_review(self, thread_count: int = 1) -> str:
+        """Guard, template, and compose a publishable initial review."""
+        self.guarded_template("review")
+        self.compose_threads(thread_count)
+        return json.loads(self.event.read_text())["event_id"]
+
+    def publish_initial_review(self, review_id: str, thread_count: int = 1) -> None:
+        self.guarded_template("review", review_id)
+        self.compose_threads(thread_count, review_id=review_id)
+        self.publish_committed(review_id)
+
+    def compose_owner_reply(self, threads: list[str], review_id: str | None = None) -> None:
+        self.draft(
+            "reply-context",
+            "--drift",
+            "Only the guarded source changed.",
+            "--guide",
+            "No behavior guide needed a change.",
+            review_id=review_id,
+        )
+        for thread_id in threads:
+            self.draft(
+                "reply",
+                thread_id,
+                "--decision",
+                "applied",
+                "--message",
+                "Applied the new result.",
+                *EVIDENCE,
+                review_id=review_id,
+            )
+        self.draft(
+            "record-check",
+            "--check",
+            "source inspection",
+            "--result",
+            "passed",
+            review_id=review_id,
+        )
+
+    def publish_owner_reply(self, review_id: str, threads: list[str]) -> None:
+        self.guarded_template("owner_reply", review_id)
+        self.compose_owner_reply(threads, review_id=review_id)
+        self.publish_committed(review_id)
+
+    def publish_reviewer_update(
+        self, review_id: str, resolve: str, comment: list[str]
+    ) -> None:
+        """Resolve one thread and comment on the rest.
+
+        A reviewer_update may not resolve every open thread, which is what
+        final_review is for, so the caller must leave at least one open.
+        """
+        self.guarded_template("reviewer_update", review_id)
+        for thread_id in comment:
+            self.draft(
+                "comment",
+                thread_id,
+                "--message",
+                "Still verifying this one.",
+                review_id=review_id,
+            )
+        self.draft(
+            "resolve",
+            resolve,
+            "--message",
+            "Confirmed the new result independently.",
+            "--verified",
+            *EVIDENCE,
+            review_id=review_id,
+        )
+        self.draft(
+            "record-check",
+            "--check",
+            "source inspection",
+            "--result",
+            "passed",
+            review_id=review_id,
+        )
+        self.publish_committed(review_id)
+
+    def publish_lgtm(self) -> None:
+        self.guarded_template("final_review")
+        self.draft("approve", "--decision", "LGTM")
+        self.draft(
+            "record-check", "--check", "source inspection", "--result", "passed"
+        )
+        self.assertTrue(json.loads(self.publish().stdout)["committed"])
+
+    # --- publication ---
+
     def test_publish_is_clean_and_inspect_exposes_workflow_and_operation(self) -> None:
-        source = self.snapshot()
-        self.acquire()
-        event_id = self.prepare_review(source)
+        event_id = self.prepare_review()
         result = json.loads(self.publish().stdout)
         self.assertTrue(result["committed"])
         self.assertEqual(result["event_id"], event_id)
@@ -158,31 +275,14 @@ class ReviewJsonCliTest(unittest.TestCase):
         )
         document = json.loads(self.review.read_text())
         self.assertEqual(document["state"]["workflow"]["phase"], "owner_response")
-        inspected = run(
-            sys.executable,
-            str(SCRIPT),
-            "inspect",
-            str(self.repo),
-            self.review_id,
-            "--json",
-            "example.txt",
-            cwd=self.repo,
-        ).stdout
+        inspected = self.inspect("--json")
         self.assertIn('"status": "clean"', inspected)
         dashboard = json.loads(inspected)
         self.assertIn("lock acquire", dashboard["recommended_next_command"])
         self.assertIn("review_cli.py", dashboard["recommended_next_command"])
         self.assertNotIn("review-json.sh", dashboard["recommended_next_command"])
         conversations = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "threads",
-                str(self.repo),
-                self.review_id,
-                "--json",
-                cwd=self.repo,
-            ).stdout
+            self.cli("threads", str(self.repo), self.review_id, "--json").stdout
         )
         self.assertEqual(conversations[0]["thread"]["id"], "T1")
 
@@ -190,8 +290,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self,
     ) -> None:
         source = self.snapshot()
-        self.acquire()
-        event_id = self.prepare_review(source)
+        event_id = self.prepare_review()
         publisher = Path(__file__).parents[1] / "scripts" / "review_publish.py"
         failed = run(
             "python3",
@@ -233,30 +332,14 @@ class ReviewJsonCliTest(unittest.TestCase):
         history = json.loads(self.review.read_text())["history"]
         self.assertEqual(history, [])
         self.assertEqual(json.loads(self.event.read_text())["event_id"], event_id)
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "lock",
-            "release",
-            str(self.repo),
-            self.review_id,
-            cwd=self.repo,
-        )
+        self.cli("lock", "release", str(self.repo), self.review_id)
 
     def test_wrong_lock_token_does_not_damage_active_lock(self) -> None:
         self.acquire()
         lease_path = self.repo / ".local" / "reviews" / f"{self.review_id}.lease.json"
         token = json.loads(lease_path.read_text())["token"]
-        failed = run(
-            sys.executable,
-            str(SCRIPT),
-            "lock",
-            "release",
-            str(self.repo),
-            self.review_id,
-            "wrong-token",
-            cwd=self.repo,
-            check=False,
+        failed = self.cli(
+            "lock", "release", str(self.repo), self.review_id, "wrong-token", check=False
         )
         self.assertNotEqual(failed.returncode, 0)
         verified = run(
@@ -273,19 +356,10 @@ class ReviewJsonCliTest(unittest.TestCase):
         )
         self.assertIn("verified", verified.stdout)
 
-    def test_guarded_draft_helpers_preserve_cli_artifact_contract(self) -> None:
-        initial = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "inspect",
-                str(self.repo),
-                self.review_id,
-                "--json",
-                "example.txt",
-                cwd=self.repo,
-            ).stdout
-        )
+    # --- composer artifacts ---
+
+    def test_composer_writes_typed_operations_into_the_guarded_draft(self) -> None:
+        initial = json.loads(self.inspect("--json"))
         self.assertEqual(initial["workflow"]["phase"], "awaiting_initial_review")
         self.assertEqual(initial["operation"]["status"], "clean")
         self.assertEqual(initial["operation"]["lock_status"], "unlocked")
@@ -294,141 +368,208 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertIn("lock acquire", initial["recommended_next_command"])
 
         self.acquire()
-        guarded = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "inspect",
-                str(self.repo),
-                self.review_id,
-                "--json",
-                "example.txt",
-                cwd=self.repo,
-            ).stdout
-        )
+        guarded = json.loads(self.inspect("--json"))
         self.assertEqual(guarded["operation"]["lock_status"], "locked")
         self.assertTrue(guarded["operation"]["lease_present"])
         self.assertIn("template", guarded["recommended_next_command"])
 
-        template_output = run(
-            sys.executable,
-            str(SCRIPT),
-            "template",
-            str(self.repo),
-            self.review_id,
-            "review",
-            cwd=self.repo,
+        templated = self.cli(
+            "template", str(self.repo), self.review_id, "review"
         ).stdout.strip()
-        self.assertEqual(Path(template_output), self.event)
+        self.assertEqual(Path(templated), self.event)
         self.assertEqual(self.event.stat().st_mode & 0o777, 0o600)
+        # A review prefills no thread: each one arrives through the composer.
+        self.assertEqual(json.loads(self.event.read_text())["operations"], [])
 
-        check_result = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "add-check",
-                str(self.repo),
-                self.review_id,
-                "passed",
-                "schema validation",
-                cwd=self.repo,
+        opened = json.loads(
+            self.draft(
+                "open-thread",
+                "--title",
+                "Update example",
+                "--risk",
+                "Old result remains.",
+                "--required-behavior",
+                "Use the new result.",
+                "--paths",
+                "example.txt",
+                *EVIDENCE,
             ).stdout
         )
-        self.assertEqual(check_result["status"], "check_added")
-        gap_result = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "add-gap",
-                str(self.repo),
-                self.review_id,
+        self.assertEqual(opened["op"], "thread.open")
+        self.assertEqual(opened["target"], "T1")
+        self.assertEqual(opened["status"], "recorded")
+
+        checked = json.loads(
+            self.draft(
+                "record-check",
+                "--check",
+                "schema validation",
+                "--result",
+                "passed",
+            ).stdout
+        )
+        self.assertEqual(checked["op"], "check.record")
+        gapped = json.loads(
+            self.draft(
+                "open-gap",
+                "--check",
                 "live probe",
+                "--reason",
                 "service unavailable",
                 "--material",
-                cwd=self.repo,
             ).stdout
         )
-        self.assertEqual(gap_result["status"], "gap_added")
-        self.assertEqual(gap_result["gap_id"], "G1")
-        draft = json.loads(self.event.read_text())
+        self.assertEqual(gapped["target"], "G1")
+
+        operations = json.loads(self.event.read_text())["operations"]
         self.assertEqual(
-            draft["validation"]["performed"],
-            [{"check": "schema validation", "result": "passed"}],
+            [item["op"] for item in operations],
+            ["thread.open", "check.record", "gap.open"],
         )
         self.assertEqual(
-            draft["validation"]["gaps"],
-            [
-                {
-                    "gap_id": "G1",
-                    "check": "live probe",
-                    "reason": "service unavailable",
-                    "material": True,
-                }
-            ],
+            operations[1], {"op": "check.record", "check": "schema validation", "result": "passed"}
+        )
+        self.assertEqual(
+            operations[2],
+            {
+                "op": "gap.open",
+                "gap_id": "G1",
+                "check": "live probe",
+                "reason": "service unavailable",
+                "material": True,
+            },
         )
 
         aborted = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "abort-draft",
-                str(self.repo),
-                self.review_id,
-                cwd=self.repo,
-            ).stdout
+            self.cli("abort-draft", str(self.repo), self.review_id).stdout
         )
         self.assertEqual(aborted["status"], "draft_aborted")
         self.assertFalse(self.event.exists())
         released = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "lock",
-                "release",
-                str(self.repo),
-                self.review_id,
-                cwd=self.repo,
-            ).stdout
+            self.cli("lock", "release", str(self.repo), self.review_id).stdout
         )
         self.assertEqual(released["status"], "released")
 
-    def publish_lgtm(self) -> None:
-        self.acquire()
-        source = self.snapshot()
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "inspect",
-            str(self.repo),
-            self.review_id,
-            "--json",
-            "example.txt",
-            cwd=self.repo,
+    def test_draft_show_lists_what_the_draft_carries_and_still_owes(self) -> None:
+        self.publish_initial_review(self.review_id)
+        self.guarded_template("owner_reply")
+
+        outstanding = json.loads(self.draft("show").stdout)
+        self.assertEqual(outstanding["kind"], "owner_reply")
+        self.assertIn("thread.reply T1", outstanding["operations"])
+        self.assertFalse(outstanding["publishable"])
+        self.assertTrue(outstanding["outstanding"])
+
+        self.compose_owner_reply(["T1"])
+        complete = json.loads(self.draft("show").stdout)
+        self.assertEqual(complete["outstanding"], [])
+        self.assertTrue(complete["publishable"])
+
+    def test_composing_the_same_thread_twice_corrects_rather_than_duplicates(
+        self,
+    ) -> None:
+        self.publish_initial_review(self.review_id, thread_count=2)
+        self.publish_owner_reply(self.review_id, ["T1", "T2"])
+        self.guarded_template("reviewer_update")
+
+        self.draft("comment", "T1", "--message", "Looking at this one.")
+        replaced = json.loads(
+            self.draft(
+                "resolve",
+                "T1",
+                "--message",
+                "Confirmed independently.",
+                "--verified",
+                *EVIDENCE,
+            ).stdout
         )
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "template",
-            str(self.repo),
-            self.review_id,
-            "final_review",
-            cwd=self.repo,
-        )
-        event = json.loads(self.event.read_text())
-        event["source_snapshot"] = source
-        event["decision"] = "LGTM"
-        event["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
+        self.assertEqual(replaced["status"], "replaced")
+        acts = [
+            item
+            for item in json.loads(self.event.read_text())["operations"]
+            if item.get("thread_id") == "T1"
         ]
-        write_json(self.event, event)
-        self.assertTrue(json.loads(self.publish().stdout)["committed"])
+        self.assertEqual([item["op"] for item in acts], ["thread.resolve"])
+
+    def test_dropping_a_prefilled_resolution_leaves_its_gap_open(self) -> None:
+        """A gap that stays open must not hold the draft that templating prefilled.
+
+        `template` writes one resolution skeleton per open gap, but a gap is
+        resolved only where the check was finally performed or shown to be
+        non-material. Without removal the skeleton could be neither filled
+        honestly nor taken out, and the whole draft would have to be aborted.
+        """
+        self.guarded_template("review")
+        self.compose_threads(1)
+        self.draft(
+            "open-gap", "--check", "live probe", "--reason", "service unavailable"
+        )
+        self.publish_committed()
+        self.publish_owner_reply(self.review_id, ["T1"])
+
+        self.guarded_template("final_review")
+        self.assertIn(
+            "gap.resolve G1", json.loads(self.draft("show").stdout)["operations"]
+        )
+        dropped = json.loads(self.draft("drop", "gap.resolve", "G1").stdout)
+        self.assertEqual(dropped["status"], "dropped")
+        self.assertEqual(dropped["dropped"], 1)
+
+        self.draft("resolve", "T1", "--message", "Verified against the guarded tree.")
+        self.draft("approve", "--decision", "LGTM")
+        self.draft(
+            "record-check", "--check", "source inspection", "--result", "passed"
+        )
+        self.publish_committed()
+        document = json.loads(self.review.read_text())
+        self.assertEqual(document["state"]["validation_gaps"]["open"], ["G1"])
+
+    def test_correcting_a_failed_check_drops_the_gap_it_opened(self) -> None:
+        self.guarded_template("review")
+        self.compose_threads(1)
+        failed = json.loads(
+            self.draft(
+                "record-check",
+                "--check",
+                "focused tests",
+                "--result",
+                "failed",
+                "--gap-reason",
+                "The focused test fails against the guarded tree.",
+            ).stdout
+        )
+        self.assertEqual(failed["target"], "G1")
+        self.assertEqual(failed["dropped"], 0)
+
+        corrected = json.loads(
+            self.draft(
+                "record-check", "--check", "focused tests", "--result", "passed"
+            ).stdout
+        )
+        self.assertEqual(corrected["status"], "replaced")
+        self.assertEqual(corrected["dropped"], 1)
+        self.assertEqual(
+            [item["op"] for item in json.loads(self.event.read_text())["operations"]],
+            ["thread.open", "check.record", "check.record"],
+        )
+        self.publish_committed()
+        document = json.loads(self.review.read_text())
+        self.assertEqual(document["state"]["validation_gaps"]["open"], [])
+
+    def test_dropping_refuses_an_operation_the_draft_does_not_carry(self) -> None:
+        self.guarded_template("review")
+        self.compose_threads(1)
+
+        refused = self.draft("drop", "thread.open", "T2", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("thread.open T1", refused.stderr)
+
+    # --- await-handoff ---
 
     def await_handoff(
         self, round_seconds: int, max_rounds: int
     ) -> subprocess.CompletedProcess[str]:
-        return run(
-            sys.executable,
-            str(SCRIPT),
+        return self.cli(
             "await-handoff",
             str(self.repo),
             self.review_id,
@@ -436,11 +577,8 @@ class ReviewJsonCliTest(unittest.TestCase):
             str(round_seconds),
             "--max-rounds",
             str(max_rounds),
-            cwd=self.repo,
             check=False,
         )
-
-    # --- await-handoff ---
 
     def test_await_handoff_returns_changed_when_counterpart_publishes(self) -> None:
         waiter = subprocess.Popen(
@@ -462,9 +600,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         )
         # Let the waiter record the initial canonical hash before publishing.
         time.sleep(3)
-        source = self.snapshot()
-        self.acquire()
-        self.prepare_review(source)
+        self.prepare_review()
         self.publish()
         stdout, _ = waiter.communicate(timeout=60)
         lines = stdout.strip().splitlines()
@@ -486,12 +622,10 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertEqual(outcome, {"rounds_used": 0, "status": "terminal"})
 
     def test_await_handoff_maps_passed_deadline_to_timeout_eligible(self) -> None:
-        source = self.snapshot()
-        self.acquire()
-        self.prepare_review(source)
+        self.prepare_review()
         self.publish()
         # Back-date the only event beyond the two-hour owner deadline. History,
-        # derived latest_event, and thread evidence observed_at must stay
+        # derived latest_event, and operation evidence observed_at must stay
         # mutually consistent for the document to remain valid.
         document = json.loads(self.review.read_text())
         stale = (
@@ -499,17 +633,11 @@ class ReviewJsonCliTest(unittest.TestCase):
         ).isoformat().replace("+00:00", "Z")
         document["history"][-1]["occurred_at"] = stale
         document["state"]["latest_event"]["occurred_at"] = stale
-        for thread in document["history"][-1]["threads"]:
-            thread["evidence"]["observed_at"] = stale
+        for operation in document["history"][-1]["operations"]:
+            if "evidence" in operation:
+                operation["evidence"]["observed_at"] = stale
         write_json(self.review, document)
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "validate",
-            str(self.repo),
-            self.review_id,
-            cwd=self.repo,
-        )
+        self.cli("validate", str(self.repo), self.review_id)
         result = self.await_handoff(round_seconds=5, max_rounds=1)
         self.assertEqual(result.returncode, 4)
         lines = result.stdout.strip().splitlines()
@@ -539,125 +667,55 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.assertEqual(self.await_handoff(1, 0).returncode, 2)
         self.assertEqual(self.await_handoff(0, 1).returncode, 2)
 
-    # --- add-note ---
+    # --- notes ---
 
-    def test_add_note_lands_on_review_draft_thread_message(self) -> None:
-        self.snapshot()
-        self.acquire()
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "inspect",
-            str(self.repo),
-            self.review_id,
-            "--json",
-            "example.txt",
-            cwd=self.repo,
-        )
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "template",
-            str(self.repo),
-            self.review_id,
-            "review",
-            cwd=self.repo,
-        )
-        # Review threads carry their own optional message, so a note flagged
-        # at raise time lands on the thread itself.
+    def test_a_note_attaches_to_a_thread_the_draft_acts_on(self) -> None:
+        self.guarded_template("review")
+        self.compose_threads(1)
         noted = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "add-note",
-                str(self.repo),
-                self.review_id,
+            self.draft(
+                "note",
                 "T1",
-                "raised as a design constraint",
                 "--tag",
                 "decision",
-                cwd=self.repo,
+                "--message",
+                "raised as a design constraint",
             ).stdout
         )
-        self.assertEqual(noted["status"], "note_added")
-        draft = json.loads(self.event.read_text())
+        self.assertEqual(noted["op"], "note.attach")
+        self.assertEqual(noted["target"], "T1")
+        operations = json.loads(self.event.read_text())["operations"]
         self.assertEqual(
-            draft["threads"][0]["message"],
-            "Note to user: [decision] raised as a design constraint",
+            operations[-1],
+            {
+                "op": "note.attach",
+                "target": {"kind": "thread", "id": "T1"},
+                "tag": "decision",
+                "message": "raised as a design constraint",
+            },
         )
-        failed = run(
-            sys.executable,
-            str(SCRIPT),
-            "add-note",
-            str(self.repo),
-            self.review_id,
-            "T9",
-            "no such thread",
-            cwd=self.repo,
-            check=False,
+        failed = self.draft(
+            "note", "T9", "--tag", "decision", "--message", "no such thread", check=False
         )
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("no entry for thread", failed.stderr)
 
-    def test_add_note_round_trips_into_summary_notes_section(self) -> None:
-        source = self.snapshot()
-        self.acquire()
-        self.prepare_review(source)
+    def test_a_note_round_trips_into_the_report_notes_section(self) -> None:
+        self.prepare_review()
         self.publish()
 
-        self.acquire()
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "inspect",
-            str(self.repo),
-            self.review_id,
-            "--json",
-            "example.txt",
-            cwd=self.repo,
+        self.guarded_template("owner_reply")
+        self.compose_owner_reply(["T1"])
+        self.draft(
+            "note",
+            "T1",
+            "--tag",
+            "decision",
+            "--message",
+            "design shifted to eventual consistency",
         )
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "template",
-            str(self.repo),
-            self.review_id,
-            "owner_reply",
-            cwd=self.repo,
-        )
-        event = json.loads(self.event.read_text())
-        event["source_drift_assessment"] = "No drift."
-        event["guide_synchronization"] = "No guide impact."
-        event["replies"][0].update(
-            {"decision": "applied", "message": "Updated the example."}
-        )
-        event["replies"][0]["evidence"].update(
-            {
-                "provenance": "example.txt",
-                "sanitized_result": "The file now holds the new value.",
-            }
-        )
-        event["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        write_json(self.event, event)
-        noted = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "add-note",
-                str(self.repo),
-                self.review_id,
-                "T1",
-                "design shifted to eventual consistency",
-                "--tag",
-                "decision",
-                cwd=self.repo,
-            ).stdout
-        )
-        self.assertEqual(noted["status"], "note_added")
-        # No manual occurred_at repair: the helper restamps the draft, so the
-        # publish below also proves the timestamp refresh.
+        # No manual occurred_at repair: every composer call restamps the draft,
+        # so the publish below also proves the timestamp refresh.
         result = json.loads(self.publish().stdout)
         self.assertTrue(result["committed"])
         report = self.report.read_text()
@@ -685,46 +743,21 @@ class ReviewJsonCliTest(unittest.TestCase):
             ]
             self.assertEqual(unknown, [], kind)
 
-    # --- source_update template ---
+    # --- source_update ---
 
-    def test_source_update_template_validates_after_filling_blanks_only(self) -> None:
-        source = self.snapshot()
-        self.acquire()
-        self.prepare_review(source)
+    def test_source_update_validates_once_its_reason_is_composed(self) -> None:
+        self.prepare_review()
         self.publish()
-        self.acquire()
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "inspect",
-            str(self.repo),
-            self.review_id,
-            "--json",
-            "example.txt",
-            cwd=self.repo,
+        self.guarded_template("source_update")
+        self.draft(
+            "replace-source",
+            "--reason",
+            "Replacement basis for continued review.",
         )
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "template",
-            str(self.repo),
-            self.review_id,
-            "source_update",
-            cwd=self.repo,
-        )
-        event = json.loads(self.event.read_text())
-        event["reason"] = "Replacement basis for continued review."
-        write_json(self.event, event)
-        # Filling the documented semantic blank alone must validate; no
-        # generated field may need deleting.
-        result = run(
-            sys.executable,
-            str(SCRIPT),
-            "validate-event",
-            str(self.repo),
-            self.review_id,
-            cwd=self.repo,
-            check=False,
+        # Composing the one semantic blank must validate; no generated field may
+        # need deleting and no snapshot needs retyping.
+        result = self.cli(
+            "validate-event", str(self.repo), self.review_id, check=False
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -743,24 +776,9 @@ class ReviewJsonCliTest(unittest.TestCase):
         )
         write_json(self.review, document)
         self.acquire()
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "inspect",
-            str(self.repo),
-            self.review_id,
-            "--json",
-            "example.txt",
-            cwd=self.repo,
-        )
-        result = run(
-            sys.executable,
-            str(SCRIPT),
-            "publish-timeout",
-            "--if-eligible",
-            str(self.repo),
-            self.review_id,
-            cwd=self.repo,
+        self.inspect("--json")
+        result = self.cli(
+            "publish-timeout", "--if-eligible", str(self.repo), self.review_id
         )
         published = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertTrue(published["committed"])
@@ -780,13 +798,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         (self.repo / "example.txt").write_text("modified\n")
         (self.repo / "new.txt").write_text("untracked\n")
         result = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "scope-candidates",
-                str(self.repo),
-                cwd=self.repo,
-            ).stdout
+            self.cli("scope-candidates", str(self.repo)).stdout
         )
         self.assertIsNone(result["merge_base"])
         self.assertIn("example.txt", result["candidates"]["unstaged"])
@@ -795,55 +807,50 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     def test_scope_candidates_with_base_ref_reports_merge_base_diff(self) -> None:
         with_base = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "scope-candidates",
-                str(self.repo),
-                "HEAD",
-                cwd=self.repo,
-            ).stdout
+            self.cli("scope-candidates", str(self.repo), "HEAD").stdout
         )
         self.assertTrue(with_base["merge_base"])
         self.assertEqual(with_base["candidates"]["merge_base_diff"], [])
 
-    # --- draft helper timestamp refresh ---
+    # --- composer timestamp refresh ---
 
-    def test_draft_helpers_restamp_occurred_at(self) -> None:
-        self.snapshot()
-        self.acquire()
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "inspect",
-            str(self.repo),
-            self.review_id,
-            "--json",
-            "example.txt",
-            cwd=self.repo,
-        )
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "template",
-            str(self.repo),
-            self.review_id,
-            "review",
-            cwd=self.repo,
-        )
+    def test_composing_restamps_occurred_at(self) -> None:
+        self.guarded_template("review")
         templated_at = json.loads(self.event.read_text())["occurred_at"]
-        run(
-            sys.executable,
-            str(SCRIPT),
-            "add-check",
-            str(self.repo),
-            self.review_id,
-            "passed",
-            "schema validation",
-            cwd=self.repo,
+        self.draft(
+            "record-check", "--check", "schema validation", "--result", "passed"
         )
         restamped_at = json.loads(self.event.read_text())["occurred_at"]
         self.assertGreater(restamped_at, templated_at)
+
+    # --- owner-reply handoff metadata ---
+
+    def test_reply_context_derives_changed_files_and_revisions(self) -> None:
+        self.prepare_review()
+        self.publish()
+        (self.repo / "example.txt").write_text("after\n")
+        run("git", "add", "example.txt", cwd=self.repo)
+        run("git", "commit", "-qm", "apply the finding", cwd=self.repo)
+        head = run("git", "rev-parse", "HEAD", cwd=self.repo).stdout.strip()
+
+        self.guarded_template("owner_reply")
+        recorded = json.loads(
+            self.draft(
+                "reply-context",
+                "--drift",
+                "Only the guarded source changed.",
+                "--guide",
+                "No behavior guide needed a change.",
+            ).stdout
+        )
+        self.assertEqual(recorded["revisions"], 1)
+
+        draft = json.loads(self.event.read_text())
+        self.assertEqual(draft["changed_files"], ["example.txt"])
+        self.assertEqual(draft["revisions"], [head])
+        self.assertEqual(
+            draft["source_drift_assessment"], "Only the guarded source changed."
+        )
 
     # --- follow-up routing ---
 
@@ -851,18 +858,7 @@ class ReviewJsonCliTest(unittest.TestCase):
         self.publish_lgtm()
 
         (self.repo / "example.txt").write_text("after\n")
-        dashboard = json.loads(
-            run(
-                sys.executable,
-                str(SCRIPT),
-                "inspect",
-                str(self.repo),
-                self.review_id,
-                "--json",
-                "example.txt",
-                cwd=self.repo,
-            ).stdout
-        )
+        dashboard = json.loads(self.inspect("--json"))
         self.assertEqual(dashboard["workflow"]["phase"], "terminal")
         self.assertTrue(dashboard["source"]["drift"])
         self.assertTrue(dashboard["source"]["approval_stale"])
@@ -870,140 +866,37 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     # --- accretion ledger and structure chaining ---
 
-    def cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        return run(sys.executable, str(SCRIPT), *args, cwd=self.repo, check=check)
-
     def start_grown_review(self, name: str) -> str:
         """Open a loop over example.txt and grow the file past the growth threshold."""
         output = self.cli("init", str(self.repo), name, "--base-ref", "HEAD").stdout
-        review_id = next(
-            line.split(": ", 1)[1]
-            for line in output.splitlines()
-            if line.startswith("review_id: ")
-        )
+        review_id = self.review_id_of(output)
         (self.repo / "example.txt").write_text("before\n" * 10)
-        self.cli("lock", "acquire", str(self.repo), review_id)
         return review_id
-
-    def publish_guarded_draft(self, review_id: str) -> None:
-        published = self.cli("publish", str(self.repo), review_id, check=False)
-        self.assertTrue(json.loads(published.stdout)["committed"], published.stdout)
-
-    def publish_initial_review(self, review_id: str, thread_count: int = 1) -> None:
-        """Open `thread_count` threads over example.txt and publish the review."""
-        self.cli("inspect", str(self.repo), review_id, "--json", "example.txt")
-        self.cli("template", str(self.repo), review_id, "review")
-        draft_path = self.repo / ".local" / "reviews" / f"{review_id}.event.json"
-        draft = json.loads(draft_path.read_text())
-        blank = draft["threads"][0]
-        draft["threads"] = []
-        for index in range(1, thread_count + 1):
-            thread = json.loads(json.dumps(blank))
-            thread.update(
-                {
-                    "id": f"T{index}",
-                    "title": "Update example" if index == 1 else f"Finding {index}",
-                    "risk": "Old result remains.",
-                    "required_behavior": "Use the new result.",
-                    "paths": ["example.txt"],
-                }
-            )
-            thread["evidence"].update(
-                {
-                    "provenance": "example.txt",
-                    "sanitized_result": "The file contains the old value.",
-                }
-            )
-            draft["threads"].append(thread)
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        write_json(draft_path, draft)
-        self.publish_guarded_draft(review_id)
-
-    def guarded_draft(self, review_id: str, kind: str) -> tuple[Path, dict[str, Any]]:
-        """Lock, guard, and template one event, returning its draft path and content."""
-        self.cli("lock", "acquire", str(self.repo), review_id)
-        self.cli("inspect", str(self.repo), review_id, "--json", "example.txt")
-        self.cli("template", str(self.repo), review_id, kind)
-        draft_path = self.repo / ".local" / "reviews" / f"{review_id}.event.json"
-        return draft_path, json.loads(draft_path.read_text())
-
-    def publish_owner_reply(self, review_id: str) -> None:
-        draft_path, draft = self.guarded_draft(review_id, "owner_reply")
-        draft["source_drift_assessment"] = "Only the guarded source changed."
-        draft["guide_synchronization"] = "No behavior guide needed a change."
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        for reply in draft["replies"]:
-            reply["message"] = "Applied the new result."
-            reply["evidence"].update(
-                {
-                    "provenance": "example.txt",
-                    "sanitized_result": "The value updated.",
-                    # Evidence may not post-date the event carrying it, and the
-                    # template stamped occurred_at when the draft was created.
-                    "observed_at": draft["occurred_at"],
-                }
-            )
-        write_json(draft_path, draft)
-        self.publish_guarded_draft(review_id)
-
-    def publish_reviewer_update(self, review_id: str, resolve: str) -> None:
-        """Resolve one thread and comment on the rest.
-
-        A reviewer_update may not resolve every open thread, which is what
-        final_review is for, so the caller must leave at least one open.
-        """
-        draft_path, draft = self.guarded_draft(review_id, "reviewer_update")
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        for decision in draft["decisions"]:
-            if decision["thread_id"] == resolve:
-                decision["action"] = "resolve"
-                decision["message"] = "Confirmed the new result independently."
-                decision["verification"] = {
-                    "independent": True,
-                    "evidence": {
-                        "basis": "source_inspection",
-                        "provenance": "example.txt",
-                        "observed_at": draft["occurred_at"],
-                        "sanitized_result": "The file carries the new value.",
-                    },
-                }
-            else:
-                decision["action"] = "comment"
-                decision["message"] = "Still verifying this one."
-        write_json(draft_path, draft)
-        self.publish_guarded_draft(review_id)
 
     def test_ledger_is_emitted_only_where_a_final_review_may_carry_it(self) -> None:
         review_id = self.start_grown_review("ledger-review")
 
-        def inspect(*flags: str) -> str:
-            return self.cli(
-                "inspect", str(self.repo), review_id, *flags, "example.txt"
-            ).stdout
-
         # awaiting_initial_review allows final_review, so the acknowledgment the
         # ledger feeds is reachable and the dashboard carries it.
-        eligible = json.loads(inspect("--json"))
+        eligible = json.loads(self.inspect("--json", review_id=review_id))
         self.assertEqual(eligible["accretion"]["flagged"], ["example.txt"])
 
         self.publish_initial_review(review_id)
 
-        # owner_response allows only owner_reply, which has no structure_debt field.
-        routine = json.loads(inspect("--json"))
+        # owner_response allows only owner_reply, which has no structure_debt.
+        routine = json.loads(self.inspect("--json", review_id=review_id))
         self.assertEqual(routine["workflow"]["phase"], "owner_response")
         self.assertIsNone(routine["accretion"])
 
-        requested = json.loads(inspect("--json", "--accretion"))
+        requested = json.loads(
+            self.inspect("--json", "--accretion", review_id=review_id)
+        )
         self.assertEqual(requested["accretion"]["flagged"], ["example.txt"])
 
         # The human form keeps showing the flagged set while the loop is active.
-        self.assertIn("accretion_flagged: example.txt", inspect())
+        self.assertIn(
+            "accretion_flagged: example.txt", self.inspect(review_id=review_id)
+        )
 
     def test_agent_view_is_the_card_alone_and_names_the_phase_obligations(
         self,
@@ -1011,17 +904,14 @@ class ReviewJsonCliTest(unittest.TestCase):
         review_id = self.start_grown_review("card-review")
         self.publish_initial_review(review_id)
 
-        card = json.loads(
-            self.cli(
-                "inspect", str(self.repo), review_id, "--agent", "example.txt"
-            ).stdout
-        )
+        card = json.loads(self.inspect("--agent", review_id=review_id))
 
         self.assertEqual(card["phase"], "owner_response")
         self.assertEqual(card["action"], "publish_owner_reply")
         self.assertEqual(card["open_threads"], ["T1"])
         self.assertIn("reply_to_every_open_thread", card["must"])
         self.assertIn("resolve_thread", card["must_not"])
+        self.assertIn("hand_edit_draft_json", card["must_not"])
         self.assertTrue(card["common_path_applies"])
         # The card replaces the dashboard rather than decorating it.
         self.assertNotIn("accretion", card)
@@ -1062,8 +952,8 @@ class ReviewJsonCliTest(unittest.TestCase):
         )
 
         # Resolve T1 and leave T2 open, which is the state routing has to tell apart.
-        self.publish_owner_reply(review_id)
-        self.publish_reviewer_update(review_id, resolve="T1")
+        self.publish_owner_reply(review_id, ["T1", "T2"])
+        self.publish_reviewer_update(review_id, resolve="T1", comment=["T2"])
 
         self.assertEqual(
             [item["id"] for item in json.loads(threads("--summary", "--open", "--json"))],
@@ -1093,64 +983,68 @@ class ReviewJsonCliTest(unittest.TestCase):
 
     def test_accretion_flags_chain_a_structure_round(self) -> None:
         base = run("git", "rev-parse", "HEAD", cwd=self.repo).stdout.strip()
-        output = self.cli(
-            "init", str(self.repo), "accretion-review", "--base-ref", "HEAD"
-        ).stdout
-        review_id = next(
-            line.split(": ", 1)[1]
-            for line in output.splitlines()
-            if line.startswith("review_id: ")
-        )
+        review_id = self.start_grown_review("accretion-review")
         reviews = self.repo / ".local" / "reviews"
         canonical = reviews / f"{review_id}.json"
         self.assertEqual(json.loads(canonical.read_text())["comparison_base"], base)
 
-        # Grow the guarded file well past the 20% threshold, then walk the guarded
-        # final_review path: the ledger must flag it and the template must prefill
-        # the acknowledgment.
-        (self.repo / "example.txt").write_text("before\n" * 10)
-        self.cli("lock", "acquire", str(self.repo), review_id)
-        dashboard = json.loads(
-            self.cli("inspect", str(self.repo), review_id, "--json", "example.txt").stdout
-        )
+        # Walk the guarded final_review path: the ledger must flag the grown file
+        # and the template must prefill the acknowledgment the composer disposes of.
+        dashboard = json.loads(self.inspect("--json", review_id=review_id))
         self.assertEqual(dashboard["accretion"]["flagged"], ["example.txt"])
-        self.cli("template", str(self.repo), review_id, "final_review")
-        draft_path = reviews / f"{review_id}.event.json"
-        draft = json.loads(draft_path.read_text())
-        self.assertEqual(draft["structure_debt"]["flagged_paths"], ["example.txt"])
-        draft["decision"] = "LGTM"
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
+        self.guarded_template("final_review", review_id)
+        draft_path = self.draft_path(review_id)
+        self.assertEqual(
+            json.loads(draft_path.read_text())["operations"][-1]["structure_debt"][
+                "flagged_paths"
+            ],
+            ["example.txt"],
+        )
 
-        # Publishing without the acknowledgment fails before the commit point.
-        unacknowledged = {
-            key: value for key, value in draft.items() if key != "structure_debt"
-        }
-        write_json(draft_path, unacknowledged)
-        refused = json.loads(
+        # The composer refuses an approval that leaves the flagged files undisposed.
+        refused = self.draft(
+            "approve", "--decision", "LGTM", review_id=review_id, check=False
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("structure-disposition", refused.stderr)
+
+        self.draft(
+            "approve",
+            "--decision",
+            "LGTM",
+            "--structure-disposition",
+            "structure_deferred",
+            "--structure-message",
+            "Real accretion; chain a structure round.",
+            review_id=review_id,
+        )
+        self.draft(
+            "record-check",
+            "--check",
+            "source inspection",
+            "--result",
+            "passed",
+            review_id=review_id,
+        )
+
+        # The publish gate stays the belt: a hand-stripped acknowledgment is
+        # refused before the commit point even though the composer wrote one.
+        composed = json.loads(draft_path.read_text())
+        stripped = json.loads(json.dumps(composed))
+        for operation in stripped["operations"]:
+            operation.pop("structure_debt", None)
+        write_json(draft_path, stripped)
+        refused_publish = json.loads(
             self.cli("publish", str(self.repo), review_id, check=False).stdout
         )
-        self.assertEqual(refused["status"], "precommit_failed")
-        self.assertIn("structure_debt", refused["detail"])
+        self.assertEqual(refused_publish["status"], "precommit_failed")
+        self.assertIn("structure_debt", refused_publish["detail"])
 
-        draft["structure_debt"].update(
-            {
-                "disposition": "structure_deferred",
-                "message": "Real accretion; chain a structure round.",
-            }
-        )
-        write_json(draft_path, draft)
-        self.assertTrue(
-            json.loads(self.cli("publish", str(self.repo), review_id).stdout)[
-                "committed"
-            ]
-        )
+        write_json(draft_path, composed)
+        self.publish_committed(review_id)
 
         # The deferred terminal recommends chaining the structure round.
-        dashboard = json.loads(
-            self.cli("inspect", str(self.repo), review_id, "--json", "example.txt").stdout
-        )
+        dashboard = json.loads(self.inspect("--json", review_id=review_id))
         self.assertEqual(dashboard["workflow"]["phase"], "terminal")
         recommended = dashboard["recommended_next_command"]
         self.assertIn("start-follow-up", recommended)
@@ -1164,11 +1058,7 @@ class ReviewJsonCliTest(unittest.TestCase):
             "--kind",
             "structure",
         ).stdout
-        successor_id = next(
-            line.split(": ", 1)[1]
-            for line in follow_up.splitlines()
-            if line.startswith("review_id: ")
-        )
+        successor_id = self.review_id_of(follow_up)
         successor = json.loads((reviews / f"{successor_id}.json").read_text())
         self.assertEqual(successor["review_kind"], "structure")
         self.assertEqual(successor["prior_review_id"], review_id)
@@ -1176,9 +1066,7 @@ class ReviewJsonCliTest(unittest.TestCase):
 
         # One structure round consumes the flag set: the prior terminal stops
         # recommending another.
-        dashboard = json.loads(
-            self.cli("inspect", str(self.repo), review_id, "--json", "example.txt").stdout
-        )
+        dashboard = json.loads(self.inspect("--json", review_id=review_id))
         self.assertEqual(dashboard["recommended_next_command"], "none")
 
 

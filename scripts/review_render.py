@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from review_notes import NOTE_MARKER
+from review_schema import operations_of
 
 RESOLUTION_LABEL_BY_DECISION = {
     "applied": "**Fixed.**",
@@ -13,6 +13,13 @@ RESOLUTION_LABEL_BY_DECISION = {
 }
 VERIFYING_EVENT_KINDS = {"reviewer_update", "final_review", "source_update"}
 TIMEOUT_OUTCOMES = {"owner_timeout", "reviewer_timeout", "initial_review_timeout"}
+# Operations that continue an existing thread's conversation, and the label each
+# contributes to a rendered entry. `thread.reply` carries its own decision instead.
+THREAD_ENTRY_LABELS = {
+    "thread.comment": "comment",
+    "thread.resolve": "resolve",
+    "thread.reopen": "reopen",
+}
 
 
 def evidence_summary(value: Any) -> str:
@@ -22,44 +29,47 @@ def evidence_summary(value: Any) -> str:
     return f"{value.get('basis', 'unknown')}: {value.get('sanitized_result', '')}"
 
 
+def entry_label(operation: dict[str, Any]) -> str:
+    """Name the act one conversation entry records."""
+    if operation.get("op") == "thread.reply":
+        return str(operation.get("decision") or "reply")
+    return THREAD_ENTRY_LABELS.get(operation.get("op"), "update")
+
+
 def thread_conversations(document: dict[str, Any]) -> list[dict[str, Any]]:
     """Project durable per-thread conversations from immutable event history."""
     conversations: dict[str, dict[str, Any]] = {}
     for event in document.get("history", []):
-        if not isinstance(event, dict):
-            continue
-        for thread in [*event.get("threads", []), *event.get("new_threads", [])]:
-            if isinstance(thread, dict):
-                conversations[thread["id"]] = {
-                    "thread": thread,
-                    "status": "open",
-                    "conversation": [],
+        for operation in operations_of(event):
+            name = operation.get("op") if isinstance(operation, dict) else None
+            if not isinstance(name, str):
+                continue
+            if name == "thread.open":
+                thread_id = operation.get("id")
+                if isinstance(thread_id, str):
+                    conversations[thread_id] = {
+                        "thread": operation,
+                        "status": "open",
+                        "conversation": [],
+                    }
+                continue
+            if name not in THREAD_ENTRY_LABELS and name != "thread.reply":
+                continue
+            thread_id = operation.get("thread_id")
+            if not isinstance(thread_id, str) or thread_id not in conversations:
+                continue
+            conversations[thread_id]["conversation"].append(
+                {
+                    "event_id": event.get("event_id"),
+                    "kind": event.get("kind"),
+                    "occurred_at": event.get("occurred_at"),
+                    "entry": operation,
                 }
-        action_groups = (
-            event.get("replies", []),
-            event.get("decisions", []),
-            event.get("resolutions", []),
-            event.get("thread_impacts", []),
-        )
-        for actions in action_groups:
-            for action in actions:
-                if not isinstance(action, dict):
-                    continue
-                thread_id = action.get("thread_id")
-                if thread_id in conversations:
-                    conversations[thread_id]["conversation"].append(
-                        {
-                            "event_id": event.get("event_id"),
-                            "kind": event.get("kind"),
-                            "occurred_at": event.get("occurred_at"),
-                            "entry": action,
-                        }
-                    )
-                    action_name = action.get("action")
-                    if event.get("kind") == "final_review" or action_name == "resolve":
-                        conversations[thread_id]["status"] = "resolved"
-                    elif action_name == "reopen":
-                        conversations[thread_id]["status"] = "open"
+            )
+            if name == "thread.resolve":
+                conversations[thread_id]["status"] = "resolved"
+            elif name == "thread.reopen":
+                conversations[thread_id]["status"] = "open"
     return [
         conversations[key]
         for key in sorted(conversations, key=lambda value: int(value[1:]))
@@ -126,10 +136,9 @@ def render_conversations(document: dict[str, Any], open_only: bool = False) -> s
         )
         for entry in item["conversation"]:
             action = entry["entry"]
-            label = action.get("decision") or action.get("action") or "resolved"
             lines.extend(
                 [
-                    f"### {entry['kind']} — {label}",
+                    f"### {entry['kind']} — {entry_label(action)}",
                     "",
                     action.get("message", ""),
                     "",
@@ -196,39 +205,23 @@ def event_date(event: dict[str, Any]) -> str:
     return occurred_at.split("T")[0] if isinstance(occurred_at, str) else ""
 
 
-def marked_notes(event: dict[str, Any]) -> list[dict[str, str]]:
-    """Lift `Note to user:` lines from every per-thread message in one event.
+def attached_notes(event: dict[str, Any]) -> list[dict[str, str]]:
+    """Collect the typed notes one transaction recorded for the user.
 
-    Threads raised in the event carry their own optional message, so notes
-    flagged at raise time surface alongside notes on replies and decisions.
+    A note is a `note.attach` record rather than a marker parsed out of prose,
+    so editing a message body can neither add nor remove one.
     """
     notes: list[dict[str, str]] = []
-    carriers: list[tuple[dict[str, Any], str]] = []
-    for actions in (
-        event.get("replies", []),
-        event.get("decisions", []),
-        event.get("resolutions", []),
-        event.get("thread_impacts", []),
-    ):
-        for action in actions:
-            if isinstance(action, dict):
-                carriers.append((action, str(action.get("thread_id", ""))))
-    for thread in [*event.get("threads", []), *event.get("new_threads", [])]:
-        if isinstance(thread, dict):
-            carriers.append((thread, str(thread.get("id", ""))))
-    for carrier, thread_id in carriers:
-        message = carrier.get("message")
-        if not isinstance(message, str):
+    for operation in operations_of(event):
+        if not isinstance(operation, dict) or operation.get("op") != "note.attach":
             continue
-        for line in message.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(NOTE_MARKER):
-                notes.append(
-                    {
-                        "text": stripped[len(NOTE_MARKER):].strip(),
-                        "source": str(thread_id or ""),
-                    }
-                )
+        target = operation.get("target")
+        notes.append(
+            {
+                "text": f"[{operation.get('tag', '')}] {operation.get('message', '')}",
+                "source": str(target.get("id", "")) if isinstance(target, dict) else "",
+            }
+        )
     return notes
 
 
@@ -236,64 +229,68 @@ def gap_records(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Collect every gap definition and resolution message by gap ID."""
     records: dict[str, dict[str, Any]] = {}
     for event in history:
-        validation = event.get("validation")
-        if isinstance(validation, dict):
-            for gap in validation.get("gaps", []):
-                if isinstance(gap, dict) and isinstance(gap.get("gap_id"), str):
-                    records[gap["gap_id"]] = {"gap": gap, "resolution": None}
-        for resolution in event.get("gap_resolutions", []):
-            if isinstance(resolution, dict):
-                gap_id = resolution.get("gap_id")
+        for operation in operations_of(event):
+            if not isinstance(operation, dict):
+                continue
+            name = operation.get("op")
+            if name == "gap.open" and isinstance(operation.get("gap_id"), str):
+                records[operation["gap_id"]] = {"gap": operation, "resolution": None}
+            elif name == "gap.resolve":
+                gap_id = operation.get("gap_id")
                 record = records.get(gap_id) if isinstance(gap_id, str) else None
                 if record is not None:
-                    record["resolution"] = resolution.get("message", "")
-                    record["disposition"] = resolution.get("disposition")
-                    record["justification"] = resolution.get("justification")
+                    record["resolution"] = operation.get("message", "")
+                    record["disposition"] = operation.get("disposition")
+                    record["justification"] = operation.get("justification")
     return records
 
 
 def summary_notes(document: dict[str, Any]) -> list[dict[str, str]]:
-    """Project the Notes-for-You items: marked notes plus structured signals.
+    """Project the Notes-for-You items: attached notes plus structured signals.
 
-    One event contributes at most one note per thread and text: an
-    agent-marked note suppresses the automatic deferred/blocked duplicate for
-    its thread, while distinct notes from the same event stay distinct.
+    One transaction contributes at most one note per target and text, so a
+    repeated `note.attach` does not read as two findings.
     """
     state = document["state"]
     notes: list[dict[str, str]] = []
     for event in document.get("history", []):
-        marked = marked_notes(event)
         seen_texts = set()
-        for note in marked:
+        for note in attached_notes(event):
             key = (note["source"], note["text"])
             if key in seen_texts:
                 continue
             seen_texts.add(key)
             notes.append(note)
-        marked_normalized = {" ".join(note["text"].split()) for note in marked}
-        for reply in event.get("replies", []):
-            if not isinstance(reply, dict):
+        for operation in operations_of(event):
+            if not isinstance(operation, dict):
                 continue
-            if reply.get("decision") != "deferred/blocked":
+            if operation.get("op") != "thread.reply":
                 continue
-            generated = (
-                f"[blocked] {reply.get('blocker', '')} Remaining work: "
-                f"{reply.get('remaining_work', '')}"
-            )
-            # The blocked-work alert always surfaces; only a marked note that
-            # is an exact normalized duplicate of it may replace it, so an
-            # unrelated note on the same thread cannot hide the blocker.
-            if " ".join(generated.split()) in marked_normalized:
+            if operation.get("decision") != "deferred/blocked":
                 continue
             notes.append(
-                {"text": generated, "source": str(reply.get("thread_id", ""))}
+                {
+                    "text": (
+                        f"[blocked] {operation.get('blocker', '')} Remaining work: "
+                        f"{operation.get('remaining_work', '')}"
+                    ),
+                    "source": str(operation.get("thread_id", "")),
+                }
             )
     for event in document.get("history", []):
-        debt = event.get("structure_debt")
-        if (
-            isinstance(debt, dict)
-            and debt.get("disposition") == "structure_deferred"
-        ):
+        for operation in operations_of(event):
+            if not isinstance(operation, dict):
+                continue
+            debt = (
+                operation.get("structure_debt")
+                if operation.get("op") == "review.approve"
+                else None
+            )
+            if (
+                not isinstance(debt, dict)
+                or debt.get("disposition") != "structure_deferred"
+            ):
+                continue
             paths = ", ".join(
                 path for path in debt.get("flagged_paths", []) if isinstance(path, str)
             )
@@ -358,9 +355,9 @@ def end_picture(item: dict[str, Any], workflow: dict[str, Any]) -> str:
         resolution_message = ""
         for entry in conversation:
             action = entry["entry"]
-            if "decision" in action:
-                last_decision = action["decision"]
-            if entry["kind"] == "final_review" or action.get("action") == "resolve":
+            if action.get("op") == "thread.reply":
+                last_decision = action.get("decision")
+            elif action.get("op") == "thread.resolve":
                 resolution_message = action.get("message", "")
         label = (
             RESOLUTION_LABEL_BY_DECISION.get(last_decision, "**Resolved.**")
@@ -371,8 +368,7 @@ def end_picture(item: dict[str, Any], workflow: dict[str, Any]) -> str:
     awaiting = workflow.get("primary_actor") or "none"
     if conversation:
         action = conversation[-1]["entry"]
-        label = action.get("decision") or action.get("action") or "update"
-        base = f"{label}: {action.get('message', '')}"
+        base = f"{entry_label(action)}: {action.get('message', '')}"
     else:
         base = "open"
     return f"{base} — in progress, awaiting {awaiting}"
@@ -384,12 +380,12 @@ def rejection_cell(item: dict[str, Any]) -> str:
     last_owner_decision = None
     for entry in item["conversation"]:
         action = entry["entry"]
-        if "decision" in action:
-            if action["decision"] != "applied":
+        if action.get("op") == "thread.reply":
+            if action.get("decision") != "applied":
                 parts.append(action.get("message", ""))
-            last_owner_decision = action["decision"]
+            last_owner_decision = action.get("decision")
         elif (
-            action.get("action") in {"comment", "reopen"}
+            action.get("op") in {"thread.comment", "thread.reopen"}
             and last_owner_decision == "applied"
         ):
             parts.append(action.get("message", ""))
@@ -507,9 +503,13 @@ def render_verification(document: dict[str, Any]) -> list[str]:
     lines = ["## Verification", ""]
     check_groups = []
     for event in history:
-        validation = event.get("validation")
-        if isinstance(validation, dict) and validation.get("performed"):
-            check_groups.append(validation["performed"])
+        performed = [
+            operation
+            for operation in operations_of(event)
+            if isinstance(operation, dict) and operation.get("op") == "check.record"
+        ]
+        if performed:
+            check_groups.append(performed)
     if check_groups:
         # The latest validating event carries the final verification state;
         # earlier rounds roll up into one line, except failures, which always

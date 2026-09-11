@@ -49,7 +49,7 @@ class ReviewPublishFaultTest(unittest.TestCase):
             "unstaged_sha256": "0" * 64,
             "untracked": [],
         }
-        event["decision"] = "LGTM"
+        event["operations"][0]["decision"] = "LGTM"
         self.event.write_text(json.dumps(event, indent=2) + "\n")
         self.args = Namespace(
             review=str(self.review),

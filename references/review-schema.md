@@ -12,23 +12,20 @@ act with its obligations, the composer refuses bad input at entry, and
 rejected and the reason is unclear, when auditing recorded history, or when
 writing a tool against the format.
 
-**Status.** This describes the operation format, in which structural acts are
-recorded as typed operations. The shipped scripts still read the earlier
-compound format, whose transactions carried one bespoke field set per event
-kind. Parser, projection, and calendar revision move to the operation format
-together, behind a revision boundary that refuses a document it cannot read
-in full.
+**Status.** The shipped parser, projection, renderer, and composer read and
+write this format. A draft is opened by `template` and filled only by `draft`
+subcommands; nothing in the agent path shapes this JSON by hand.
 
 ## Document envelope
 
-The skill version is `0.9.1`. Persisted compatibility uses an independent
+The skill version is `0.10.0`. Persisted compatibility uses an independent
 calendar revision:
 
 ```json
 {
   "format": "local-pr-loop",
-  "format_revision": "2026-08-21.1",
-  "created_by": {"version": "0.9.1"},
+  "format_revision": "2026-09-11.1",
+  "created_by": {"version": "0.10.0"},
   "created_at": "2026-08-15T01:00:00+00:00",
   "review_id": "k7m3q9wx",
   "prior_review_id": null,
@@ -60,10 +57,6 @@ calendar revision:
 recorded by `init --base-ref`. `review_id` and `prior_review_id` are
 eight-character review IDs, and a follow-up never names itself as its prior
 review. `name` is lowercase words joined by single hyphens.
-
-The revision shown above is the pre-operation one. Adopting the operation
-format replaces it with a new calendar revision, because the storage contract
-changes.
 
 ### Frozen revisions
 
@@ -304,7 +297,7 @@ open and blocks LGTM.
 
 `note.attach` records something the user must see. It replaces the
 `Note to user:` prose marker that the old format buried inside messages, so a
-note is now a typed record rather than a parsed line.
+note is a typed record rather than a parsed line.
 
 ```json
 {
@@ -428,8 +421,8 @@ transaction opens or acts on.
 `thread.open`.
 
 **`source_update`** — replaces the guarded basis and routes to the owner. One
-`source.replace`; `thread.comment` and `thread.reopen` as impacts, naming any
-one thread at most once; `thread.open` for findings the new basis raises.
+`source.replace`; `thread.comment` and `thread.reopen` as impacts;
+`thread.open` for findings the new basis raises.
 
 **`owner_reply`** — exactly one `thread.reply` for every open thread, and none
 for a thread that is not open. No `thread.open`, `thread.resolve`, or
@@ -478,6 +471,11 @@ sequential and gap-free across the whole document, assigned in the order their
 opening operations appear. A `thread.open` or `gap.open` carrying anything but
 the next expected identifier is rejected, so identifiers stay stable for the
 life of the loop.
+
+**One act per thread.** A transaction may open, reply to, comment on, resolve,
+or reopen a given thread once. A handoff that acted twice would record two
+answers to the same finding with nothing to say which one it meant, so the
+second act is rejected rather than allowed to win.
 
 **Closed field sets.** The document, every transaction, every operation, and
 every nested record reject unknown fields. Reading canonical history also

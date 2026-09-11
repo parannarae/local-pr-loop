@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import review_scope
+from review_schema import operations_of
 
 # A file this many raised threads name is accretion-flagged.
 THREAD_FLAG_THRESHOLD = 5
@@ -32,12 +33,10 @@ def thread_counts(history: Any) -> dict[str, int]:
     if not isinstance(history, list):
         return counts
     for event in history:
-        if not isinstance(event, dict):
-            continue
-        for thread in [*event.get("threads", []), *event.get("new_threads", [])]:
-            if not isinstance(thread, dict):
+        for operation in operations_of(event):
+            if not isinstance(operation, dict) or operation.get("op") != "thread.open":
                 continue
-            paths = thread.get("paths")
+            paths = operation.get("paths")
             if not isinstance(paths, list):
                 continue
             for path in paths:
@@ -206,6 +205,17 @@ def flagged_paths(
     return ledger(repository_root, document, scope, exclusions)["flagged"]
 
 
+def recorded_structure_debt(event: Any) -> dict[str, Any] | None:
+    """Return the structure_debt one transaction's `review.approve` carries."""
+
+    for operation in operations_of(event):
+        if isinstance(operation, dict) and operation.get("op") == "review.approve":
+            debt = operation.get("structure_debt")
+            if debt is not None:
+                return debt
+    return None
+
+
 def acknowledgment_error(
     document: dict[str, Any], event: dict[str, Any], flagged: list[str]
 ) -> str | None:
@@ -218,10 +228,10 @@ def acknowledgment_error(
 
     if event.get("kind") != "final_review":
         return None
-    debt = event.get("structure_debt")
+    debt = recorded_structure_debt(event)
     if document.get("review_kind") == "structure":
         return (
-            "a structure round records no structure_debt; remove the field"
+            "a structure round records no structure_debt; remove it from review.approve"
             if debt is not None
             else None
         )
@@ -251,7 +261,7 @@ def deferred_structure_debt(document: dict[str, Any]) -> dict[str, Any] | None:
         return None
     for event in reversed(history):
         if isinstance(event, dict) and event.get("kind") == "final_review":
-            debt = event.get("structure_debt")
+            debt = recorded_structure_debt(event)
             if (
                 isinstance(debt, dict)
                 and debt.get("disposition") == "structure_deferred"

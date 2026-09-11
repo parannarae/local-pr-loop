@@ -116,8 +116,8 @@ its link target.
 Use the same repository, scope, exclusions, and additional inputs for a
 publication. If the reviewed source basis changes after review begins, the
 reviewer publishes `source_update` with the replacement snapshot before owner
-work continues. The event may use an empty `thread_impacts` list and may add
-sequential `new_threads` discovered in the replacement source.
+work continues. Comment on or reopen only the threads the replacement actually
+affects, and open a new thread for each finding the replacement source raises.
 
 ## Lock Before Mutation
 
@@ -134,44 +134,110 @@ The second inspection creates an opaque guard containing the canonical and
 source identities. A reviewer may analyze first, but must acquire and inspect
 before `template`.
 
-## Prepare and Validate an Event
+## Open and Compose a Transaction
 
 ```bash
 python3 "$SKILL_DIR/scripts/review_cli.py" template \
   REPO REVIEW_ID owner_reply
-
-python3 "$SKILL_DIR/scripts/review_cli.py" validate-event REPO REVIEW_ID
 ```
 
-The template prepopulates guarded snapshots and every role-required thread/gap
-entry. Populate only its remaining blanks. Use:
+`template` opens the draft under the lease. It stamps the envelope, fills in the
+guarded snapshots, and prefills the operation skeletons whose set is already
+known: one reply per open thread, one resolution per open gap, and the
+`structure_debt` acknowledgment a flagged `final_review` owes. A review's
+findings are not such a set, so a `review` draft opens with no operations.
+
+Never edit the draft. Every act is one `draft` subcommand, which refuses bad
+input as it is typed and names the argument at fault:
+
+```bash
+python3 "$SKILL_DIR/scripts/review_cli.py" draft REPO REVIEW_ID open-thread \
+  --title "Reject malformed input" \
+  --risk "Malformed input reaches persistence." \
+  --required-behavior "Reject before persistence." \
+  --paths src/service/ingest.py \
+  --basis source_inspection \
+  --provenance src/service/ingest.py \
+  --sanitized-result "The guard runs after the write."
+
+python3 "$SKILL_DIR/scripts/review_cli.py" draft REPO REVIEW_ID record-check \
+  --check "focused tests" --result passed
+
+python3 "$SKILL_DIR/scripts/review_cli.py" draft REPO REVIEW_ID open-gap \
+  --check "live probe" --reason "service unavailable" --material
+
+python3 "$SKILL_DIR/scripts/review_cli.py" draft REPO REVIEW_ID note T2 \
+  --tag decision --message "bump deferred to the release commit"
+```
+
+The subcommands are `open-thread`, `reply`, `comment`, `resolve`, `reopen`,
+`open-gap`, `resolve-gap`, `record-check`, `note`, `replace-source`, `approve`,
+and `reply-context`. Each one's `--help` states its own arguments. The long
+prose bodies also have file forms — `--message-file`, `--sanitized-result-file`,
+and `reply-context`'s `--drift-file` and `--guide-file` — each reading from a
+path, or from stdin for `-`, so a long reply costs its tokens once.
+
+`note` attaches to a thread the draft already opens or acts on, so compose that
+act first. Use it only for design-shifting changes, never mechanical fixes.
+
+Read the threads a reply answers before composing it:
+
+```bash
+python3 "$SKILL_DIR/scripts/review_cli.py" threads REPO REVIEW_ID --json
+```
 
 `threads` returns full bodies by default, which is what drafting a reply needs.
 Add `--summary` for identity, priority, status, title, and paths alone, and
 `--open` to leave out threads that are already resolved; that pair is the
 routing read.
 
+Ask the draft what it still owes, then check the file as a whole:
+
 ```bash
-python3 "$SKILL_DIR/scripts/review_cli.py" threads REPO REVIEW_ID --json
-python3 "$SKILL_DIR/scripts/review_cli.py" add-check \
-  REPO REVIEW_ID passed "focused tests"
-python3 "$SKILL_DIR/scripts/review_cli.py" add-gap \
-  REPO REVIEW_ID "live probe" "service unavailable" --material
-python3 "$SKILL_DIR/scripts/review_cli.py" add-note \
-  REPO REVIEW_ID T2 "bump deferred to the release commit" --tag decision
+python3 "$SKILL_DIR/scripts/review_cli.py" draft REPO REVIEW_ID show
+python3 "$SKILL_DIR/scripts/review_cli.py" validate-event REPO REVIEW_ID
 ```
 
-`add-note` appends a machine-formatted user-facing note to the draft's reply,
-decision, resolution, or thread impact for the given thread, or to the thread
-itself when it is being raised in this draft; use it only for design-shifting
-changes, never mechanical fixes.
+`draft show` names the operations composed so far and lists what remains
+outstanding. `validate-event` is the belt rather than an authoring step: the
+composer cannot write an invalid operation, but a file on disk can still be
+corrupted between commands.
 
-Every draft helper restamps the draft's `occurred_at` when it writes, so
-evidence recorded after templating never postdates its event. Never hand-edit
-the timestamp.
+Every composer call restamps the draft's `occurred_at`, so evidence recorded
+after templating never postdates its transaction. Never hand-edit the timestamp.
 
-Use the event kind and fields defined in
-[review-schema.md](review-schema.md).
+## Correct a Draft
+
+Composing an act a second time corrects it in place. Taking one back is `drop`,
+which names the operation exactly as `show` prints it:
+
+```bash
+python3 "$SKILL_DIR/scripts/review_cli.py" draft REPO REVIEW_ID drop \
+  gap.resolve G1
+```
+
+This is how a prefilled resolution leaves a draft when its gap stays open. A gap
+that is still material is not resolved at all, so the skeleton `template` wrote
+for it can be filled only dishonestly; without `drop` the whole draft would have
+to be aborted over one obligation that was never owed.
+
+Removal reaches further than the operation named. A note goes with the thread act
+it annotates, because a transaction may not carry a note for a thread it no
+longer touches, and the `T<N>` and `G<N>` the draft opens are renumbered so the
+sequence keeps no hole.
+
+The same rule drops an operation without being asked: recording a check as passed
+after recording it as failed removes the material gap the failure opened, which
+would otherwise sit in the transaction contradicting it. Every acknowledgment
+carries the count as `dropped`, so nothing leaves the draft silently.
+
+`review.approve` and `source.replace` may not be dropped. They carry what
+templating derived from the guard — the accretion ledger's flagged set and the
+guarded snapshot — which composing them again would not restore, so correct them
+with `approve` and `replace-source` instead.
+
+The operation vocabulary and each kind's obligations are in
+[review-schema.md](review-schema.md); routine authoring never needs to open it.
 
 ## Guarded Publication
 

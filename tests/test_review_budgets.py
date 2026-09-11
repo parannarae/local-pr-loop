@@ -8,10 +8,15 @@ every stage of one loop — including after most threads have resolved, which is
 where a view that tracks history rather than outstanding work gives itself away.
 
 Absolute ceilings are given only to views whose size is bounded by design.
-`threads --json` and canonical JSON grow with review history without limit, so a
-fixed ceiling on them would encode the fixture rather than a contract; the
-compact-to-full ratio assertions below carry that part instead, and they keep
-holding as the fixture grows.
+`threads --json`, `draft show`, and canonical JSON grow with the review's work
+without a fixed limit, so a ceiling on them would encode the fixture rather than
+a contract; the compact-to-full ratio and non-growth assertions below carry that
+part instead, and they keep holding as the fixture grows.
+
+Composer acknowledgments are bounded by their own shape: each one carries an
+operation name, an outstanding count, a status, a count of what the act dropped,
+and at most one identifier. The ceiling is what forbids an acknowledgment from
+growing into a draft path or an echo of the operation it recorded.
 """
 
 from __future__ import annotations
@@ -24,7 +29,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
 
 ROOT = Path(__file__).parents[1]
 CLI = ROOT / "scripts" / "review_cli.py"
@@ -36,11 +40,22 @@ GUARDED_FILE_COUNT = 60
 # plan calls for and the first pair cannot show: durable history has accumulated and
 # most threads are settled, so a view that grows with history rather than with open
 # work is caught here and nowhere else.
+INITIAL = "awaiting_initial_review"
 FRESH_OWNER = "owner_response"
 FRESH_REVIEWER = "reviewer_verification"
 SETTLED_OWNER = "owner_response, 2 resolved"
 SETTLED_REVIEWER = "reviewer_verification, 2 resolved"
 TERMINAL = "terminal"
+
+# The evidence every composed act carries, as the typed flags the composer takes.
+EVIDENCE = (
+    "--basis",
+    "source_inspection",
+    "--provenance",
+    "src/module_00.py",
+    "--sanitized-result",
+    "The guarded path carries the declared behavior.",
+)
 
 # Ceiling, measured value, and why the view is bounded. Raise one only with a
 # measurement and a reason; a rise with neither is the regression this catches.
@@ -78,6 +93,15 @@ BUDGET_BY_CASE = {
     f"inspect --json ({FRESH_REVIEWER})": (20_000, 15_434),
     f"inspect --json ({SETTLED_REVIEWER})": (20_000, 15_414),
     f"inspect --json ({TERMINAL})": (2_000, 1_339),
+    # One line of fixed fields, whatever the operation recorded: an operation
+    # name, an outstanding count, a status, a count of the operations the act
+    # dropped, and at most one identifier. The second number here is that shape's
+    # own length rather than a reading off a run, because the shape is what bounds
+    # it; the ceiling is roughly twice it, so an acknowledgment that started
+    # carrying a draft path or an echo of its operation fails here.
+    "draft open-thread (acknowledgment)": (160, 92),
+    "draft reply (acknowledgment)": (160, 92),
+    "draft record-check (acknowledgment)": (160, 92),
 }
 
 # A compact view must stay a small fraction of the full one it replaces. Unlike an
@@ -116,9 +140,9 @@ class CompactViewBudgetTest(unittest.TestCase):
         cls.directory = tempfile.mkdtemp()
         cls.repo = Path(cls.directory) / "fixture"
         cls.repo.mkdir(parents=True)
+        cls.measured = {}
         cls.build_repository()
         cls.review_id = cls.open_loop()
-        cls.measured = {}
         cls.walk_loop()
 
     @classmethod
@@ -167,122 +191,123 @@ class CompactViewBudgetTest(unittest.TestCase):
         return cls.cli("threads", str(cls.repo), cls.review_id, *flags)
 
     @classmethod
-    def guarded_draft(cls, kind: str) -> tuple[Path, dict[str, Any]]:
+    def draft(cls, *arguments: str) -> str:
+        return cls.cli("draft", str(cls.repo), cls.review_id, *arguments)
+
+    @classmethod
+    def guarded_draft(cls, kind: str, stage: str) -> None:
+        """Lock, guard, and template one transaction, recording what it still owes."""
         cls.cli("lock", "acquire", str(cls.repo), cls.review_id)
         cls.inspect("--json")
         cls.cli("template", str(cls.repo), cls.review_id, kind)
-        path = cls.repo / ".local" / "reviews" / f"{cls.review_id}.event.json"
-        return path, json.loads(path.read_text())
+        cls.measured[f"draft show ({stage})"] = len(cls.draft("show"))
 
     @classmethod
-    def publish(cls, path: Path, draft: dict[str, Any]) -> None:
-        path.write_text(json.dumps(draft, indent=2) + "\n")
+    def publish(cls) -> None:
         result = json.loads(cls.cli("publish", str(cls.repo), cls.review_id))
         if not result["committed"]:
             raise AssertionError(f"fixture publish failed: {result}")
 
     @classmethod
-    def evidence(cls, occurred_at: str) -> dict[str, Any]:
-        return {
-            "basis": "source_inspection",
-            "provenance": "src/module_00.py",
-            "observed_at": occurred_at,
-            "sanitized_result": "The guarded path carries the declared behavior.",
-        }
+    def record_check(cls) -> str:
+        return cls.draft(
+            "record-check", "--check", "source inspection", "--result", "passed"
+        )
 
     @classmethod
     def walk_loop(cls) -> None:
         """Publish review, owner_reply, reviewer_update, and final_review in turn."""
-        path, draft = cls.guarded_draft("review")
-        blank = draft["threads"][0]
-        draft["threads"] = []
+        cls.guarded_draft("review", INITIAL)
         for index in range(1, 4):
-            thread = json.loads(json.dumps(blank))
-            thread.update(
-                {
-                    "id": f"T{index}",
-                    "title": f"Finding {index}",
-                    "risk": "The guarded path returns an undocumented result.",
-                    "required_behavior": "Return the documented result.",
-                    "paths": [f"src/module_{index:02d}.py"],
-                }
+            acknowledgment = cls.draft(
+                "open-thread",
+                "--title",
+                f"Finding {index}",
+                "--risk",
+                "The guarded path returns an undocumented result.",
+                "--required-behavior",
+                "Return the documented result.",
+                "--paths",
+                f"src/module_{index:02d}.py",
+                *EVIDENCE,
             )
-            thread["evidence"] = cls.evidence(draft["occurred_at"])
-            draft["threads"].append(thread)
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        cls.publish(path, draft)
+            if index == 1:
+                cls.measured["draft open-thread (acknowledgment)"] = len(acknowledgment)
+        cls.measured["draft record-check (acknowledgment)"] = len(cls.record_check())
+        cls.publish()
 
         cls.record(FRESH_OWNER)
 
-        path, draft = cls.guarded_draft("owner_reply")
-        draft["source_drift_assessment"] = "Only the guarded source changed."
-        draft["guide_synchronization"] = "No behavior guide needed a change."
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        for reply in draft["replies"]:
-            reply["message"] = "Applied the documented behavior."
-            reply["evidence"] = cls.evidence(draft["occurred_at"])
-        cls.publish(path, draft)
+        cls.guarded_draft("owner_reply", FRESH_OWNER)
+        cls.reply_to(["T1", "T2", "T3"], measure=True)
+        cls.record_check()
+        cls.publish()
 
         cls.record(FRESH_REVIEWER)
 
         # Resolve two of the three; a reviewer_update must leave one open, so this is
         # the most resolved history the loop can hold before its terminal.
-        path, draft = cls.guarded_draft("reviewer_update")
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        for decision in draft["decisions"]:
-            decision["message"] = "Checked against the guarded tree."
-            if decision["thread_id"] in {"T1", "T2"}:
-                decision["action"] = "resolve"
-                decision["verification"] = {
-                    "independent": True,
-                    "evidence": cls.evidence(draft["occurred_at"]),
-                }
-            else:
-                decision["action"] = "comment"
-        cls.publish(path, draft)
+        cls.guarded_draft("reviewer_update", FRESH_REVIEWER)
+        cls.draft("comment", "T3", "--message", "Still verifying this one.")
+        for thread_id in ("T1", "T2"):
+            cls.draft(
+                "resolve",
+                thread_id,
+                "--message",
+                "Checked against the guarded tree.",
+                "--verified",
+                *EVIDENCE,
+            )
+        cls.record_check()
+        cls.publish()
 
         cls.record(SETTLED_OWNER)
 
-        path, draft = cls.guarded_draft("owner_reply")
-        draft["source_drift_assessment"] = "Only the guarded source changed."
-        draft["guide_synchronization"] = "No behavior guide needed a change."
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        for reply in draft["replies"]:
-            reply["message"] = "Applied the remaining documented behavior."
-            reply["evidence"] = cls.evidence(draft["occurred_at"])
-        cls.publish(path, draft)
+        cls.guarded_draft("owner_reply", SETTLED_OWNER)
+        cls.reply_to(["T3"])
+        cls.record_check()
+        cls.publish()
 
         cls.record(SETTLED_REVIEWER)
 
-        path, draft = cls.guarded_draft("final_review")
-        draft["decision"] = "LGTM"
-        draft["validation"]["performed"] = [
-            {"check": "source inspection", "result": "passed"}
-        ]
-        for resolution in draft["resolutions"]:
-            resolution["message"] = "Verified against the guarded tree."
-            resolution["verification"] = {
-                "independent": True,
-                "evidence": cls.evidence(draft["occurred_at"]),
-            }
-        draft["structure_debt"].update(
-            {
-                "disposition": "structure_deferred",
-                "message": "Real accretion; a structure round should follow.",
-            }
+        cls.guarded_draft("final_review", SETTLED_REVIEWER)
+        cls.draft("resolve", "T3", "--message", "Verified against the guarded tree.")
+        cls.draft(
+            "approve",
+            "--decision",
+            "LGTM",
+            "--structure-disposition",
+            "structure_deferred",
+            "--structure-message",
+            "Real accretion; a structure round should follow.",
         )
-        cls.publish(path, draft)
+        cls.record_check()
+        cls.publish()
 
         cls.measured[f"inspect --agent ({TERMINAL})"] = len(cls.inspect("--agent"))
         cls.measured[f"inspect --json ({TERMINAL})"] = len(cls.inspect("--json"))
+
+    @classmethod
+    def reply_to(cls, thread_ids: list[str], *, measure: bool = False) -> None:
+        cls.draft(
+            "reply-context",
+            "--drift",
+            "Only the guarded source changed.",
+            "--guide",
+            "No behavior guide needed a change.",
+        )
+        for thread_id in thread_ids:
+            acknowledgment = cls.draft(
+                "reply",
+                thread_id,
+                "--decision",
+                "applied",
+                "--message",
+                "Applied the documented behavior.",
+                *EVIDENCE,
+            )
+            if measure and thread_id == thread_ids[0]:
+                cls.measured["draft reply (acknowledgment)"] = len(acknowledgment)
 
     @classmethod
     def record(cls, stage: str) -> None:
@@ -354,6 +379,15 @@ class CompactViewBudgetTest(unittest.TestCase):
                         f"{view} grew as history accumulated, so it is tracking the "
                         "conversation rather than the work outstanding",
                     )
+
+    def test_draft_show_reports_outstanding_work_rather_than_history(self) -> None:
+        # Both stages template the same kind, so the only difference is how many
+        # obligations are left: three replies owed against one.
+        self.assertLess(
+            self.measured[f"draft show ({SETTLED_OWNER})"],
+            self.measured[f"draft show ({FRESH_OWNER})"],
+            "draft show is tracking the conversation rather than what the draft owes",
+        )
 
     def test_each_compact_view_stays_a_small_fraction_of_the_full_one(self) -> None:
         for (compact, full), fraction in MAX_COMPACT_FRACTION.items():

@@ -40,9 +40,9 @@ LOCK_STEPS = ("acquire_lock", "inspect_under_lease_with_scope")
 # the kind itself is already named by the card's action and next command.
 AUTHORING_STEPS = (
     "template_event",
-    "populate_draft_blanks",
+    "compose_operations",
     "record_validation_evidence",
-    "validate_event",
+    "review_draft",
     "inspect_before_publish",
     "publish",
     "read_publication_result",
@@ -80,6 +80,7 @@ OBLIGATIONS_BY_ACTION: dict[str, dict[str, tuple[str, ...]]] = {
         "must_not": (
             "transcribe_another_agents_findings",
             "publish_lgtm_with_material_validation_gap",
+            "hand_edit_draft_json",
         ),
     },
     "publish_owner_reply": {
@@ -87,7 +88,7 @@ OBLIGATIONS_BY_ACTION: dict[str, dict[str, tuple[str, ...]]] = {
             "reply_to_every_open_thread",
             "state_decision_on_every_reply",
             "record_evidence_for_declined_work",
-            "flag_design_shift_with_add_note",
+            "flag_design_shift_with_a_note",
             "await_handoff_if_not_primary_actor",
         ),
         "must_not": (
@@ -95,6 +96,7 @@ OBLIGATIONS_BY_ACTION: dict[str, dict[str, tuple[str, ...]]] = {
             "reopen_thread",
             "open_new_thread",
             "hand_edit_canonical_json",
+            "hand_edit_draft_json",
         ),
     },
     "publish_reviewer_update": {
@@ -102,13 +104,14 @@ OBLIGATIONS_BY_ACTION: dict[str, dict[str, tuple[str, ...]]] = {
             "decide_every_open_thread",
             "verify_declined_thread_independently_before_resolving",
             "resolve_every_open_thread_in_final_review",
-            "flag_design_shift_with_add_note",
+            "flag_design_shift_with_a_note",
             "await_handoff_if_not_primary_actor",
         ),
         "must_not": (
             "transcribe_another_agents_findings",
             "publish_lgtm_with_open_thread",
             "publish_lgtm_with_material_validation_gap",
+            "hand_edit_draft_json",
         ),
     },
     "publish_source_update": {
@@ -117,7 +120,10 @@ OBLIGATIONS_BY_ACTION: dict[str, dict[str, tuple[str, ...]]] = {
             "open_new_thread_for_each_finding_in_the_replacement_source",
             "await_handoff_if_not_primary_actor",
         ),
-        "must_not": ("resolve_thread_on_source_change_alone",),
+        "must_not": (
+            "resolve_thread_on_source_change_alone",
+            "hand_edit_draft_json",
+        ),
     },
     "publish_draft": {
         "must": (
@@ -190,11 +196,11 @@ SENTENCE_BY_STEP = {
         "inspect again under the lease with the same scope, which writes the guard"
     ),
     "template_event": "create the draft with template",
-    "populate_draft_blanks": "fill in the draft's semantic blanks",
+    "compose_operations": "compose each act with the draft subcommands",
     "record_validation_evidence": (
-        "record validation with add-check, add-gap, and evidence-template"
+        "record validation with draft record-check and draft open-gap"
     ),
-    "validate_event": "run validate-event and fix what it reports",
+    "review_draft": "run draft show and compose away what it lists as outstanding",
     "inspect_before_publish": "inspect once more",
     "publish": "publish",
     "read_publication_result": "read the publication result by committed first",
@@ -222,8 +228,8 @@ SENTENCE_BY_MUST = {
         "give every reply a decision of applied, declined, or deferred/blocked"
     ),
     "record_evidence_for_declined_work": "record evidence for work you decline",
-    "flag_design_shift_with_add_note": (
-        "flag a design, contract, or business-logic shift with add-note"
+    "flag_design_shift_with_a_note": (
+        "flag a design, contract, or business-logic shift with draft note"
     ),
     "decide_every_open_thread": "decide every open thread",
     "verify_declined_thread_independently_before_resolving": (
@@ -243,7 +249,7 @@ SENTENCE_BY_MUST = {
         "read the publication result by committed first"
     ),
     "acknowledge_structure_debt": (
-        "carry the structure_debt acknowledgment the final_review template prefills"
+        "dispose of the flagged files with draft approve --structure-disposition"
     ),
     "template_again_rather_than_repairing_the_rejected_draft": (
         "template the event again rather than repairing the rejected draft"
@@ -272,6 +278,7 @@ SENTENCE_BY_MUST_NOT = {
     "reopen_thread": "reopen a thread",
     "open_new_thread": "open a new thread",
     "hand_edit_canonical_json": "hand-edit canonical JSON",
+    "hand_edit_draft_json": "hand-edit the draft JSON instead of composing it",
     "resolve_thread_on_source_change_alone": (
         "resolve a thread because the source changed"
     ),

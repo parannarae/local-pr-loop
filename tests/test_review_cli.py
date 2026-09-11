@@ -13,6 +13,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import review_cli
+import review_compose
 import review_schema
 
 
@@ -33,12 +34,9 @@ class ReviewCliTest(unittest.TestCase):
             set(command_action.choices),
             {
                 "abort-draft",
-                "add-check",
-                "add-gap",
-                "add-note",
                 "await-handoff",
                 "discover",
-                "evidence-template",
+                "draft",
                 "init",
                 "inspect",
                 "lock",
@@ -56,6 +54,38 @@ class ReviewCliTest(unittest.TestCase):
                 "validate-event",
                 "wait",
             },
+        )
+
+    def test_every_operation_the_format_allows_has_a_typed_constructor(self) -> None:
+        # A vocabulary entry with no constructor is one an agent would have to
+        # hand-shape, which is the authoring path the composer exists to remove.
+        # `timeout.declare` is the sole exception: template stamps it from the
+        # handoff clock, so no agent ever composes one.
+        constructed = {
+            value.OP
+            for value in vars(review_compose).values()
+            if isinstance(value, type)
+            and issubclass(value, review_compose.Constructor)
+            and value.OP
+        }
+        self.assertEqual(
+            constructed,
+            set(review_schema.OPERATION_FIELDS) - {"timeout.declare"},
+        )
+
+    def test_the_composer_exposes_a_subcommand_for_every_composer(self) -> None:
+        # Beyond the composers, the draft command model is `drop`, which takes an
+        # act back, `reply-context`, which records what an owner reply derives
+        # from the repository, and `show`, which reports what the draft owes.
+        parser = review_compose.build_parser()
+        subcommands = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        self.assertEqual(
+            set(subcommands.choices),
+            set(review_compose.COMPOSERS) | {"drop", "reply-context", "show"},
         )
 
     def test_package_version_references_are_consistent(self) -> None:
