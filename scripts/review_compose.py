@@ -851,8 +851,9 @@ def compose_record_check(
         result=args.result,
         evidence=build_evidence(args, draft.stamped),
     )
-    if not failed or not reason:
+    if not failed:
         return [check.as_operation()], None
+    # The guards above make a failed result and a gap reason inseparable.
     gap = gap_open_for(draft, args.check, reason, True)
     return [check.as_operation(), gap.as_operation()], gap.gap_id
 

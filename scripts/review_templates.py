@@ -72,10 +72,12 @@ def event_template(kind: str) -> dict[str, Any]:
     elif kind == "final_review":
         base["source_snapshot"] = blank_snapshot()
         operations = [{"op": "review.approve", "decision": ""}]
-    else:
+    elif kind in TIMEOUT_DURATION_BY_KIND:
         operations = [
             {"op": "timeout.declare", "started_at": "", "deadline": "", "reason": ""}
         ]
+    else:
+        raise ValueError(f"no transaction of kind {kind!r} is defined")
     base["operations"] = operations
     base["occurred_at"] = datetime.now(timezone.utc).isoformat()
     return base

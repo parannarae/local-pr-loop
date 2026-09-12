@@ -460,8 +460,8 @@ def project_history(
     return errors, state, threads
 
 
-def structure_debt_operations(history: Any) -> list[dict[str, Any]]:
-    """Return every recorded `review.approve` acknowledgment in this history."""
+def structure_debt_acknowledgments(history: Any) -> list[dict[str, Any]]:
+    """Return the `structure_debt` payload of every recorded `review.approve`."""
 
     found: list[dict[str, Any]] = []
     if not isinstance(history, list):
@@ -530,7 +530,7 @@ def validate_document(document: Any) -> list[str]:
     if document.get("review_kind") == "structure":
         require(
             errors,
-            not structure_debt_operations(document.get("history")),
+            not structure_debt_acknowledgments(document.get("history")),
             "a structure round records no structure_debt; the acknowledgment belongs "
             "to the correctness loop that flagged the files",
         )

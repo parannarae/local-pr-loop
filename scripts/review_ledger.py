@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import review_scope
-from review_schema import operations_of
+from review_schema import operations_of, unsupported_revision_error
 
 # A file this many raised threads name is accretion-flagged.
 THREAD_FLAG_THRESHOLD = 5
@@ -284,11 +284,17 @@ def has_structure_successor(reviews_directory: Path, review_id: str) -> bool:
             continue
         try:
             sibling = json.loads(canonical.read_text())
+        # An unreadable sibling cannot be shown to be the successor, so it counts
+        # as absent and the terminal keeps recommending the round.
         except (OSError, ValueError):
             continue
+        # A sibling written against another format revision carries a different
+        # field set, so its `review_kind` and `prior_review_id` are not this
+        # revision's fields to read.
+        if unsupported_revision_error(sibling) is not None:
+            continue
         if (
-            isinstance(sibling, dict)
-            and sibling.get("prior_review_id") == review_id
+            sibling.get("prior_review_id") == review_id
             and sibling.get("review_kind") == "structure"
         ):
             return True

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import review_scope
+from review_contract import TIMEOUT_DURATION_BY_KIND
 from review_io import (
     load_object,
     require_secure_regular,
@@ -44,7 +45,10 @@ def verify_lease(args: argparse.Namespace) -> dict[str, Any]:
         check=False,
     )
     if completed.returncode != 0:
-        raise ValueError("local lease does not own the active review lock")
+        raise ValueError(
+            "local lease does not own the active review lock: "
+            + completed.stderr.strip()
+        )
     return lease
 
 
@@ -96,8 +100,8 @@ def release_lease(args: argparse.Namespace) -> int:
         check=False,
     )
     if completed.returncode != 0:
-        print("review lock release failed", file=sys.stderr)
-        return 1
+        print(f"review lock release failed: {completed.stderr.strip()}", file=sys.stderr)
+        return completed.returncode
     Path(args.lease).unlink()
     Path(args.guard).unlink(missing_ok=True)
     print(json.dumps({"status": "released"}, sort_keys=True))
@@ -115,6 +119,10 @@ def candidate_declared_paths(canonical: Path, guard: Path) -> list[str] | None:
         try:
             stored = load_object(guard).get("scope")
             return review_scope.declared_paths(stored)
+        # A guard written by an unsupported revision, truncated by a crash mid-write,
+        # or left unreadable falls back to history below rather than failing this
+        # scan, so one damaged loop cannot block every later inspection. A loop that
+        # is guarded but has published nothing then declares nothing here.
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
     try:
@@ -215,8 +223,8 @@ def refresh_guard(args: argparse.Namespace) -> int:
         check=False,
     )
     if snapshot.returncode != 0:
-        print("source snapshot failed", file=sys.stderr)
-        return 1
+        print(f"source snapshot failed: {snapshot.stderr.strip()}", file=sys.stderr)
+        return snapshot.returncode
     snapshot_value = json.loads(snapshot.stdout)
     guard = {
         "review_sha256": hashlib.sha256(Path(args.review).read_bytes()).hexdigest(),
@@ -267,18 +275,25 @@ def poll_for_change(
     latest = document["state"].get("latest_event")
     handoff_deadline: float | None = None
     started_text: str | None = None
-    seconds = 7200
+    timeout_kind = ""
     if workflow["phase"] == "awaiting_initial_review":
         # Anchored on document creation: this handoff starts before any event.
+        timeout_kind = "initial_review_timeout"
         started_text = document.get("created_at")
     elif workflow["phase"] in {"owner_response", "reviewer_verification"} and isinstance(
         latest, dict
     ):
+        timeout_kind = (
+            "owner_timeout"
+            if workflow["phase"] == "owner_response"
+            else "reviewer_timeout"
+        )
         started_text = latest["occurred_at"]
-        seconds = 7200 if workflow["phase"] == "owner_response" else 1800
     if started_text:
         started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
-        handoff_deadline = started.timestamp() + seconds
+        handoff_deadline = (
+            started + TIMEOUT_DURATION_BY_KIND[timeout_kind]
+        ).timestamp()
     # A handoff deadline still ahead cuts this wait short, so the waiting actor learns
     # it may publish a timeout without sitting out the whole bound. One already behind
     # must not: the loop's deadline would then be in the past, this call would return
@@ -307,6 +322,11 @@ def poll_for_change(
 
 
 def wait_for_change(args: argparse.Namespace) -> int:
+    """Run one bounded poll and print its result.
+
+    Exit codes: 0 when canonical state changed, 3 for every other outcome, which
+    the printed `status` distinguishes.
+    """
     result = poll_for_change(Path(args.review), args.timeout)
     print(json.dumps(result))
     return 0 if result["status"] == "changed" else 3
@@ -397,9 +417,11 @@ def main() -> int:
         if args.max_rounds < 1:
             parser.error("--max-rounds must be at least 1")
         return await_handoff(args)
-    if not 1 <= args.timeout <= 86400:
-        parser.error("--timeout must be between 1 and 86400 seconds")
-    return wait_for_change(args)
+    if args.command == "wait":
+        if not 1 <= args.timeout <= 86400:
+            parser.error("--timeout must be between 1 and 86400 seconds")
+        return wait_for_change(args)
+    return 2
 
 
 if __name__ == "__main__":

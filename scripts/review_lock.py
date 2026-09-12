@@ -148,11 +148,13 @@ def main() -> int:
                 return 1
             print("lock verified")
             return 0
-        if path.exists():
-            print(json.dumps(public_owner(read_owner(path)), indent=2))
+        if args.action == "status":
+            if path.exists():
+                print(json.dumps(public_owner(read_owner(path)), indent=2))
+                return 0
+            print("unlocked")
             return 0
-        print("unlocked")
-        return 0
+        return 2
     except (
         OSError,
         TypeError,

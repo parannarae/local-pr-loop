@@ -171,7 +171,13 @@ def main() -> int:
             "unstaged_sha256": digest_bytes(unstaged),
             "untracked": untracked_manifest(repo, pathspecs),
         }
-    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+    except subprocess.CalledProcessError as error:
+        # `git` reports the actionable reason on stderr, which the captured run
+        # keeps out of the exception text.
+        detail = error.stderr.decode(errors="replace").strip() if error.stderr else ""
+        print(f"source snapshot failed: {error}. {detail}".strip(), file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as error:
         print(f"source snapshot failed: {error}", file=sys.stderr)
         return 1
 

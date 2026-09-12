@@ -10,13 +10,14 @@ import json
 import shlex
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import review_card
 import review_ledger
 import review_scope
+from review_contract import TIMEOUT_DURATION_BY_KIND
 from review_io import (
     atomic_bytes,
     atomic_json,
@@ -114,7 +115,14 @@ def digest_by_path(entries: Any) -> dict[str, str]:
     }
 
 
-def compare_digests(recorded: dict[str, str], current: dict[str, str], kind: str) -> list:
+def compare_digests(
+    recorded: dict[str, str], current: dict[str, str], kind: str
+) -> list[dict[str, str]]:
+    """Report added, removed, and modified paths between two digest maps.
+
+    `kind` is not part of the comparison: it is the label stamped on every change
+    so a caller can tell which half of the snapshot the path came from.
+    """
     changes = []
     for path in sorted(set(recorded) | set(current)):
         if path not in current:
@@ -186,7 +194,11 @@ def terminal_outcome(review: Path) -> str | None:
         document = load_json(review)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    terminal = (document.get("state") or {}).get("terminal")
+    # Read defensively: this runs inside the cleanup handler that must report commit
+    # state on every path, and `publish` is the first reader of a canonical file no
+    # command validated, so a hand-edited `state` must not escape as an exception.
+    state = document.get("state")
+    terminal = state.get("terminal") if isinstance(state, dict) else None
     if isinstance(terminal, dict) and isinstance(terminal.get("outcome"), str):
         return terminal["outcome"]
     return None
@@ -354,6 +366,12 @@ def write_report(state: Any, document: dict[str, Any], report: Path) -> None:
 
 
 def publish(args: argparse.Namespace) -> int:
+    """Append the leased draft to canonical history through one commit point.
+
+    Every path prints one structured result whose `committed` field is the only
+    safe way to read the outcome: once it is true the event is recorded and must
+    never be republished, and any remaining work is cleanup `recover` finishes.
+    """
     review = Path(args.review)
     event_path = Path(args.event)
     report = Path(args.report)
@@ -365,7 +383,7 @@ def publish(args: argparse.Namespace) -> int:
         # A guard supplies the declaration when one exists; otherwise the caller must.
         args.scope_declaration = (
             review_scope.validate(json.loads(args.scope_json))
-            if getattr(args, "scope_json", None)
+            if args.scope_json
             else None
         )
         if args.lease:
@@ -401,15 +419,8 @@ def publish(args: argparse.Namespace) -> int:
         event_snapshot_field = state.source_field_for(event.get("kind"))
         if event_snapshot_field:
             event_snapshot = event.get(event_snapshot_field)
-            identity_fields = (
-                "revision",
-                "scope",
-                "exclusions",
-                "additional_inputs",
-                "fingerprint",
-            )
-            if not isinstance(event_snapshot, dict) or any(
-                event_snapshot.get(key) != snapshot.get(key) for key in identity_fields
+            if state.snapshot_identity(event_snapshot) != state.snapshot_identity(
+                snapshot
             ):
                 raise ValueError("event snapshot does not match guarded source")
         if event.get("kind") == "final_review":
@@ -605,6 +616,12 @@ def recover_without_receipt(
 
 
 def recover(args: argparse.Namespace) -> int:
+    """Finish the cleanup a publication receipt shows is still outstanding.
+
+    Recovery never re-commits: it completes the report, draft, and receipt work
+    that follows a commit, so a receipt for an event already in canonical history
+    settles as a successful no-op.
+    """
     review = Path(args.review)
     event_path = Path(args.event)
     report = Path(args.report)
@@ -728,6 +745,13 @@ def recover(args: argparse.Namespace) -> int:
 
 
 def operation(args: argparse.Namespace) -> int:
+    """Print the dashboard an agent routes on.
+
+    It reports artifact condition, timeout eligibility, source drift, the
+    accretion ledger, and the one recommended next command. Every field is
+    derived from canonical state and the current source; nothing here writes, so
+    an inspection is safe to repeat.
+    """
     review = Path(args.review)
     event = Path(args.event)
     report = Path(args.report)
@@ -802,11 +826,7 @@ def operation(args: argparse.Namespace) -> int:
         started_text = latest["occurred_at"]
     if started_text:
         started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
-        deadline = started + (
-            timedelta(minutes=30)
-            if kind == "reviewer_timeout"
-            else timedelta(hours=2)
-        )
+        deadline = started + TIMEOUT_DURATION_BY_KIND[kind]
         timeout_eligibility = {
             "event_kind": kind,
             "started_at": started.isoformat(),
@@ -831,10 +851,9 @@ def operation(args: argparse.Namespace) -> int:
     )
     # Absent for a caller that supplies only a fingerprint; drift is then reported
     # without per-path detail rather than failing.
-    current_source_json = getattr(args, "current_source_json", "")
     try:
         current_snapshot_value = (
-            json.loads(current_source_json) if current_source_json else None
+            json.loads(args.current_source_json) if args.current_source_json else None
         )
     except json.JSONDecodeError:
         current_snapshot_value = None

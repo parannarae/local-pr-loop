@@ -35,6 +35,7 @@ SHA256_PATTERN = review_schema.SHA256_PATTERN
 load_json = review_schema.load_json
 operations_of = review_schema.operations_of
 reject_duplicate_keys = review_schema.reject_duplicate_keys
+snapshot_identity = review_schema.snapshot_identity
 unsupported_revision_error = review_schema.unsupported_revision_error
 validate_event = review_schema.validate_event
 

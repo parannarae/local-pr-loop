@@ -284,9 +284,7 @@ def validate_string_list(
     require(errors, valid, f"{prefix} must be a list of {suffix}")
 
 
-def validate_snapshot(
-    errors: list[str], snapshot: Any, prefix: str, *, fingerprint: bool = True
-) -> None:
+def validate_snapshot(errors: list[str], snapshot: Any, prefix: str) -> None:
     require(errors, isinstance(snapshot, dict), f"{prefix} must be a mapping")
     if not isinstance(snapshot, dict):
         return
@@ -370,44 +368,39 @@ def validate_snapshot(
             len(paths) == len(set(paths)),
             f"{prefix}.additional_inputs paths must be unique",
         )
-    if fingerprint:
+    require(
+        errors,
+        isinstance(snapshot.get("fingerprint"), str)
+        and bool(SHA256_PATTERN.fullmatch(snapshot["fingerprint"])),
+        f"{prefix}.fingerprint must be lowercase SHA-256",
+    )
+    for key in ("staged_sha256", "unstaged_sha256"):
         require(
             errors,
-            isinstance(snapshot.get("fingerprint"), str)
-            and bool(SHA256_PATTERN.fullmatch(snapshot["fingerprint"])),
-            f"{prefix}.fingerprint must be lowercase SHA-256",
+            isinstance(snapshot.get(key), str)
+            and bool(SHA256_PATTERN.fullmatch(snapshot[key])),
+            f"{prefix}.{key} must be lowercase SHA-256",
         )
-        for key in ("staged_sha256", "unstaged_sha256"):
-            require(
+    untracked = snapshot.get("untracked")
+    require(errors, isinstance(untracked, list), f"{prefix}.untracked must be a list")
+    if isinstance(untracked, list):
+        for index, item in enumerate(untracked):
+            item_prefix = f"{prefix}.untracked[{index}]"
+            require(errors, isinstance(item, dict), f"{item_prefix} must be a mapping")
+            if not isinstance(item, dict):
+                continue
+            reject_unknown(
                 errors,
-                isinstance(snapshot.get(key), str)
-                and bool(SHA256_PATTERN.fullmatch(snapshot[key])),
-                f"{prefix}.{key} must be lowercase SHA-256",
+                item,
+                {"path", "kind", "mode", "sha256", "link_target"},
+                item_prefix,
             )
-        untracked = snapshot.get("untracked")
-        require(
-            errors, isinstance(untracked, list), f"{prefix}.untracked must be a list"
-        )
-        if isinstance(untracked, list):
-            for index, item in enumerate(untracked):
-                item_prefix = f"{prefix}.untracked[{index}]"
+            for key in ("path", "kind", "mode", "sha256"):
                 require(
-                    errors, isinstance(item, dict), f"{item_prefix} must be a mapping"
-                )
-                if not isinstance(item, dict):
-                    continue
-                reject_unknown(
                     errors,
-                    item,
-                    {"path", "kind", "mode", "sha256", "link_target"},
-                    item_prefix,
+                    isinstance(item.get(key), str) and bool(item[key]),
+                    f"{item_prefix}.{key} must be a non-empty string",
                 )
-                for key in ("path", "kind", "mode", "sha256"):
-                    require(
-                        errors,
-                        isinstance(item.get(key), str) and bool(item[key]),
-                        f"{item_prefix}.{key} must be a non-empty string",
-                    )
 
 
 def snapshot_identity(snapshot: Any) -> dict[str, Any] | None:

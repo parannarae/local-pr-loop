@@ -286,7 +286,7 @@ def command_init(args: argparse.Namespace) -> int:
     report = captured_helper(STATE_SCRIPT, ["report"], input_bytes=canonical)
     atomic_bytes(paths.canonical, canonical)
     atomic_bytes(paths.report, report)
-    if getattr(args, "created_review_id", None) is not None:
+    if args.created_review_id is not None:
         # A caller that must inspect the result before announcing it — the
         # chained follow-up — reads the id here and prints its own lines.
         args.created_review_id.append(review_id)
@@ -396,13 +396,15 @@ def command_inspect(args: argparse.Namespace) -> int:
                 json.dumps(declaration, sort_keys=True),
             ],
         )
+        # The guard command reports the whole guard document, which carries the
+        # snapshot it recorded alongside the scope and the canonical SHA.
+        source = json.loads(snapshot_json)["source_snapshot"]
     else:
         snapshot_json = captured_helper(
             SNAPSHOT_SCRIPT,
             review_scope.snapshot_arguments(str(paths.repository.root), declaration),
         )
-    snapshot_value = json.loads(snapshot_json)
-    source = snapshot_value.get("source_snapshot", snapshot_value)
+        source = json.loads(snapshot_json)
     # Both machine views replace the human report rather than decorating it, so neither
     # carries the state dump, the artifact paths, or the raw snapshot.
     compact = args.json or args.agent
@@ -730,7 +732,7 @@ def command_retire(args: argparse.Namespace) -> int:
     # Convergence races another agent for this same duplicate and handles the
     # loss itself, so its diagnostics would only make a successful run look
     # broken. Every other caller reports the refusal.
-    expects_contention = getattr(args, "quiet", False)
+    expects_contention = args.quiet
     acquired = run_helper(
         WORKFLOW_SCRIPT,
         ["acquire", *workflow_arguments(paths)],
@@ -1101,7 +1103,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="base_ref",
         help="Comparison base ref; its merge base with HEAD anchors the growth signal",
     )
-    init.set_defaults(handler=command_init, prior_review_id=None, comparison_base=None)
+    init.set_defaults(
+        handler=command_init,
+        prior_review_id=None,
+        comparison_base=None,
+        # Set only by the chained follow-up, which collects the new id instead of
+        # letting this command announce it.
+        created_review_id=None,
+    )
 
     validate = commands.add_parser("validate")
     add_review_selection(validate)
@@ -1232,7 +1241,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Why this event-free review is being retired",
     )
-    retire.set_defaults(handler=command_retire)
+    retire.set_defaults(
+        handler=command_retire,
+        # Set only by successor convergence, which races another agent for the same
+        # duplicate and reports the loss itself.
+        quiet=False,
+    )
     return parser
 
 

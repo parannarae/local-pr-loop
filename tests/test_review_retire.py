@@ -142,7 +142,12 @@ class RetireReviewTest(unittest.TestCase):
         try:
             review_cli.command_retire(
                 Namespace(
-                    repo=str(self.repo), review_id=self.review_id, reason="race probe"
+                    repo=str(self.repo),
+                    review_id=self.review_id,
+                    reason="race probe",
+                    # A direct retirement reports contention; only successor
+                    # convergence silences it.
+                    quiet=False,
                 )
             )
         finally:

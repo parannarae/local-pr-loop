@@ -14,6 +14,9 @@ from typing import Any
 
 MODULE = Path(__file__).parents[1] / "scripts" / "review_ledger.py"
 sys.path.insert(0, str(MODULE.parent))
+
+import review_schema
+
 SPEC = importlib.util.spec_from_file_location("review_ledger", MODULE)
 assert SPEC and SPEC.loader
 review_ledger = importlib.util.module_from_spec(SPEC)
@@ -45,6 +48,24 @@ def approval(debt_record: dict[str, Any] | None = None) -> dict[str, Any]:
     if debt_record is not None:
         operation["structure_debt"] = debt_record
     return operation
+
+
+def successor_document(
+    review_id: str = "zzzzzzzz", prior_review_id: str = "abcdefgh"
+) -> dict[str, Any]:
+    """Build a structure successor as it is stored on disk.
+
+    The storage contract fields are what make the sibling readable under this
+    revision; a document without them is not this revision's to interpret, so the
+    successor scan does not count it.
+    """
+    return {
+        "format": review_schema.FORMAT,
+        "format_revision": review_schema.FORMAT_REVISION,
+        "review_id": review_id,
+        "prior_review_id": prior_review_id,
+        "review_kind": "structure",
+    }
 
 
 def document(
@@ -344,12 +365,7 @@ class FollowUpTest(unittest.TestCase):
         )
 
     def test_existing_structure_successor_consumes_the_flag_set(self) -> None:
-        successor = {
-            "review_id": "zzzzzzzz",
-            "prior_review_id": "abcdefgh",
-            "review_kind": "structure",
-        }
-        (self.reviews / "zzzzzzzz.json").write_text(json.dumps(successor))
+        (self.reviews / "zzzzzzzz.json").write_text(json.dumps(successor_document()))
         self.assertFalse(
             review_ledger.structure_follow_up_due(
                 self.deferred_document(), self.reviews
@@ -357,12 +373,9 @@ class FollowUpTest(unittest.TestCase):
         )
 
     def test_non_canonical_artifacts_are_ignored_in_the_successor_scan(self) -> None:
-        successor = {
-            "review_id": "zzzzzzzz",
-            "prior_review_id": "abcdefgh",
-            "review_kind": "structure",
-        }
-        (self.reviews / "zzzzzzzz.guard.json").write_text(json.dumps(successor))
+        (self.reviews / "zzzzzzzz.guard.json").write_text(
+            json.dumps(successor_document())
+        )
         self.assertTrue(
             review_ledger.structure_follow_up_due(
                 self.deferred_document(), self.reviews
