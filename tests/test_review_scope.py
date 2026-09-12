@@ -157,6 +157,39 @@ class CanonicalPathTest(unittest.TestCase):
                 },
             )
 
+    def test_building_snapshot_arguments_refuses_an_alias_in_both_roles(self) -> None:
+        """The argument path enforced the string rule, so an alias passed it.
+
+        `snapshot_arguments` is how a publication rebuilds the guarded snapshot, so an
+        alias accepted here would have one file recorded as two guarded declarations.
+        """
+
+        with self.assertRaises(ValueError) as caught:
+            review_scope.snapshot_arguments(
+                str(self.repo),
+                {
+                    "exclude": [],
+                    "additional_input": ["shared/data.txt"],
+                    "scope": ["linkdir/data.txt"],
+                },
+            )
+
+        self.assertIn(
+            "both a reviewed path and an additional input", str(caught.exception)
+        )
+
+    def test_building_snapshot_arguments_does_not_require_the_paths_to_exist(
+        self,
+    ) -> None:
+        # A guarded file deleted since the guard was written must still be snapshotted,
+        # so the deletion reports as drift instead of as an unavailable scope.
+        arguments = review_scope.snapshot_arguments(
+            str(self.repo),
+            {"exclude": [], "additional_input": [], "scope": ["deleted.py"]},
+        )
+
+        self.assertEqual(arguments[-2:], ["--", "deleted.py"])
+
 
 # --- review_scope.snapshot_arguments ---
 

@@ -21,3 +21,17 @@ package = false
 # The oldest interpreter the skill supports, and the one macOS ships, so syntax
 # newer than 3.9 fails here rather than on a user's machine.
 target-version = "py39"
+
+[tool.pyright]
+# Mirrors Pylance defaults so the CLI gate and the IDE agree: the project venv,
+# and scripts/ on the path the way the tests arrange it at runtime with
+# sys.path.insert.
+include = ["scripts", "tests"]
+extraPaths = ["scripts"]
+# Must repeat the requires-python floor above because pyright does not read it
+# (verified: unpinned, 3.10-only syntax passes); update both together when the
+# floor moves.
+pythonVersion = "3.9"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"

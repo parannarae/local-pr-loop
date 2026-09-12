@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import hashlib
 import io
@@ -150,9 +149,6 @@ class ReviewWorkflowWaitTest(unittest.TestCase):
         baseline = write_waiting_document(self.review, "entry")
         changed = {"status": "changed", "canonical_sha256": "b" * 64}
         timed_out = {"status": "timeout", "canonical_sha256": baseline}
-        args = argparse.Namespace(
-            review=str(self.review), round_seconds=5, max_rounds=3
-        )
 
         # A change absorbed into a later round's baseline was the original
         # defect, so the contract under test is that every round receives the
@@ -160,7 +156,7 @@ class ReviewWorkflowWaitTest(unittest.TestCase):
         with mock.patch.object(
             review_workflow, "poll_for_change", side_effect=[timed_out, changed]
         ) as poll, contextlib.redirect_stdout(io.StringIO()) as stdout:
-            exit_code = review_workflow.await_handoff(args)
+            exit_code = review_workflow.await_handoff(self.review, 5, 3)
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(

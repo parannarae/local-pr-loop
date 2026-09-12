@@ -36,7 +36,7 @@ for a shape actively causing defects — and state `required_behavior` as the
 target shape, not a site edit.
 
 Do not raise correctness findings in this round. A defect noticed mid-round is
-recorded with `add-note` on the most related thread and routed to a new
+recorded with `draft note` on the most related thread and routed to a new
 correctness loop after this one terminates; mixing the two verification
 contracts in one loop makes it ambiguous which check governs a thread.
 
@@ -45,19 +45,19 @@ contracts in one loop makes it ambiguous which check governs a thread.
 Restructure across the whole guarded scope; cross-site diffs are the expected
 result. Preserve every behavior, comment rationale, and test contract. Do not
 widen scope beyond the guarded set, and do not fix defects found on the way —
-flag each with `add-note` on your reply and route it to a follow-up
-correctness loop instead.
+flag each with `draft note` on the thread your reply already answers and route
+it to a follow-up correctness loop instead.
 
 ## Verification Contract
 
-Behavior preservation replaces diff locality. Record with `add-check`:
+Behavior preservation replaces diff locality. Record with `draft record-check`:
 
 - the full test suite passes on the restructured tree; and
 - test files inside the guarded scope are unchanged — the strongest cheap
   evidence that only shape moved.
 
 When a restructuring legitimately must touch test files (helper moves,
-renames), the owner flags it with `add-note` and the reviewer verifies
+renames), the owner flags it with `draft note` and the reviewer verifies
 assertion equivalence explicitly before resolving; zero test edits stays the
 default expectation. Resolve a thread only after reading the restructured code
 whole, not from the diff alone.

@@ -10,8 +10,13 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Literal, overload
 
 
+@overload
+def git(repo: Path, *args: str) -> bytes: ...
+@overload
+def git(repo: Path, *args: str, text: Literal[True]) -> str: ...
 def git(repo: Path, *args: str, text: bool = False) -> bytes | str:
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -38,7 +43,27 @@ def digest_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def stderr_text(error: subprocess.CalledProcessError) -> str:
+    """Return a failed child's stderr as text, or empty when it captured none.
+
+    `git` here runs in text mode for some calls and binary mode for others, so the
+    captured stream is `str` or `bytes` depending on which call failed.
+    """
+    stderr = error.stderr
+    if isinstance(stderr, bytes):
+        return stderr.decode(errors="replace").strip()
+    if isinstance(stderr, str):
+        return stderr.strip()
+    return ""
+
+
 def untracked_manifest(repo: Path, pathspecs: list[str]) -> list[dict[str, str]]:
+    """Digest every untracked file inside the scope, as Git itself sees it.
+
+    A symlink's `sha256` covers its target string rather than the target's content, so
+    repointing a link is drift even when the file it now names is byte-identical.
+    """
+
     output = git(
         repo,
         "ls-files",
@@ -75,6 +100,13 @@ def untracked_manifest(repo: Path, pathspecs: list[str]) -> list[dict[str, str]]
 
 
 def additional_input_manifest(repo: Path, values: list[str]) -> list[dict[str, str]]:
+    """Digest each declared additional input, following a symlink to its content.
+
+    A symlink's `sha256` covers the resolved file's bytes, unlike `untracked_manifest`,
+    which digests the target string: an input is declared to be read, so its content is
+    what the guard must pin. `link_target` still records where it pointed.
+    """
+
     entries = []
     for relative in normalize_scope(repo, values):
         path = repo / relative
@@ -166,7 +198,14 @@ def main() -> int:
             "unstaged_sha256": digest_bytes(unstaged),
             "untracked": untracked_manifest(repo, pathspecs),
         }
-    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+    except subprocess.CalledProcessError as error:
+        # `git` reports the actionable reason on stderr, which the captured run
+        # keeps out of the exception text.
+        message = f"source snapshot failed: {error}"
+        detail = stderr_text(error)
+        print(f"{message} {detail}" if detail else message, file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as error:
         print(f"source snapshot failed: {error}", file=sys.stderr)
         return 1
 

@@ -13,7 +13,10 @@ from typing import Any
 import review_render
 import review_schema
 import review_templates
-from review_contract import SOURCE_FIELD_BY_KIND, TIMEOUT_DURATION_BY_KIND
+from review_contract import (
+    TIMEOUT_DURATION_BY_KIND,
+    source_field_for,
+)
 from review_projection import (
     default_state,
     project_history,
@@ -26,9 +29,14 @@ EVIDENCE_BASES = review_schema.EVIDENCE_BASES
 EVENT_ID_PATTERN = review_schema.EVENT_ID_PATTERN
 FORMAT = review_schema.FORMAT
 FORMAT_REVISION = review_schema.FORMAT_REVISION
+OPERATION_FIELDS = review_schema.OPERATION_FIELDS
+OPERATIONS_BY_KIND = review_schema.OPERATIONS_BY_KIND
 SHA256_PATTERN = review_schema.SHA256_PATTERN
-load_json = review_schema.load_json
+load_json_from_stdin = review_schema.load_json_from_stdin
+operations_of = review_schema.operations_of
 reject_duplicate_keys = review_schema.reject_duplicate_keys
+snapshot_identity = review_schema.snapshot_identity
+unsupported_revision_error = review_schema.unsupported_revision_error
 validate_event = review_schema.validate_event
 
 
@@ -38,14 +46,6 @@ def blank_snapshot() -> dict[str, Any]:
 
 def blank_evidence() -> dict[str, Any]:
     return review_templates.blank_evidence()
-
-
-def blank_validation() -> dict[str, list[Any]]:
-    return review_templates.blank_validation()
-
-
-def blank_thread() -> dict[str, Any]:
-    return review_templates.blank_thread()
 
 
 def new_document(
@@ -116,7 +116,7 @@ def append_event(document: Any, event: Any) -> dict[str, Any]:
     if not isinstance(event, dict):
         raise TypeError("event must be a JSON object")
     next_history = [*document["history"], event]
-    errors, state, _ = project_history(next_history, document.get("created_at"))
+    errors, state = project_history(next_history, document.get("created_at"))
     if errors:
         raise ValueError("; ".join(errors))
     document["history"] = next_history
@@ -181,17 +181,10 @@ def main() -> int:
     threads_parser.add_argument("--json", action="store_true")
     threads_parser.add_argument("--summary", action="store_true")
     threads_parser.add_argument("--open", dest="open_only", action="store_true")
-    evidence_parser = subparsers.add_parser("evidence-template")
-    evidence_parser.add_argument("basis", choices=EVIDENCE_BASES)
     subparsers.add_parser("eligible-timeout")
     args = parser.parse_args()
     if args.command == "template":
         print(json.dumps(event_template(args.kind), indent=2))
-        return 0
-    if args.command == "evidence-template":
-        value = blank_evidence()
-        value["basis"] = args.basis
-        print(json.dumps(value, indent=2))
         return 0
     if args.command == "init":
         document = new_document(
@@ -208,7 +201,7 @@ def main() -> int:
         print(json.dumps(document, indent=2))
         return 0
     try:
-        value = load_json()
+        value = load_json_from_stdin()
     except (ValueError, json.JSONDecodeError) as error:
         print(f"invalid JSON: {error}", file=sys.stderr)
         return 1
@@ -225,13 +218,21 @@ def main() -> int:
         return emit_validation(validate_event(value))
     if args.command == "source-snapshot":
         kind = args.kind or (value.get("kind") if isinstance(value, dict) else None)
-        field = SOURCE_FIELD_BY_KIND.get(kind)
+        field = source_field_for(kind)
         print(
             json.dumps(value.get(field))
             if field and isinstance(value, dict)
             else "null"
         )
         return 0
+    # `report` and `threads` render schema-required fields directly, so they refuse a
+    # document the format cannot vouch for rather than print one with substituted
+    # values. The diagnostic `state` and `eligible-timeout` commands stay ungated so a
+    # stale or invalid projection is still inspectable during recovery.
+    if args.command in {"report", "threads"}:
+        errors = validate_document(value)
+        if errors:
+            return emit_validation(errors)
     if args.command == "report":
         print(render_report(value), end="")
         return 0

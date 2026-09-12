@@ -98,7 +98,8 @@ def release(path: Path, token: str) -> int:
     except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError) as error:
         print(f"cannot read review lock holder: {error}", file=sys.stderr)
         return 1
-    if not secrets.compare_digest(owner.get("token", ""), token):
+    recorded = owner.get("token", "")
+    if not isinstance(recorded, str) or not secrets.compare_digest(recorded, token):
         print("review lock token does not match", file=sys.stderr)
         return 1
     tombstone = path.with_name(f"{path.name}.released-{secrets.token_hex(8)}")
@@ -139,16 +140,21 @@ def main() -> int:
             if not args.token:
                 parser.error("--token is required for verify")
             owner = read_owner(path)
-            if not secrets.compare_digest(owner.get("token", ""), args.token):
+            recorded = owner.get("token", "")
+            if not isinstance(recorded, str) or not secrets.compare_digest(
+                recorded, args.token
+            ):
                 print("review lock token does not match", file=sys.stderr)
                 return 1
             print("lock verified")
             return 0
-        if path.exists():
-            print(json.dumps(public_owner(read_owner(path)), indent=2))
+        if args.action == "status":
+            if path.exists():
+                print(json.dumps(public_owner(read_owner(path)), indent=2))
+                return 0
+            print("unlocked")
             return 0
-        print("unlocked")
-        return 0
+        return 2
     except (
         OSError,
         TypeError,

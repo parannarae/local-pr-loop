@@ -24,12 +24,18 @@ from review_io import atomic_bytes, load_object
 from review_schema import REVIEW_ID_PATTERN, REVIEW_NAME_PATTERN
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+COMPOSE_SCRIPT = SCRIPT_DIRECTORY / "review_compose.py"
 LOCK_SCRIPT = SCRIPT_DIRECTORY / "review_lock.py"
 PUBLISH_SCRIPT = SCRIPT_DIRECTORY / "review_publish.py"
 SNAPSHOT_SCRIPT = SCRIPT_DIRECTORY / "source_snapshot.py"
 STATE_SCRIPT = SCRIPT_DIRECTORY / "review_state.py"
 WORKFLOW_SCRIPT = SCRIPT_DIRECTORY / "review_workflow.py"
 REVIEW_ID_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+# How long a freshly created successor waits before deciding which loop won. Covers the
+# skew between two agents writing their canonical files; it is not a correctness bound,
+# and a competitor slower than this still converges on the next command that scans
+# successors.
+SUCCESSOR_SETTLE_SECONDS = 0.4
 
 
 @dataclass(frozen=True)
@@ -285,7 +291,7 @@ def command_init(args: argparse.Namespace) -> int:
     report = captured_helper(STATE_SCRIPT, ["report"], input_bytes=canonical)
     atomic_bytes(paths.canonical, canonical)
     atomic_bytes(paths.report, report)
-    if getattr(args, "created_review_id", None) is not None:
+    if args.created_review_id is not None:
         # A caller that must inspect the result before announcing it — the
         # chained follow-up — reads the id here and prints its own lines.
         args.created_review_id.append(review_id)
@@ -362,63 +368,72 @@ def command_scope_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_inspect(args: argparse.Namespace) -> int:
-    paths = review_paths(args.repo, args.review_id)
-    validate_review(paths)
-    lock_json = captured_helper(
-        LOCK_SCRIPT,
-        review_discover.lock_status_arguments(paths.repository.root, paths.canonical),
-    )
-    # One declaration serves both branches. Transporting it as structured data keeps the
-    # guarded and unguarded snapshots identical for an identical request, which an argument
-    # tail re-parsed by a second process cannot guarantee.
-    declaration = scope_declaration(args)
-    lease_present = paths.lease.is_file() and not paths.lease.is_symlink()
-    if lease_present:
-        snapshot_json = captured_helper(
-            WORKFLOW_SCRIPT,
-            [
-                "guard",
-                "--repo",
-                str(paths.repository.root),
-                "--review",
-                str(paths.canonical),
-                "--lease",
-                str(paths.lease),
-                "--guard",
-                str(paths.guard),
-                "--lock-script",
-                str(LOCK_SCRIPT),
-                "--snapshot-script",
-                str(SNAPSHOT_SCRIPT),
-                "--scope-json",
-                json.dumps(declaration, sort_keys=True),
-            ],
-        )
-    else:
-        snapshot_json = captured_helper(
+def workflow_arguments(paths: ReviewPaths) -> list[str]:
+    """Build the repository, review, and lock artifacts every leased helper needs."""
+    return [
+        "--repo",
+        str(paths.repository.root),
+        "--review",
+        str(paths.canonical),
+        "--lease",
+        str(paths.lease),
+        "--guard",
+        str(paths.guard),
+        "--lock-script",
+        str(LOCK_SCRIPT),
+    ]
+
+
+@dataclass(frozen=True)
+class InspectedSource:
+    """One inspection's source snapshot, with the helper output that produced it."""
+
+    snapshot: dict[str, Any]
+    # Printed verbatim by the human view: the guarded branch reports the whole guard
+    # document, which carries more than the snapshot alone.
+    helper_output: bytes
+
+
+def inspected_source(
+    paths: ReviewPaths, declaration: dict[str, list[str]], lease_present: bool
+) -> InspectedSource:
+    """Snapshot the declared source, refreshing the inspection guard under a lease.
+
+    One declaration serves both branches. Transporting it as structured data keeps the
+    guarded and unguarded snapshots identical for an identical request, which an argument
+    tail re-parsed by a second process cannot guarantee.
+    """
+
+    if not lease_present:
+        output = captured_helper(
             SNAPSHOT_SCRIPT,
             review_scope.snapshot_arguments(str(paths.repository.root), declaration),
         )
-    snapshot_value = json.loads(snapshot_json)
-    source = snapshot_value.get("source_snapshot", snapshot_value)
-    # Both machine views replace the human report rather than decorating it, so neither
-    # carries the state dump, the artifact paths, or the raw snapshot.
-    compact = args.json or args.agent
-    if not compact:
-        print("workflow:")
-        completed = run_helper(
-            STATE_SCRIPT,
-            ["state"],
-            input_bytes=paths.canonical.read_bytes(),
-        )
-        if completed.returncode != 0:
-            return completed.returncode
-        print("operation:")
-    command_prefix = (
-        f"python3 {shlex.quote(str(SCRIPT_DIRECTORY / 'review_cli.py'))}"
+        return InspectedSource(snapshot=json.loads(output), helper_output=output)
+    output = captured_helper(
+        WORKFLOW_SCRIPT,
+        [
+            "guard",
+            *workflow_arguments(paths),
+            "--snapshot-script",
+            str(SNAPSHOT_SCRIPT),
+            "--scope-json",
+            json.dumps(declaration, sort_keys=True),
+        ],
     )
-    operation_args = [
+    # The guard command reports the whole guard document, which carries the
+    # snapshot it recorded alongside the scope and the canonical SHA.
+    return InspectedSource(
+        snapshot=json.loads(output)["source_snapshot"], helper_output=output
+    )
+
+
+def operation_arguments(
+    paths: ReviewPaths, lock_json: bytes, source: dict[str, Any]
+) -> list[str]:
+    """Build the `operation` argument vector describing this review's artifacts."""
+
+    return [
         "operation",
         "--review",
         str(paths.canonical),
@@ -443,8 +458,33 @@ def command_inspect(args: argparse.Namespace) -> int:
         "--current-source-json",
         json.dumps(source, sort_keys=True),
         "--command-prefix",
-        command_prefix,
+        f"python3 {shlex.quote(str(SCRIPT_DIRECTORY / 'review_cli.py'))}",
     ]
+
+
+def command_inspect(args: argparse.Namespace) -> int:
+    paths = review_paths(args.repo, args.review_id)
+    validate_review(paths)
+    lock_json = captured_helper(
+        LOCK_SCRIPT,
+        review_discover.lock_status_arguments(paths.repository.root, paths.canonical),
+    )
+    lease_present = paths.lease.is_file() and not paths.lease.is_symlink()
+    source = inspected_source(paths, scope_declaration(args), lease_present)
+    # Both machine views replace the human report rather than decorating it, so neither
+    # carries the state dump, the artifact paths, or the raw snapshot.
+    compact = args.json or args.agent
+    if not compact:
+        print("workflow:")
+        completed = run_helper(
+            STATE_SCRIPT,
+            ["state"],
+            input_bytes=paths.canonical.read_bytes(),
+        )
+        if completed.returncode != 0:
+            return completed.returncode
+        print("operation:")
+    operation_args = operation_arguments(paths, lock_json, source.snapshot)
     if lease_present:
         operation_args.append("--lease-present")
     if args.json:
@@ -463,7 +503,7 @@ def command_inspect(args: argparse.Namespace) -> int:
     digest = hashlib.sha256(paths.canonical.read_bytes()).hexdigest()
     print(f"review_sha256: {digest}")
     print("source_snapshot:")
-    sys.stdout.buffer.write(snapshot_json)
+    sys.stdout.buffer.write(source.helper_output)
     return 0
 
 
@@ -521,21 +561,6 @@ def command_template(args: argparse.Namespace) -> int:
     atomic_bytes(paths.event, event, mode=0o600)
     print(paths.event)
     return 0
-
-
-def workflow_arguments(paths: ReviewPaths) -> list[str]:
-    return [
-        "--repo",
-        str(paths.repository.root),
-        "--review",
-        str(paths.canonical),
-        "--lease",
-        str(paths.lease),
-        "--guard",
-        str(paths.guard),
-        "--lock-script",
-        str(LOCK_SCRIPT),
-    ]
 
 
 def command_lock(args: argparse.Namespace) -> int:
@@ -624,75 +649,28 @@ def command_abort_draft(args: argparse.Namespace) -> int:
     ).returncode
 
 
-def command_add_check(args: argparse.Namespace) -> int:
-    paths = review_paths(args.repo, args.review_id)
-    values = [
-        "add-check",
-        *workflow_arguments(paths),
-        "--event",
-        str(paths.event),
-        "--result",
-        args.result,
-        "--check",
-        args.check,
-    ]
-    evidence_values = (args.basis, args.provenance, args.sanitized_result)
-    if any(value is not None for value in evidence_values):
-        if not all(value is not None for value in evidence_values):
-            raise ValueError(
-                "basis, provenance, and sanitized result must be provided together"
-            )
-        values.extend(
-            [
-                "--basis",
-                args.basis,
-                "--provenance",
-                args.provenance,
-                "--sanitized-result",
-                args.sanitized_result,
-            ]
+def command_draft(args: argparse.Namespace) -> int:
+    """Run one composer subcommand against this review's leased draft.
+
+    The remaining arguments are forwarded verbatim, so `draft ... --help` reaches
+    the composer's own per-command help rather than being re-described here.
+    """
+    if not args.arguments:
+        raise ValueError(
+            "draft needs a subcommand; run it with --help to list them"
         )
-    if args.artifact_digest:
-        values.extend(["--artifact-digest", args.artifact_digest])
-    return run_helper(WORKFLOW_SCRIPT, values).returncode
-
-
-def command_add_gap(args: argparse.Namespace) -> int:
     paths = review_paths(args.repo, args.review_id)
-    values = [
-        "add-gap",
-        *workflow_arguments(paths),
-        "--event",
-        str(paths.event),
-        "--check",
-        args.check,
-        "--reason",
-        args.reason,
-    ]
-    if args.material:
-        values.append("--material")
-    return run_helper(WORKFLOW_SCRIPT, values).returncode
-
-
-def command_add_note(args: argparse.Namespace) -> int:
-    paths = review_paths(args.repo, args.review_id)
-    values = [
-        "add-note",
-        *workflow_arguments(paths),
-        "--event",
-        str(paths.event),
-        "--thread",
-        args.thread_id,
-        "--note",
-        args.note,
-    ]
-    if args.tag:
-        values.extend(["--tag", args.tag])
-    return run_helper(WORKFLOW_SCRIPT, values).returncode
-
-
-def command_evidence_template(args: argparse.Namespace) -> int:
-    return run_helper(STATE_SCRIPT, ["evidence-template", args.basis]).returncode
+    subcommand, *rest = args.arguments
+    return run_helper(
+        COMPOSE_SCRIPT,
+        [
+            subcommand,
+            *workflow_arguments(paths),
+            "--event",
+            str(paths.event),
+            *rest,
+        ],
+    ).returncode
 
 
 def command_regenerate_report(args: argparse.Namespace) -> int:
@@ -776,7 +754,7 @@ def command_retire(args: argparse.Namespace) -> int:
     # Convergence races another agent for this same duplicate and handles the
     # loss itself, so its diagnostics would only make a successful run look
     # broken. Every other caller reports the refusal.
-    expects_contention = getattr(args, "quiet", False)
+    expects_contention = args.quiet
     acquired = run_helper(
         WORKFLOW_SCRIPT,
         ["acquire", *workflow_arguments(paths)],
@@ -1024,13 +1002,6 @@ def report_existing_successor(
     return 0
 
 
-# How long a freshly created successor waits before deciding which loop won.
-# Covers the skew between two agents writing their canonical files; it is not a
-# correctness bound, and a competitor slower than this still converges on the
-# next command that scans successors.
-SUCCESSOR_SETTLE_SECONDS = 0.4
-
-
 def command_start_follow_up(args: argparse.Namespace) -> int:
     prior = review_paths(args.repo, args.prior_review_id)
     validate_review(prior)
@@ -1147,7 +1118,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="base_ref",
         help="Comparison base ref; its merge base with HEAD anchors the growth signal",
     )
-    init.set_defaults(handler=command_init, prior_review_id=None, comparison_base=None)
+    init.set_defaults(
+        handler=command_init,
+        prior_review_id=None,
+        comparison_base=None,
+        # Set only by the chained follow-up, which collects the new id instead of
+        # letting this command announce it.
+        created_review_id=None,
+    )
 
     validate = commands.add_parser("validate")
     add_review_selection(validate)
@@ -1195,35 +1173,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     threads.set_defaults(handler=command_threads)
 
-    add_check = commands.add_parser("add-check")
-    add_review_selection(add_check)
-    add_check.add_argument("result", choices=("passed", "failed"))
-    add_check.add_argument("check")
-    add_check.add_argument("basis", nargs="?")
-    add_check.add_argument("provenance", nargs="?")
-    add_check.add_argument("sanitized_result", nargs="?")
-    add_check.add_argument("artifact_digest", nargs="?")
-    add_check.set_defaults(handler=command_add_check)
-
-    add_gap = commands.add_parser("add-gap")
-    add_review_selection(add_gap)
-    add_gap.add_argument("check")
-    add_gap.add_argument("reason")
-    add_gap.add_argument("--material", action="store_true")
-    add_gap.set_defaults(handler=command_add_gap)
-
-    add_note = commands.add_parser("add-note")
-    add_review_selection(add_note)
-    add_note.add_argument("thread_id")
-    add_note.add_argument("note")
-    add_note.add_argument(
-        "--tag", choices=("action-required", "follow-up", "decision")
+    draft = commands.add_parser(
+        "draft",
+        help="Compose one typed operation into the leased draft",
     )
-    add_note.set_defaults(handler=command_add_note)
-
-    evidence = commands.add_parser("evidence-template")
-    evidence.add_argument("basis", choices=review_state.EVIDENCE_BASES)
-    evidence.set_defaults(handler=command_evidence_template)
+    add_review_selection(draft)
+    draft.add_argument(
+        "arguments",
+        nargs=argparse.REMAINDER,
+        help="Composer subcommand and its arguments; use --help to list them",
+    )
+    draft.set_defaults(handler=command_draft)
 
     snapshot = commands.add_parser("snapshot")
     snapshot.add_argument("repo")
@@ -1296,7 +1256,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Why this event-free review is being retired",
     )
-    retire.set_defaults(handler=command_retire)
+    retire.set_defaults(
+        handler=command_retire,
+        # Set only by successor convergence, which races another agent for the same
+        # duplicate and reports the loss itself.
+        quiet=False,
+    )
     return parser
 
 

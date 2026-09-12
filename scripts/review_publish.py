@@ -10,19 +10,15 @@ import json
 import shlex
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import review_card
 import review_ledger
 import review_scope
-from review_io import (
-    atomic_bytes,
-    atomic_json,
-)
-from review_io import load_object as load_json
-from review_io import load_secure_object as load_secure_json
+from review_contract import TIMEOUT_DURATION_BY_KIND
+from review_io import atomic_bytes, atomic_json, load_object, load_secure_object
 
 
 def sha256(path: Path) -> str:
@@ -55,16 +51,30 @@ def unpublishable_draft_reason(event_path: Path) -> str | None:
     A timeout draft fixes ``occurred_at`` when it is templated. One stamped before its own
     deadline stays invalid no matter how long the caller waits, so telling the caller to
     republish it is advice that cannot succeed.
+
+    A draft this function cannot read or parse also returns None, deliberately: the
+    caller is about to report a failure whose own message names the real problem, and
+    claiming the draft is unpublishable would replace that with a guess.
     """
 
     try:
-        draft = load_json(event_path)
+        draft = load_object(event_path)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
     if draft.get("kind") not in TIMEOUT_EVENT_KINDS:
         return None
     occurred_at = draft.get("occurred_at")
-    deadline = draft.get("deadline")
+    operations = draft.get("operations")
+    declaration = next(
+        (
+            operation
+            for operation in (operations if isinstance(operations, list) else [])
+            if isinstance(operation, dict)
+            and operation.get("op") == "timeout.declare"
+        ),
+        {},
+    )
+    deadline = declaration.get("deadline")
     if not isinstance(occurred_at, str) or not isinstance(deadline, str):
         return None
     try:
@@ -87,7 +97,7 @@ def recorded_snapshot(document: dict[str, Any], state: Any) -> dict[str, Any] | 
     for event in reversed(document.get("history") or []):
         if not isinstance(event, dict):
             continue
-        field = state.SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        field = state.source_field_for(event.get("kind"))
         value = event.get(field) if field else None
         if isinstance(value, dict):
             return value
@@ -104,7 +114,14 @@ def digest_by_path(entries: Any) -> dict[str, str]:
     }
 
 
-def compare_digests(recorded: dict[str, str], current: dict[str, str], kind: str) -> list:
+def compare_digests(
+    recorded: dict[str, str], current: dict[str, str], kind: str
+) -> list[dict[str, str]]:
+    """Report added, removed, and modified paths between two digest maps.
+
+    `kind` is not part of the comparison: it is the label stamped on every change
+    so a caller can tell which half of the snapshot the path came from.
+    """
     changes = []
     for path in sorted(set(recorded) | set(current)):
         if path not in current:
@@ -173,16 +190,20 @@ def terminal_outcome(review: Path) -> str | None:
     """Return the recorded terminal outcome of a review, or None while it is open."""
 
     try:
-        document = load_json(review)
+        document = load_object(review)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    terminal = (document.get("state") or {}).get("terminal")
+    # Read defensively: this runs inside the cleanup handler that must report commit
+    # state on every path, and `publish` is the first reader of a canonical file no
+    # command validated, so a hand-edited `state` must not escape as an exception.
+    state = document.get("state")
+    terminal = state.get("terminal") if isinstance(state, dict) else None
     if isinstance(terminal, dict) and isinstance(terminal.get("outcome"), str):
         return terminal["outcome"]
     return None
 
 
-def result(
+def result_with_canonical_digest(
     *,
     status: str,
     committed: bool,
@@ -192,6 +213,13 @@ def result(
     recovery_action: str,
     detail: str | None = None,
 ) -> dict[str, Any]:
+    """Build one structured command result, reading and hashing the canonical file.
+
+    `canonical_sha256` is None when that file is absent, which is a real state a
+    retirement leaves behind; the caller reads `committed` to learn the outcome and
+    the digest only to compare against a receipt.
+    """
+
     value: dict[str, Any] = {
         "status": status,
         "committed": committed,
@@ -267,8 +295,12 @@ def lock_status(lock_script: Path, repo: Path, review: Path) -> str:
     return completed.stdout.strip()
 
 
-def current_snapshot(args: argparse.Namespace) -> dict[str, Any]:
-    if args.scope_declaration is None:
+def current_snapshot(
+    repo: str, snapshot_script: str, declaration: dict[str, list[str]] | None
+) -> dict[str, Any]:
+    """Take the source snapshot this publication is checked against."""
+
+    if declaration is None:
         raise ValueError(
             "no scope declaration is available; supply --scope-json or publish under an "
             "inspection guard"
@@ -276,15 +308,15 @@ def current_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     completed = subprocess.run(
         [
             sys.executable,
-            args.snapshot_script,
-            *review_scope.snapshot_arguments(args.repo, args.scope_declaration),
+            snapshot_script,
+            *review_scope.snapshot_arguments(repo, declaration),
         ],
         capture_output=True,
         text=True,
         check=False,
     )
     if completed.returncode != 0:
-        raise RuntimeError("source snapshot failed")
+        raise RuntimeError(f"source snapshot failed: {completed.stderr.strip()}")
     value = json.loads(completed.stdout)
     if not isinstance(value, dict):
         raise TypeError("source snapshot must be a JSON object")
@@ -326,11 +358,118 @@ def validate_receipt(receipt: dict[str, Any], state: Any) -> None:
         raise ValueError("publication receipt commit_phase is invalid")
 
 
+def lease_token(lease: dict[str, Any]) -> str:
+    """Return the lease's lock token, refusing a lease that records none.
+
+    The lease is a 0600 file this skill wrote, so a missing or non-string token
+    means corruption; failing here names the artifact instead of surfacing as a
+    lock mismatch later.
+    """
+    token = lease.get("token")
+    if not isinstance(token, str) or not token:
+        raise ValueError("lease records no usable token; re-acquire the lock")
+    return token
+
+
+def guard_digest(state: Any, value: Any, field: str) -> str:
+    """Return one SHA-256 field of the inspection guard, refusing a corrupt one.
+
+    The guard is a 0600 file this skill wrote, so a malformed digest means corruption.
+    Naming the guard here is what keeps a later comparison from blaming canonical
+    history for it, following `lease_token` and its stated reason.
+    """
+
+    if not isinstance(value, str) or not state.SHA256_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"inspection guard {field} is not a SHA-256 digest; release the lock and "
+            "re-run inspect to recreate it"
+        )
+    return value
+
+
+# A NamedTuple rather than a frozen dataclass, deliberately: this module is loaded
+# under an alias by several test harnesses, which leaves it absent from `sys.modules`,
+# and `dataclasses` needs the defining module registered there to build the class.
+# NamedTuple gives the same immutable named record without that lookup.
+class PublicationExpectations(NamedTuple):
+    """What a publication must match before it may commit.
+
+    Every field is resolved once, from the guard when one exists and from the caller's
+    own flags otherwise, so the comparison sites never have to ask which source won.
+    """
+
+    token: str
+    review_sha256: str | None
+    source_fingerprint: str | None
+    scope_declaration: dict[str, list[str]] | None
+
+
+def resolve_expectations(
+    args: argparse.Namespace, state: Any
+) -> PublicationExpectations:
+    """Resolve one publication's expectations from its lease and guard, or its flags.
+
+    A stored guard is authoritative wherever it exists: it recorded the canonical
+    digest, the source fingerprint, and the scope the inspection actually observed.
+    """
+
+    if not args.lease:
+        return PublicationExpectations(
+            token=args.token,
+            review_sha256=args.expected_review_sha,
+            source_fingerprint=args.expected_source_fingerprint,
+            scope_declaration=(
+                review_scope.validate(json.loads(args.scope_json))
+                if args.scope_json
+                else None
+            ),
+        )
+    lease = load_secure_object(Path(args.lease), "lease")
+    guard = load_secure_object(Path(args.guard), "inspection guard")
+    snapshot = guard.get("source_snapshot")
+    if not isinstance(snapshot, dict):
+        raise TypeError("inspection guard source snapshot is invalid")
+    if "scope" not in guard:
+        raise ValueError(
+            "inspection guard predates this version and records no structured "
+            "scope; release the lock and re-run inspect to recreate it"
+        )
+    return PublicationExpectations(
+        token=lease_token(lease),
+        review_sha256=guard_digest(state, guard.get("review_sha256"), "review_sha256"),
+        source_fingerprint=guard_digest(
+            state, snapshot.get("fingerprint"), "source_snapshot.fingerprint"
+        ),
+        scope_declaration=review_scope.validate(guard.get("scope")),
+    )
+
+
+def snapshot_path_list(snapshot: dict[str, Any], field: str) -> list[str]:
+    """Return a snapshot's `scope` or `exclusions`, refusing a malformed value.
+
+    Defaulting either to an empty list is not neutral for the accretion ledger: an
+    empty scope matches no thread while an empty exclusion list diffs the whole
+    repository, so the two halves of the flagged set would move in opposite
+    directions over the same corrupt snapshot.
+    """
+
+    value = snapshot.get(field)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"guarded source snapshot {field} must be a list of strings")
+    return value
+
+
 def write_report(state: Any, document: dict[str, Any], report: Path) -> None:
     atomic_bytes(report, state.render_report(document).encode())
 
 
 def publish(args: argparse.Namespace) -> int:
+    """Append the leased draft to canonical history through one commit point.
+
+    Every path prints one structured result whose `committed` field is the only
+    safe way to read the outcome: once it is true the event is recorded and must
+    never be republished, and any remaining work is cleanup `recover` finishes.
+    """
     review = Path(args.review)
     event_path = Path(args.event)
     report = Path(args.report)
@@ -339,54 +478,31 @@ def publish(args: argparse.Namespace) -> int:
     event_id: str | None = None
     committed = False
     try:
-        # A guard supplies the declaration when one exists; otherwise the caller must.
-        args.scope_declaration = (
-            review_scope.validate(json.loads(args.scope_json))
-            if getattr(args, "scope_json", None)
-            else None
+        expectations = resolve_expectations(args, state)
+        verify_lock(
+            Path(args.lock_script), Path(args.repo), review, expectations.token
         )
-        if args.lease:
-            lease = load_secure_json(Path(args.lease), "lease")
-            guard = load_secure_json(Path(args.guard), "inspection guard")
-            args.token = lease.get("token")
-            args.expected_review_sha = guard.get("review_sha256")
-            snapshot = guard.get("source_snapshot")
-            if not isinstance(snapshot, dict):
-                raise ValueError("inspection guard source snapshot is invalid")
-            args.expected_source_fingerprint = snapshot.get("fingerprint")
-            if "scope" not in guard:
-                raise ValueError(
-                    "inspection guard predates this version and records no structured "
-                    "scope; release the lock and re-run inspect to recreate it"
-                )
-            args.scope_declaration = review_scope.validate(guard.get("scope"))
-        verify_lock(Path(args.lock_script), Path(args.repo), review, args.token)
-        document = load_json(review)
+        document = load_object(review)
         validation_errors = state.validate_document(document)
         if validation_errors:
             raise ValueError("; ".join(validation_errors))
-        event = load_json(event_path)
+        event = load_object(event_path)
         event_id = event.get("event_id")
         if not isinstance(event_id, str):
             raise TypeError("event_id is required")
         base_sha = sha256(review)
-        if base_sha != args.expected_review_sha:
+        if base_sha != expectations.review_sha256:
             raise ValueError("canonical SHA does not match expected review SHA")
-        snapshot = current_snapshot(args)
-        if snapshot.get("fingerprint") != args.expected_source_fingerprint:
+        snapshot = current_snapshot(
+            args.repo, args.snapshot_script, expectations.scope_declaration
+        )
+        if snapshot.get("fingerprint") != expectations.source_fingerprint:
             raise ValueError("source fingerprint does not match expected fingerprint")
-        event_snapshot_field = state.SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        event_snapshot_field = state.source_field_for(event.get("kind"))
         if event_snapshot_field:
             event_snapshot = event.get(event_snapshot_field)
-            identity_fields = (
-                "revision",
-                "scope",
-                "exclusions",
-                "additional_inputs",
-                "fingerprint",
-            )
-            if not isinstance(event_snapshot, dict) or any(
-                event_snapshot.get(key) != snapshot.get(key) for key in identity_fields
+            if state.snapshot_identity(event_snapshot) != state.snapshot_identity(
+                snapshot
             ):
                 raise ValueError("event snapshot does not match guarded source")
         if event.get("kind") == "final_review":
@@ -396,8 +512,8 @@ def publish(args: argparse.Namespace) -> int:
             flagged = review_ledger.flagged_paths(
                 args.repo,
                 document,
-                snapshot.get("scope") or [],
-                snapshot.get("exclusions") or [],
+                snapshot_path_list(snapshot, "scope"),
+                snapshot_path_list(snapshot, "exclusions"),
             )
             acknowledgment = review_ledger.acknowledgment_error(
                 document, event, flagged
@@ -425,7 +541,9 @@ def publish(args: argparse.Namespace) -> int:
 
         # Recheck ownership at the transaction boundary. A direct helper call
         # and a lock change between preflight and commit are both rejected.
-        verify_lock(Path(args.lock_script), Path(args.repo), review, args.token)
+        verify_lock(
+            Path(args.lock_script), Path(args.repo), review, expectations.token
+        )
         if sha256(review) != base_sha:
             raise ValueError("canonical JSON changed before commit")
         # This replace is the one and only publication commit point.
@@ -436,14 +554,16 @@ def publish(args: argparse.Namespace) -> int:
         write_report(state, updated, report)
         if event_path.is_file() and sha256(event_path) == draft_sha:
             event_path.unlink()
-        release_lock(Path(args.lock_script), Path(args.repo), review, args.token)
+        release_lock(
+            Path(args.lock_script), Path(args.repo), review, expectations.token
+        )
         journal.unlink()
         if args.lease:
             Path(args.lease).unlink()
             Path(args.guard).unlink(missing_ok=True)
         print(
             json.dumps(
-                result(
+                result_with_canonical_digest(
                     status="published",
                     committed=True,
                     review=review,
@@ -460,7 +580,7 @@ def publish(args: argparse.Namespace) -> int:
     except Exception as error:  # noqa: BLE001
         if event_id and review.is_file():
             try:
-                committed = canonical_has_event(load_json(review), event_id)
+                committed = canonical_has_event(load_object(review), event_id)
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 pass
         status = "published_cleanup_required" if committed else "precommit_failed"
@@ -498,7 +618,7 @@ def publish(args: argparse.Namespace) -> int:
                 )
         print(
             json.dumps(
-                result(
+                result_with_canonical_digest(
                     status=status,
                     committed=committed,
                     review=review,
@@ -527,7 +647,7 @@ def recover_without_receipt(
     missing file here reads as a failure and invites a retry that cannot help.
     """
 
-    document = load_json(review)
+    document = load_object(review)
     errors = state.validate_document(document)
     if errors:
         raise ValueError("; ".join(errors))
@@ -542,7 +662,7 @@ def recover_without_receipt(
             blockers.append("the review is locked")
         print(
             json.dumps(
-                result(
+                result_with_canonical_digest(
                     status="nothing_to_recover",
                     committed=False,
                     review=review,
@@ -566,7 +686,7 @@ def recover_without_receipt(
     write_report(state, document, report)
     print(
         json.dumps(
-            result(
+            result_with_canonical_digest(
                 status="already_clean",
                 committed=False,
                 review=review,
@@ -582,6 +702,13 @@ def recover_without_receipt(
 
 
 def recover(args: argparse.Namespace) -> int:
+    """Settle whatever a publication left outstanding, without ever committing.
+
+    A receipt whose event reached canonical history has only the report, draft,
+    and receipt cleanup left, so a publication already finished settles as a
+    successful no-op. A receipt still in preparation is discarded instead, which
+    leaves canonical history untouched and the draft in place to publish again.
+    """
     review = Path(args.review)
     event_path = Path(args.event)
     report = Path(args.report)
@@ -591,16 +718,16 @@ def recover(args: argparse.Namespace) -> int:
     committed = False
     try:
         if args.lease and Path(args.lease).exists():
-            lease = load_secure_json(Path(args.lease), "lease")
-            args.token = lease.get("token")
+            lease = load_secure_object(Path(args.lease), "lease")
+            args.token = lease_token(lease)
         if not journal.exists():
             return recover_without_receipt(args, review, event_path, report, state)
-        receipt = load_json(journal)
+        receipt = load_object(journal)
         validate_receipt(receipt, state)
         event_id = receipt.get("event_id")
         if not isinstance(event_id, str):
             raise TypeError("publication journal has no event_id")
-        document = load_json(review)
+        document = load_object(review)
         errors = state.validate_document(document)
         if errors:
             raise ValueError("; ".join(errors))
@@ -621,7 +748,7 @@ def recover(args: argparse.Namespace) -> int:
             journal.unlink()
             print(
                 json.dumps(
-                    result(
+                    result_with_canonical_digest(
                         status="prepared_publication_aborted",
                         committed=False,
                         review=review,
@@ -660,7 +787,7 @@ def recover(args: argparse.Namespace) -> int:
             Path(args.guard).unlink(missing_ok=True)
         print(
             json.dumps(
-                result(
+                result_with_canonical_digest(
                     status="recovered",
                     committed=True,
                     review=review,
@@ -676,12 +803,12 @@ def recover(args: argparse.Namespace) -> int:
     except Exception as error:  # noqa: BLE001
         if event_id and review.is_file():
             try:
-                committed = canonical_has_event(load_json(review), event_id)
+                committed = canonical_has_event(load_object(review), event_id)
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 pass
         print(
             json.dumps(
-                result(
+                result_with_canonical_digest(
                     status=(
                         "published_cleanup_required"
                         if committed
@@ -704,13 +831,130 @@ def recover(args: argparse.Namespace) -> int:
         return 1
 
 
+def render_dashboard(dashboard: dict[str, Any], card: dict[str, Any]) -> str:
+    """Render the inspection dashboard as the text a human reads.
+
+    Every line is read back out of the dashboard the `--json` form prints, so the two
+    views can never disagree about what the inspection observed.
+    """
+
+    workflow = dashboard["workflow"]
+    source = dashboard["source"]
+    accretion = dashboard["accretion"]
+    lines = [
+        f"phase: {workflow['phase']}",
+        f"expected_responder: {workflow['primary_actor'] or 'none'}",
+        "allowed_events_by_actor: "
+        + json.dumps(workflow["allowed_events_by_actor"], sort_keys=True),
+        f"open_threads: {', '.join(dashboard['open_threads']) or 'none'}",
+        "open_validation_gaps: "
+        + (", ".join(dashboard["open_validation_gaps"]) or "none"),
+        f"operation_status: {dashboard['operation']['status']}",
+        f"lock_status: {dashboard['operation']['lock_status']}",
+    ]
+    if dashboard["review_kind"] == "structure":
+        lines.append(f"review_kind: {dashboard['review_kind']}")
+    if accretion and accretion["flagged"]:
+        lines.append(
+            "accretion_flagged: "
+            + ", ".join(
+                f"{path} ({'+'.join(accretion['files'][path]['flags'])})"
+                for path in accretion["flagged"]
+            )
+        )
+    lines.extend(
+        [
+            f"source_drift: {str(source['drift']).lower()}",
+            f"approval_stale: {str(source['approval_stale']).lower()}",
+        ]
+    )
+    if source["terminal_outcome"]:
+        lines.append(f"terminal_outcome: {source['terminal_outcome']}")
+    if source["drift"] and source["drift_detail_available"]:
+        lines.extend(
+            [
+                "changed_paths: "
+                + (
+                    ", ".join(
+                        f"{item['change']} {item['path']}"
+                        for item in source["changed_paths"]
+                    )
+                    or "none identified individually"
+                ),
+                "tracked_diff_changed: "
+                + str(source["tracked_diff_changed"]).lower()
+                + " (aggregate; individual tracked paths are not recorded)",
+                "revision_changed: " + str(source["revision_changed"]).lower(),
+            ]
+        )
+        if source["scope_changes"]:
+            lines.append(
+                "scope_changes: " + json.dumps(source["scope_changes"], sort_keys=True)
+            )
+    if source["source_moved_since_terminal"]:
+        lines.append(
+            "note: this loop ended without an approval; "
+            "the source has moved since it was recorded"
+        )
+    lines.extend(
+        [
+            "timeout: " + json.dumps(dashboard["timeout_eligibility"], sort_keys=True),
+            f"recommended_next_command: {dashboard['recommended_next_command']}",
+            *review_card.render_card(card),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def timeout_eligibility(document: dict[str, Any]) -> dict[str, Any] | None:
+    """Report the timeout this phase structurally allows, and whether it is due yet.
+
+    None for a phase that allows none, which is every terminal and any waiting phase
+    whose anchoring event is missing.
+    """
+
+    workflow = document["state"]["workflow"]
+    latest = document["state"].get("latest_event")
+    if workflow["phase"] == "awaiting_initial_review":
+        kind = "initial_review_timeout"
+        started_text = document.get("created_at")
+    elif workflow["phase"] in {"owner_response", "reviewer_verification"} and isinstance(
+        latest, dict
+    ):
+        kind = (
+            "owner_timeout"
+            if workflow["phase"] == "owner_response"
+            else "reviewer_timeout"
+        )
+        started_text = latest["occurred_at"]
+    else:
+        return None
+    if not started_text:
+        return None
+    started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
+    deadline = started + TIMEOUT_DURATION_BY_KIND[kind]
+    return {
+        "event_kind": kind,
+        "started_at": started.isoformat(),
+        "deadline": deadline.isoformat(),
+        "eligible": datetime.now(timezone.utc) >= deadline,
+    }
+
+
 def operation(args: argparse.Namespace) -> int:
+    """Print the dashboard an agent routes on.
+
+    It reports artifact condition, timeout eligibility, source drift, the
+    accretion ledger, and the one recommended next command. Every field is
+    derived from canonical state and the current source; nothing here writes, so
+    an inspection is safe to repeat.
+    """
     review = Path(args.review)
     event = Path(args.event)
     report = Path(args.report)
     journal = Path(args.journal)
     state = import_state(Path(args.state_script))
-    document = load_json(review)
+    document = load_object(review)
     expected_report = state.render_report(document)
     report_matches = (
         report.is_file()
@@ -722,7 +966,7 @@ def operation(args: argparse.Namespace) -> int:
     artifact_error: str | None = None
     if journal.exists():
         try:
-            receipt = load_json(journal)
+            receipt = load_object(journal)
             validate_receipt(receipt, state)
             receipt_phase = receipt["commit_phase"]
             present = canonical_has_event(document, receipt["event_id"])
@@ -742,7 +986,7 @@ def operation(args: argparse.Namespace) -> int:
             artifact_error = str(error)
     elif event.exists():
         try:
-            draft = load_json(event)
+            draft = load_object(event)
             errors = state.validate_event(draft)
             if errors:
                 status = "editing_draft"
@@ -761,35 +1005,7 @@ def operation(args: argparse.Namespace) -> int:
         status = "clean"
         recovery = "none"
     workflow = document["state"]["workflow"]
-    timeout_eligibility: dict[str, Any] | None = None
-    latest = document["state"].get("latest_event")
-    started_text: str | None = None
-    kind = ""
-    if workflow["phase"] == "awaiting_initial_review":
-        kind = "initial_review_timeout"
-        started_text = document.get("created_at")
-    elif workflow["phase"] in {"owner_response", "reviewer_verification"} and isinstance(
-        latest, dict
-    ):
-        kind = (
-            "owner_timeout"
-            if workflow["phase"] == "owner_response"
-            else "reviewer_timeout"
-        )
-        started_text = latest["occurred_at"]
-    if started_text:
-        started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
-        deadline = started + (
-            timedelta(minutes=30)
-            if kind == "reviewer_timeout"
-            else timedelta(hours=2)
-        )
-        timeout_eligibility = {
-            "event_kind": kind,
-            "started_at": started.isoformat(),
-            "deadline": deadline.isoformat(),
-            "eligible": datetime.now(timezone.utc) >= deadline,
-        }
+    eligibility = timeout_eligibility(document)
     source_drift = (
         bool(document["state"]["source_fingerprint"])
         and args.current_source_fingerprint != document["state"]["source_fingerprint"]
@@ -807,14 +1023,11 @@ def operation(args: argparse.Namespace) -> int:
         workflow["phase"] == "terminal" and source_drift and not approval_stale
     )
     # Absent for a caller that supplies only a fingerprint; drift is then reported
-    # without per-path detail rather than failing.
-    current_source_json = getattr(args, "current_source_json", "")
-    try:
-        current_snapshot_value = (
-            json.loads(current_source_json) if current_source_json else None
-        )
-    except json.JSONDecodeError:
-        current_snapshot_value = None
+    # without per-path detail rather than failing. A value that is present but will not
+    # decode is a defect in our own CLI, not caller input, so the error surfaces.
+    current_snapshot_value = (
+        json.loads(args.current_source_json) if args.current_source_json else None
+    )
     drift_detail = source_drift_detail(
         recorded_snapshot(document, state), current_snapshot_value
     )
@@ -847,8 +1060,8 @@ def operation(args: argparse.Namespace) -> int:
         accretion = review_ledger.ledger(
             args.repo,
             document,
-            current_snapshot_value.get("scope") or [],
-            current_snapshot_value.get("exclusions") or [],
+            snapshot_path_list(current_snapshot_value, "scope"),
+            snapshot_path_list(current_snapshot_value, "exclusions"),
         )
     structure_due = workflow[
         "phase"
@@ -957,10 +1170,7 @@ def operation(args: argparse.Namespace) -> int:
         ("source_drift", source_drift),
         ("scope_undeclared", not document["state"]["source_fingerprint"]),
         ("scope_changed", bool(drift_detail["scope_changes"])),
-        (
-            "timeout_eligible",
-            bool(timeout_eligibility and timeout_eligibility["eligible"]),
-        ),
+        ("timeout_eligible", bool(eligibility and eligibility["eligible"])),
         ("open_validation_gaps", bool(document["state"]["validation_gaps"]["open"])),
         ("structure_round", document.get("review_kind") == "structure"),
         ("structure_follow_up_due", structure_due),
@@ -1007,7 +1217,7 @@ def operation(args: argparse.Namespace) -> int:
         "open_threads": document["state"]["threads"]["open"],
         "open_validation_gaps": document["state"]["validation_gaps"]["open"],
         "operation": operation_value,
-        "timeout_eligibility": timeout_eligibility,
+        "timeout_eligibility": eligibility,
         "source": {
             "recorded_fingerprint": document["state"]["source_fingerprint"],
             "current_fingerprint": args.current_source_fingerprint,
@@ -1028,86 +1238,7 @@ def operation(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(dashboard, indent=2))
     else:
-        print(
-            "\n".join(
-                [
-                    f"phase: {workflow['phase']}",
-                    f"expected_responder: {workflow['primary_actor'] or 'none'}",
-                    "allowed_events_by_actor: "
-                    + json.dumps(workflow["allowed_events_by_actor"], sort_keys=True),
-                    f"open_threads: {', '.join(dashboard['open_threads']) or 'none'}",
-                    "open_validation_gaps: "
-                    + (", ".join(dashboard["open_validation_gaps"]) or "none"),
-                    f"operation_status: {status}",
-                    f"lock_status: {operation_value['lock_status']}",
-                    *(
-                        [f"review_kind: {document['review_kind']}"]
-                        if document.get("review_kind") == "structure"
-                        else []
-                    ),
-                    *(
-                        [
-                            "accretion_flagged: "
-                            + ", ".join(
-                                f"{path} ({'+'.join(accretion['files'][path]['flags'])})"
-                                for path in accretion["flagged"]
-                            )
-                        ]
-                        if accretion and accretion["flagged"]
-                        else []
-                    ),
-                    f"source_drift: {str(source_drift).lower()}",
-                    f"approval_stale: {str(approval_stale).lower()}",
-                    *(
-                        [f"terminal_outcome: {terminal_outcome_value}"]
-                        if terminal_outcome_value
-                        else []
-                    ),
-                    *(
-                        [
-                            "changed_paths: "
-                            + (
-                                ", ".join(
-                                    f"{item['change']} {item['path']}"
-                                    for item in drift_detail["changed_paths"]
-                                )
-                                or "none identified individually"
-                            ),
-                            "tracked_diff_changed: "
-                            + str(drift_detail["tracked_diff_changed"]).lower()
-                            + " (aggregate; individual tracked paths are not recorded)",
-                            "revision_changed: "
-                            + str(drift_detail["revision_changed"]).lower(),
-                            *(
-                                [
-                                    "scope_changes: "
-                                    + json.dumps(
-                                        drift_detail["scope_changes"], sort_keys=True
-                                    )
-                                ]
-                                if drift_detail["scope_changes"]
-                                else []
-                            ),
-                        ]
-                        if source_drift and drift_detail["available"]
-                        else []
-                    ),
-                    *(
-                        [
-                            (
-                                "note: this loop ended without an approval; "
-                                "the source has moved since it was recorded"
-                            )
-                        ]
-                        if terminal_source_moved
-                        else []
-                    ),
-                    "timeout: " + json.dumps(timeout_eligibility, sort_keys=True),
-                    f"recommended_next_command: {recommended}",
-                    *review_card.render_card(card),
-                ]
-            )
-        )
+        print(render_dashboard(dashboard, card))
     return 0
 
 

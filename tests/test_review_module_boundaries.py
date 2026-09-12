@@ -41,9 +41,22 @@ class ReviewModuleBoundaryTest(unittest.TestCase):
         workflow_imports = imported_modules(SCRIPTS / "review_workflow.py")
 
         self.assertNotIn("review_render", workflow_imports)
-        self.assertIn("review_notes", workflow_imports)
-        # The shared note marker must stay dependency-neutral.
+        # The shared note tag set must stay dependency-neutral.
         self.assertEqual(imported_modules(SCRIPTS / "review_notes.py"), set())
+
+    def test_composer_sits_above_workflow_and_below_presentation(self) -> None:
+        composer_imports = imported_modules(SCRIPTS / "review_compose.py")
+        workflow_imports = imported_modules(SCRIPTS / "review_workflow.py")
+
+        # The composer leases through the workflow layer and types against the
+        # schema; the direction never reverses, so the workflow never learns
+        # about authoring.
+        self.assertIn("review_workflow", composer_imports)
+        self.assertIn("review_schema", composer_imports)
+        self.assertIn("review_notes", composer_imports)
+        self.assertNotIn("review_compose", workflow_imports)
+        for forbidden in ("review_render", "review_projection", "review_state"):
+            self.assertNotIn(forbidden, composer_imports)
 
     def test_state_facade_exposes_schema_and_projection_contracts(self) -> None:
         self.assertIs(review_state.validate_event, review_schema.validate_event)

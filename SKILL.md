@@ -3,7 +3,7 @@ name: local-pr-loop
 description: Use when the user names local-pr-loop, asks for iterative review of local or uncommitted work, or asks to keep reviewing until LGTM. Runs the owner or reviewer role in a repository-local JSON PR loop — durable conversation threads, immutable history, source-drift guards, validated routing, timeouts, and a skim-first Markdown summary report — that progresses without hosted PR comments until every thread is resolved and the current source reaches LGTM. Do not simulate this loop with ad-hoc subagent review rounds; a review without durable threads, a source guard, and a lock is not a local-pr-loop.
 license: MIT
 metadata:
-  version: "0.9.0"
+  version: "0.10.0"
 ---
 
 # Local PR Loop
@@ -83,8 +83,8 @@ Only the reviewer resolves or reopens threads. Preserve all replies and decision
 as immutable events and derive thread state from history.
 
 When a change shifts design, a behavior contract, or business logic, or a
-decision needs the user's attention, flag it with `add-note` on your draft
-reply, decision, or resolution — the summary report lifts these notes into the
+decision needs the user's attention, flag it with `draft note` on the thread
+your draft already acts on — the summary report lifts these notes into the
 section the user reads first. Never flag mechanical fixes. Both roles may
 write notes; `deferred/blocked` replies and timeout terminals surface
 automatically without one.
@@ -93,7 +93,7 @@ automatically without one.
 
 One agent context holds one role for the life of a handoff. When an
 orchestrator delegates review, the delegated reviewer itself runs the full CLI
-sequence — lock, `inspect`, `template`, `validate-event`, `publish` — so lock
+sequence — lock, `inspect`, `template`, `draft`, `publish` — so lock
 tenure and evidence are first-person. Transcribing a terminated subagent's
 findings into a reviewer event claims unperformed validation and is forbidden.
 
@@ -174,7 +174,7 @@ the shape of its whole guarded scope while preserving behavior: read
 Verification is behavior preservation — the full test suite passes with test
 files unchanged — instead of diff locality, and its LGTM asserts "same
 behavior, better shape". Correctness findings discovered mid-round are flagged
-with `add-note` and routed to a new correctness loop, never mixed in. One
+with `draft note` and routed to a new correctness loop, never mixed in. One
 structure round consumes the flag set that triggered it.
 
 ## Reading State
@@ -253,10 +253,17 @@ phase action, and `inspect` names the changed paths.
 5. Create a state-aware draft with `template REPO REVIEW_ID KIND`. Read
    `threads` when handling a multi-turn conversation, and
    `threads --summary --open` when you only need to route.
-6. Populate the remaining blanks. Use `add-check`, `add-gap`, and
-   `evidence-template` for correctly shaped validation records, and `add-note`
-   for user-facing notes on design-shifting changes.
-7. Run `validate-event`, repeat `inspect`, then run `publish REPO REVIEW_ID`.
+6. Compose each act with `draft REPO REVIEW_ID SUBCOMMAND ...`: `open-thread`,
+   `reply`, `comment`, `resolve`, `reopen`, `open-gap`, `resolve-gap`,
+   `record-check`, `note`, `replace-source`, `approve`, and `reply-context`.
+   Each one refuses bad input as you type it, and `--help` states its
+   arguments. Composing an act again corrects it, except `note`, which
+   accumulates so one thread can carry several; correct a note with `draft
+   REPO REVIEW_ID drop note.attach T<N>`, which takes every note on that
+   thread, then compose the ones that stay. `draft REPO REVIEW_ID drop
+   OP TARGET` takes any other act back. Never edit the draft JSON yourself.
+7. Run `draft REPO REVIEW_ID show` and compose away whatever it lists as
+   outstanding, repeat `inspect`, then run `publish REPO REVIEW_ID`.
 8. Read the structured publication result. After any nonzero result, inspect
    canonical state first. If `committed` is true or the event is latest, never
    retry the old SHA; run `recover-publish`.
@@ -277,14 +284,14 @@ Use priorities consistently:
 
 ## Non-Negotiable Rules
 
-- Populate only the temporary event created by `template`. Let only `publish`
-  append canonical history and derive state.
-- Let `template` and `validate-event` carry the schema. Populate only a
-  draft's semantic blanks and fix reported failures instead of hand-shaping
-  IDs, timestamps, or fields; exact contracts live in
-  [review-schema.md](references/review-schema.md). Unknown fields are
-  rejected so raw credentials and response payloads cannot silently enter
-  canonical history.
+- Change the temporary event created by `template` only through `draft`
+  subcommands. Let only `publish` append canonical history and derive state.
+- Let `template` and the composer carry the schema. Supply decisions as typed
+  flags and prose as text or message files, and fix what a refusal reports
+  instead of hand-shaping IDs, timestamps, or fields; exact contracts live in
+  [review-schema.md](references/review-schema.md), which routine authoring
+  never needs to open. Unknown fields are rejected so raw credentials and
+  response payloads cannot silently enter canonical history.
 - For external-contract P1/P2 findings, record `live_probe`,
   `captured_fixture`, or `authoritative_contract` evidence with provenance,
   observation time, and sanitized result. A synthetic counterexample alone is

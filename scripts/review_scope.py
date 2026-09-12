@@ -73,17 +73,6 @@ def declared_paths(value: object) -> list[str]:
     return [*declared["scope"], *declared["additional_input"]]
 
 
-def normalize_path(path: str) -> str:
-    """Return a lexically comparable repository-relative path.
-
-    This only trims separators. It cannot see through ``..`` segments or symlinks, so it
-    is never sufficient on its own for a safety decision; use `canonical_path` wherever a
-    repository root is available.
-    """
-
-    return path.strip("/")
-
-
 def canonical_path(repository_root: str, path: str) -> str:
     """Return one repository-relative identity for a declared path.
 
@@ -115,10 +104,12 @@ def canonical_paths(repository_root: str, paths: list[str]) -> list[str]:
     return [canonical_path(repository_root, path) for path in paths]
 
 
-def require_distinct_declarations(
-    repository_root: str, value: object
-) -> dict[str, list[str]]:
+def require_distinct_paths(repository_root: str, value: object) -> dict[str, list[str]]:
     """Validate a declaration and reject aliases of one path in two roles.
+
+    This is the distinctness rule alone. Use it wherever a declaration only has to
+    name one path once, such as rebuilding the snapshot of a scope whose files may
+    since have been deleted.
 
     Raises:
         ValueError: A path is declared as both reviewed scope and an additional input, or
@@ -139,6 +130,20 @@ def require_distinct_declarations(
             "scope declaration lists the same repository path as both a reviewed path "
             "and an additional input: " + "; ".join(sorted(duplicated))
         )
+    return declared
+
+
+def require_distinct_declarations(
+    repository_root: str, value: object
+) -> dict[str, list[str]]:
+    """Validate a declaration a guard is about to record: distinct roles, present paths.
+
+    Raises:
+        ValueError: A path is declared as both reviewed scope and an additional input,
+            resolves outside the repository, or is missing from the worktree.
+    """
+
+    declared = require_distinct_paths(repository_root, value)
     require_existing_paths(repository_root, declared)
     return declared
 
@@ -175,22 +180,20 @@ def covers(container: str, candidate: str) -> bool:
 
 
 def overlapping_paths(
-    first: list[str], second: list[str], repository_root: str | None = None
+    first: list[str], second: list[str], repository_root: str
 ) -> list[str]:
     """Return the paths two scopes share, treating a directory as its whole subtree.
 
     Two loops that guard ``src`` and ``src/app.py`` are reviewing the same file, so a
     plain set intersection would miss the conflict that matters.
 
-    Supply ``repository_root`` for any safety decision. Without it the comparison is
-    lexical, so ``src/../shared`` and ``shared`` look unrelated even though they name one
-    file. A path that resolves outside the repository is skipped rather than compared,
-    because it can never be part of a guarded scope.
+    The comparison is canonical because it decides whether two loops may guard the same
+    file: ``src/../shared`` and ``shared`` name one file and must overlap. A path that
+    resolves outside the repository is skipped rather than compared, because it can never
+    be part of a guarded scope.
     """
 
     def identities(paths: list[str]) -> list[str]:
-        if repository_root is None:
-            return [normalize_path(path) for path in paths]
         resolved = []
         for path in paths:
             try:
@@ -214,9 +217,12 @@ def snapshot_arguments(repository_root: str, value: object) -> list[str]:
 
     Options are emitted from their own fields and the reviewed paths follow a ``--``
     separator, so a path is never read as an option and an option is never recorded as a path.
+
+    Only distinctness is enforced, not existence: a snapshot of a scope whose guarded file
+    was deleted must still report that deletion as drift rather than refuse to be taken.
     """
 
-    declared = validate(value)
+    declared = require_distinct_paths(repository_root, value)
     arguments = ["--repo", str(repository_root)]
     for exclusion in declared["exclude"]:
         arguments.extend(["--exclude", exclusion])

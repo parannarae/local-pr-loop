@@ -14,6 +14,9 @@ from typing import Any
 
 MODULE = Path(__file__).parents[1] / "scripts" / "review_ledger.py"
 sys.path.insert(0, str(MODULE.parent))
+
+import review_schema
+
 SPEC = importlib.util.spec_from_file_location("review_ledger", MODULE)
 assert SPEC and SPEC.loader
 review_ledger = importlib.util.module_from_spec(SPEC)
@@ -32,10 +35,37 @@ def run(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def thread(paths: list[str] | None) -> dict[str, Any]:
-    value: dict[str, Any] = {"id": "T1", "title": "finding"}
+    """Build the `thread.open` operation the ledger counts paths from."""
+    value: dict[str, Any] = {"op": "thread.open", "id": "T1", "title": "finding"}
     if paths is not None:
         value["paths"] = paths
     return value
+
+
+def approval(debt_record: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the `review.approve` operation a final_review carries."""
+    operation: dict[str, Any] = {"op": "review.approve", "decision": "LGTM"}
+    if debt_record is not None:
+        operation["structure_debt"] = debt_record
+    return operation
+
+
+def successor_document(
+    review_id: str = "zzzzzzzz", prior_review_id: str = "abcdefgh"
+) -> dict[str, Any]:
+    """Build a structure successor as it is stored on disk.
+
+    The storage contract fields are what make the sibling readable under this
+    revision; a document without them is not this revision's to interpret, so the
+    successor scan does not count it.
+    """
+    return {
+        "format": review_schema.FORMAT,
+        "format_revision": review_schema.FORMAT_REVISION,
+        "review_id": review_id,
+        "prior_review_id": prior_review_id,
+        "review_kind": "structure",
+    }
 
 
 def document(
@@ -55,22 +85,25 @@ def document(
 
 
 class ThreadCountTest(unittest.TestCase):
-    def test_counts_threads_and_new_threads_per_path(self) -> None:
+    def test_counts_thread_open_operations_per_path(self) -> None:
         history = [
-            {"kind": "review", "threads": [thread(["a.py", "b.py"]), thread(["a.py"])]},
-            {"kind": "reviewer_update", "new_threads": [thread(["a.py"])]},
+            {
+                "kind": "review",
+                "operations": [thread(["a.py", "b.py"]), thread(["a.py"])],
+            },
+            {"kind": "reviewer_update", "operations": [thread(["a.py"])]},
         ]
         self.assertEqual(
             review_ledger.thread_counts(history), {"a.py": 3, "b.py": 1}
         )
 
     def test_thread_without_paths_counts_toward_nothing(self) -> None:
-        history = [{"kind": "review", "threads": [thread(None), thread([])]}]
+        history = [{"kind": "review", "operations": [thread(None), thread([])]}]
         self.assertEqual(review_ledger.thread_counts(history), {})
 
     def test_five_threads_flag_a_file_and_four_do_not(self) -> None:
-        four = [{"kind": "review", "threads": [thread(["a.py"])] * 4}]
-        five = [{"kind": "review", "threads": [thread(["a.py"])] * 5}]
+        four = [{"kind": "review", "operations": [thread(["a.py"])] * 4}]
+        five = [{"kind": "review", "operations": [thread(["a.py"])] * 5}]
         ledger_four = review_ledger.ledger(".", document(four), ["a.py"], [])
         ledger_five = review_ledger.ledger(".", document(five), ["a.py"], [])
         self.assertEqual(ledger_four["flagged"], [])
@@ -78,21 +111,79 @@ class ThreadCountTest(unittest.TestCase):
         self.assertEqual(ledger_five["files"]["a.py"]["flags"], ["threads"])
 
     def test_thread_path_outside_the_guarded_scope_never_flags(self) -> None:
-        history = [{"kind": "review", "threads": [thread(["outside.py"])] * 9}]
+        history = [{"kind": "review", "operations": [thread(["outside.py"])] * 9}]
         ledger = review_ledger.ledger(".", document(history), ["guarded.py"], [])
         self.assertEqual(ledger["flagged"], [])
         self.assertNotIn("outside.py", ledger["files"])
 
     def test_directory_scope_covers_nested_thread_paths(self) -> None:
-        history = [{"kind": "review", "threads": [thread(["src/a.py"])] * 5}]
+        history = [{"kind": "review", "operations": [thread(["src/a.py"])] * 5}]
         ledger = review_ledger.ledger(".", document(history), ["src"], [])
         self.assertEqual(ledger["flagged"], ["src/a.py"])
 
     def test_excluded_thread_path_is_dropped(self) -> None:
-        history = [{"kind": "review", "threads": [thread(["src/a.py"])] * 5}]
+        history = [{"kind": "review", "operations": [thread(["src/a.py"])] * 5}]
         ledger = review_ledger.ledger(
             ".", document(history), ["src"], ["src/a.py"]
         )
+        self.assertEqual(ledger["flagged"], [])
+
+
+class CanonicalScopeTest(unittest.TestCase):
+    """One guarded file has one identity, however a thread spells its path.
+
+    `thread.open.paths` is agent-authored, so a `..` segment or a symlink alias used to
+    miss the guarded file entirely: its threads were dropped as out of scope, and the
+    flagged set the final_review had to acknowledge was short by that file.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.repo = Path(self.temporary.name).resolve()
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.py").write_text("value\n")
+        (self.repo / "alias.py").symlink_to(self.repo / "src" / "app.py")
+
+    def ledger_over(self, paths: list[str], count: int) -> dict[str, Any]:
+        history = [{"kind": "review", "operations": [thread(paths)] * count}]
+        return review_ledger.ledger(str(self.repo), document(history), ["src"], [])
+
+    def test_a_dot_dot_path_counts_toward_the_file_it_names(self) -> None:
+        ledger = self.ledger_over(["src/../src/app.py"], 5)
+
+        self.assertEqual(ledger["flagged"], ["src/app.py"])
+        self.assertEqual(ledger["files"]["src/app.py"]["threads"], 5)
+
+    def test_a_symlink_alias_merges_into_the_guarded_files_single_count(self) -> None:
+        history = [
+            {
+                "kind": "review",
+                "operations": [thread(["alias.py"])] * 3 + [thread(["src/app.py"])] * 2,
+            }
+        ]
+
+        ledger = review_ledger.ledger(str(self.repo), document(history), ["src"], [])
+
+        # One entry, not two spellings: `structure_debt.flagged_paths` must not have to
+        # repeat the alias verbatim to satisfy the acknowledgment gate.
+        self.assertEqual(ledger["flagged"], ["src/app.py"])
+        self.assertEqual(ledger["files"]["src/app.py"]["threads"], 5)
+        self.assertNotIn("alias.py", ledger["files"])
+
+    def test_a_thread_path_outside_the_repository_is_dropped(self) -> None:
+        ledger = self.ledger_over(["../elsewhere.py"], 9)
+
+        self.assertEqual(ledger["flagged"], [])
+        self.assertEqual(ledger["files"], {})
+
+    def test_an_exclusion_spelled_as_an_alias_still_excludes(self) -> None:
+        history = [{"kind": "review", "operations": [thread(["src/app.py"])] * 5}]
+
+        ledger = review_ledger.ledger(
+            str(self.repo), document(history), ["src"], ["alias.py"]
+        )
+
         self.assertEqual(ledger["flagged"], [])
 
 
@@ -150,12 +241,12 @@ class GrowthTest(unittest.TestCase):
 
     def test_thread_and_growth_flags_combine_on_one_file(self) -> None:
         self.grow(30)
-        history = [{"kind": "review", "threads": [thread(["module.py"])] * 5}]
+        history = [{"kind": "review", "operations": [thread(["module.py"])] * 5}]
         ledger = self.ledger(history)
         self.assertEqual(ledger["files"]["module.py"]["flags"], ["threads", "growth"])
 
     def test_missing_base_skips_growth_and_keeps_thread_signal(self) -> None:
-        history = [{"kind": "review", "threads": [thread(["module.py"])] * 5}]
+        history = [{"kind": "review", "operations": [thread(["module.py"])] * 5}]
         ledger = review_ledger.ledger(
             str(self.repo), document(history), ["module.py"], []
         )
@@ -219,14 +310,14 @@ class GrowthTest(unittest.TestCase):
 
 class FlaggedPathsTest(unittest.TestCase):
     def test_structure_round_never_reports_flagged_paths(self) -> None:
-        history = [{"kind": "review", "threads": [thread(["a.py"])] * 9}]
+        history = [{"kind": "review", "operations": [thread(["a.py"])] * 9}]
         flagged = review_ledger.flagged_paths(
             ".", document(history, review_kind="structure"), ["a.py"], []
         )
         self.assertEqual(flagged, [])
 
     def test_policy_off_never_reports_flagged_paths(self) -> None:
-        history = [{"kind": "review", "threads": [thread(["a.py"])] * 9}]
+        history = [{"kind": "review", "operations": [thread(["a.py"])] * 9}]
         flagged = review_ledger.flagged_paths(
             ".", document(history, structure_policy="off"), ["a.py"], []
         )
@@ -243,39 +334,40 @@ def debt(paths: list[str], disposition: str = "structure_deferred") -> dict[str,
 class AcknowledgmentTest(unittest.TestCase):
     def test_non_final_review_events_are_never_checked(self) -> None:
         error = review_ledger.acknowledgment_error(
-            document(), {"kind": "owner_reply"}, ["a.py"]
+            document(), {"kind": "owner_reply", "operations": []}, ["a.py"]
         )
         self.assertIsNone(error)
 
     def test_flagged_files_without_structure_debt_are_rejected(self) -> None:
-        error = review_ledger.acknowledgment_error(
-            document(), {"kind": "final_review"}, ["a.py"]
-        )
+        event = {"kind": "final_review", "operations": [approval()]}
+        error = review_ledger.acknowledgment_error(document(), event, ["a.py"])
         self.assertIn("a.py", error or "")
 
     def test_matching_acknowledgment_passes(self) -> None:
-        event = {"kind": "final_review", "structure_debt": debt(["a.py", "b.py"])}
+        event = {
+            "kind": "final_review",
+            "operations": [approval(debt(["a.py", "b.py"]))],
+        }
         error = review_ledger.acknowledgment_error(document(), event, ["b.py", "a.py"])
         self.assertIsNone(error)
 
     def test_stale_flagged_set_is_rejected(self) -> None:
-        event = {"kind": "final_review", "structure_debt": debt(["a.py"])}
+        event = {"kind": "final_review", "operations": [approval(debt(["a.py"]))]}
         error = review_ledger.acknowledgment_error(document(), event, ["b.py"])
         self.assertIn("does not match", error or "")
 
     def test_unflagged_acknowledgment_is_rejected(self) -> None:
-        event = {"kind": "final_review", "structure_debt": debt(["a.py"])}
+        event = {"kind": "final_review", "operations": [approval(debt(["a.py"]))]}
         error = review_ledger.acknowledgment_error(document(), event, [])
         self.assertIn("no file is accretion-flagged", error or "")
 
     def test_clean_final_review_passes(self) -> None:
-        error = review_ledger.acknowledgment_error(
-            document(), {"kind": "final_review"}, []
-        )
+        event = {"kind": "final_review", "operations": [approval()]}
+        error = review_ledger.acknowledgment_error(document(), event, [])
         self.assertIsNone(error)
 
     def test_structure_round_rejects_structure_debt(self) -> None:
-        event = {"kind": "final_review", "structure_debt": debt(["a.py"])}
+        event = {"kind": "final_review", "operations": [approval(debt(["a.py"]))]}
         error = review_ledger.acknowledgment_error(
             document(review_kind="structure"), event, []
         )
@@ -292,7 +384,9 @@ class FollowUpTest(unittest.TestCase):
         self.reviews = Path(self.temporary.name)
 
     def deferred_document(self, **overrides: Any) -> dict[str, Any]:
-        history = [{"kind": "final_review", "structure_debt": debt(["a.py"])}]
+        history = [
+            {"kind": "final_review", "operations": [approval(debt(["a.py"]))]}
+        ]
         return document(history, **overrides)
 
     def test_deferred_terminal_under_auto_is_due(self) -> None:
@@ -310,7 +404,7 @@ class FollowUpTest(unittest.TestCase):
         )
 
     def test_structure_round_is_never_due(self) -> None:
-        history = [{"kind": "final_review"}]
+        history = [{"kind": "final_review", "operations": [approval()]}]
         self.assertFalse(
             review_ledger.structure_follow_up_due(
                 document(history, review_kind="structure"), self.reviews
@@ -321,7 +415,7 @@ class FollowUpTest(unittest.TestCase):
         history = [
             {
                 "kind": "final_review",
-                "structure_debt": debt(["a.py"], "structure_reviewed"),
+                "operations": [approval(debt(["a.py"], "structure_reviewed"))],
             }
         ]
         self.assertFalse(
@@ -329,25 +423,42 @@ class FollowUpTest(unittest.TestCase):
         )
 
     def test_existing_structure_successor_consumes_the_flag_set(self) -> None:
-        successor = {
-            "review_id": "zzzzzzzz",
-            "prior_review_id": "abcdefgh",
-            "review_kind": "structure",
-        }
-        (self.reviews / "zzzzzzzz.json").write_text(json.dumps(successor))
+        (self.reviews / "zzzzzzzz.json").write_text(json.dumps(successor_document()))
         self.assertFalse(
             review_ledger.structure_follow_up_due(
                 self.deferred_document(), self.reviews
             )
         )
 
+    def test_successor_of_another_format_revision_does_not_consume_the_flag_set(
+        self,
+    ) -> None:
+        successor = successor_document()
+        successor["format_revision"] = "2026-01-01.1"
+        (self.reviews / "zzzzzzzz.json").write_text(json.dumps(successor))
+        self.assertTrue(
+            review_ledger.structure_follow_up_due(
+                self.deferred_document(), self.reviews
+            )
+        )
+
+    def test_successor_without_a_storage_contract_does_not_consume_the_flag_set(
+        self,
+    ) -> None:
+        successor = successor_document()
+        del successor["format"]
+        del successor["format_revision"]
+        (self.reviews / "zzzzzzzz.json").write_text(json.dumps(successor))
+        self.assertTrue(
+            review_ledger.structure_follow_up_due(
+                self.deferred_document(), self.reviews
+            )
+        )
+
     def test_non_canonical_artifacts_are_ignored_in_the_successor_scan(self) -> None:
-        successor = {
-            "review_id": "zzzzzzzz",
-            "prior_review_id": "abcdefgh",
-            "review_kind": "structure",
-        }
-        (self.reviews / "zzzzzzzz.guard.json").write_text(json.dumps(successor))
+        (self.reviews / "zzzzzzzz.guard.json").write_text(
+            json.dumps(successor_document())
+        )
         self.assertTrue(
             review_ledger.structure_follow_up_due(
                 self.deferred_document(), self.reviews

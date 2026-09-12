@@ -55,6 +55,7 @@ def make_document(
 
 def make_thread(thread_id: str, priority: str, title: str, risk: str) -> dict[str, Any]:
     return {
+        "op": "thread.open",
         "id": thread_id,
         "priority": priority,
         "contract": "internal",
@@ -70,6 +71,29 @@ def make_thread(thread_id: str, priority: str, title: str, risk: str) -> dict[st
     }
 
 
+def reply(thread_id: str, decision: str, message: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "op": "thread.reply",
+        "thread_id": thread_id,
+        "decision": decision,
+        "message": message,
+        **extra,
+    }
+
+
+def note(thread_id: str, tag: str, message: str) -> dict[str, Any]:
+    return {
+        "op": "note.attach",
+        "target": {"kind": "thread", "id": thread_id},
+        "tag": tag,
+        "message": message,
+    }
+
+
+def check(name: str, result: str) -> dict[str, Any]:
+    return {"op": "check.record", "check": name, "result": result}
+
+
 def seven_event_lgtm_document() -> dict[str, Any]:
     """A sanitized structural mirror of loop q84vy559: three rounds to LGTM."""
     scope = ["a.py", "b.py"]
@@ -79,79 +103,97 @@ def seven_event_lgtm_document() -> dict[str, Any]:
             "kind": "review",
             "event_id": "evt_review0000",
             "occurred_at": "2026-08-14T01:00:00+00:00",
-            "threads": [
+            "source_snapshot": snapshot,
+            "operations": [
                 make_thread("T1", "P1", "Baseline race", "Change absorbed at boundary"),
                 make_thread("T2", "P2", "Version skew", "Package and artifact differ"),
+                check("suite", "passed"),
             ],
-            "source_snapshot": snapshot,
-            "validation": {"performed": [{"check": "suite", "result": "passed"}], "gaps": []},
         },
         {
             "kind": "owner_reply",
             "event_id": "evt_reply00001",
             "occurred_at": "2026-08-14T02:00:00+00:00",
-            "replies": [
-                {"thread_id": "T1", "decision": "applied", "message": "Fixed baseline."},
-                {"thread_id": "T2", "decision": "applied", "message": "Bumped everywhere."},
-            ],
-            "validation": {
-                "performed": [{"check": "suite", "result": "passed"}],
-                "gaps": [
-                    {
-                        "gap_id": "G1",
-                        "check": "guarded scope covers fixes",
-                        "reason": "two files outside scope",
-                        "material": True,
-                    }
-                ],
-            },
             "completed_source_snapshot": snapshot,
+            "operations": [
+                reply("T1", "applied", "Fixed baseline."),
+                reply("T2", "applied", "Bumped everywhere."),
+                check("suite", "passed"),
+                {
+                    "op": "gap.open",
+                    "gap_id": "G1",
+                    "check": "guarded scope covers fixes",
+                    "reason": "two files outside scope",
+                    "material": True,
+                },
+            ],
         },
         {
             "kind": "reviewer_update",
             "event_id": "evt_update0001",
             "occurred_at": "2026-08-14T03:00:00+00:00",
-            "decisions": [
-                {"thread_id": "T1", "action": "resolve", "message": "Verified the repair."},
-                {"thread_id": "T2", "action": "comment", "message": "Bump crossed scope; revert."},
-            ],
-            "gap_resolutions": [
-                {"gap_id": "G1", "message": "Resolved by requiring the revert."}
-            ],
             "source_snapshot": snapshot,
+            "operations": [
+                {
+                    "op": "thread.resolve",
+                    "thread_id": "T1",
+                    "message": "Verified the repair.",
+                },
+                {
+                    "op": "thread.comment",
+                    "thread_id": "T2",
+                    "message": "Bump crossed scope; revert.",
+                },
+                {
+                    "op": "gap.resolve",
+                    "gap_id": "G1",
+                    "disposition": "performed",
+                    "message": "Resolved by requiring the revert.",
+                },
+            ],
         },
         {
             "kind": "owner_reply",
             "event_id": "evt_reply00002",
             "occurred_at": "2026-08-14T04:00:00+00:00",
-            "replies": [{"thread_id": "T2", "decision": "applied", "message": "Reverted."}],
             "completed_source_snapshot": snapshot,
+            "operations": [reply("T2", "applied", "Reverted.")],
         },
         {
             "kind": "reviewer_update",
             "event_id": "evt_update0002",
             "occurred_at": "2026-08-14T05:00:00+00:00",
-            "decisions": [{"thread_id": "T2", "action": "resolve", "message": "Verified revert."}],
-            "new_threads": [
-                make_thread("T3", "P2", "Unguarded tests", "Tests outside scope")
-            ],
             "source_snapshot": snapshot,
+            "operations": [
+                {
+                    "op": "thread.resolve",
+                    "thread_id": "T2",
+                    "message": "Verified revert.",
+                },
+                make_thread("T3", "P2", "Unguarded tests", "Tests outside scope"),
+            ],
         },
         {
             "kind": "owner_reply",
             "event_id": "evt_reply00003",
             "occurred_at": "2026-08-14T06:00:00+00:00",
-            "replies": [{"thread_id": "T3", "decision": "applied", "message": "Relocated."}],
             "completed_source_snapshot": snapshot,
+            "operations": [reply("T3", "applied", "Relocated.")],
         },
         {
             "kind": "final_review",
             "event_id": "evt_final0001",
             "occurred_at": "2026-08-14T07:00:00+00:00",
-            "decision": "LGTM",
-            "resolutions": [{"thread_id": "T3", "message": "Verified relocation."}],
             "source_snapshot": snapshot,
-            "validation": {"performed": [{"check": "final suite", "result": "passed"}], "gaps": []},
+            "operations": [
+                {
+                    "op": "thread.resolve",
+                    "thread_id": "T3",
+                    "message": "Verified relocation.",
+                },
+                check("final suite", "passed"),
+                {"op": "review.approve", "decision": "LGTM"},
+            ],
         },
     ]
     return make_document(
@@ -181,38 +223,30 @@ def two_thread_document() -> dict[str, Any]:
                 "kind": "review",
                 "event_id": "evt_review0000",
                 "occurred_at": "2026-08-14T01:00:00+00:00",
-                "threads": [resolved_thread, open_thread],
+                "operations": [resolved_thread, open_thread],
             },
             {
                 "kind": "owner_reply",
                 "event_id": "evt_reply00001",
                 "occurred_at": "2026-08-14T02:00:00+00:00",
-                "replies": [
-                    {
-                        "thread_id": "T1",
-                        "decision": "applied",
-                        "message": "Serialized the baseline write.",
-                    },
-                    {
-                        "thread_id": "T2",
-                        "decision": "applied",
-                        "message": "Bumped both manifests.",
-                    },
+                "operations": [
+                    reply("T1", "applied", "Serialized the baseline write."),
+                    reply("T2", "applied", "Bumped both manifests."),
                 ],
             },
             {
                 "kind": "reviewer_update",
                 "event_id": "evt_update0001",
                 "occurred_at": "2026-08-14T03:00:00+00:00",
-                "decisions": [
+                "operations": [
                     {
+                        "op": "thread.resolve",
                         "thread_id": "T1",
-                        "action": "resolve",
                         "message": "Verified against the suite.",
                     },
                     {
+                        "op": "thread.comment",
                         "thread_id": "T2",
-                        "action": "comment",
                         "message": "Still checking the skew.",
                     },
                 ],
@@ -256,7 +290,7 @@ class ThreadSummaryTest(unittest.TestCase):
 
     def test_a_thread_without_declared_paths_summarizes_as_an_empty_list(self) -> None:
         document = two_thread_document()
-        del document["history"][0]["threads"][1]["paths"]
+        del document["history"][0]["operations"][1]["paths"]
 
         summaries = review_render.thread_summaries(document)
 
@@ -295,6 +329,13 @@ class ThreadSummaryTest(unittest.TestCase):
         self.assertNotIn("Baseline race", rendered)
         self.assertIn("Bumped both manifests.", rendered)
 
+    def test_each_entry_is_labelled_by_the_act_it_records(self) -> None:
+        rendered = review_render.render_conversations(two_thread_document())
+
+        self.assertIn("### owner_reply — applied", rendered)
+        self.assertIn("### reviewer_update — resolve", rendered)
+        self.assertIn("### reviewer_update — comment", rendered)
+
 
 class ReviewRenderTest(unittest.TestCase):
     # --- completed_rounds ---
@@ -318,17 +359,14 @@ class ReviewRenderTest(unittest.TestCase):
 
     # --- summary_notes ---
 
-    def test_lifts_marked_note_lines_with_thread_attribution(self) -> None:
+    def test_lifts_attached_notes_with_thread_attribution(self) -> None:
         document = make_document(
             [
                 {
                     "kind": "owner_reply",
-                    "replies": [
-                        {
-                            "thread_id": "T1",
-                            "decision": "applied",
-                            "message": "Fixed.\nNote to user: [decision] deferred bump",
-                        }
+                    "operations": [
+                        reply("T1", "applied", "Fixed."),
+                        note("T1", "decision", "deferred bump"),
                     ],
                 }
             ]
@@ -338,49 +376,71 @@ class ReviewRenderTest(unittest.TestCase):
             notes, [{"text": "[decision] deferred bump", "source": "T1"}]
         )
 
-    def test_blocked_alert_survives_unrelated_note_and_yields_to_duplicate(
-        self,
-    ) -> None:
+    def test_a_note_cannot_be_written_or_removed_by_editing_a_message(self) -> None:
         document = make_document(
             [
                 {
                     "kind": "owner_reply",
-                    "replies": [
-                        {
-                            "thread_id": "T1",
-                            "decision": "deferred/blocked",
-                            "message": "Blocked.\nNote to user: waiting on infra",
-                            "blocker": "infra outage",
-                            "remaining_work": "rerun probes",
-                        },
-                        {
-                            "thread_id": "T2",
-                            "decision": "deferred/blocked",
-                            "message": (
-                                "Blocked.\nNote to user: [blocked] missing"
-                                " dataset Remaining work: load fixture"
-                            ),
-                            "blocker": "missing dataset",
-                            "remaining_work": "load fixture",
-                        },
+                    "operations": [
+                        reply(
+                            "T1",
+                            "applied",
+                            "Fixed.\nNote to user: [decision] deferred bump",
+                        )
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(review_render.summary_notes(document), [])
+
+    def test_a_repeated_note_contributes_once_per_transaction(self) -> None:
+        document = make_document(
+            [
+                {
+                    "kind": "owner_reply",
+                    "operations": [
+                        reply("T1", "applied", "Fixed."),
+                        note("T1", "decision", "deferred bump"),
+                        note("T1", "decision", "deferred bump"),
+                        note("T1", "follow-up", "revisit after release"),
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            [item["text"] for item in review_render.summary_notes(document)],
+            ["[decision] deferred bump", "[follow-up] revisit after release"],
+        )
+
+    def test_a_note_never_hides_the_blocked_work_alert(self) -> None:
+        document = make_document(
+            [
+                {
+                    "kind": "owner_reply",
+                    "operations": [
+                        reply(
+                            "T1",
+                            "deferred/blocked",
+                            "Blocked.",
+                            blocker="infra outage",
+                            remaining_work="rerun probes",
+                        ),
+                        note("T1", "action-required", "waiting on infra"),
                     ],
                 }
             ]
         )
         notes = review_render.summary_notes(document)
-        # T1's unrelated note must not hide its blocked-work alert; T2's note
-        # is an exact normalized duplicate, so the automatic copy is dropped.
-        texts_by_source = [(note["source"], note["text"]) for note in notes]
-        self.assertIn(("T1", "waiting on infra"), texts_by_source)
+        texts_by_source = [(item["source"], item["text"]) for item in notes]
+
+        self.assertIn(("T1", "[action-required] waiting on infra"), texts_by_source)
         self.assertIn(
             ("T1", "[blocked] infra outage Remaining work: rerun probes"),
             texts_by_source,
         )
-        self.assertEqual(
-            [item for item in texts_by_source if item[0] == "T2"],
-            [("T2", "[blocked] missing dataset Remaining work: load fixture")],
-        )
-        self.assertEqual(len(notes), 3)
+        self.assertEqual(len(notes), 2)
 
     def test_timeout_terminal_adds_notes_for_open_threads_and_material_gap(
         self,
@@ -389,17 +449,15 @@ class ReviewRenderTest(unittest.TestCase):
             [
                 {
                     "kind": "owner_reply",
-                    "validation": {
-                        "performed": [],
-                        "gaps": [
-                            {
-                                "gap_id": "G1",
-                                "check": "live probe",
-                                "reason": "service down",
-                                "material": True,
-                            }
-                        ],
-                    },
+                    "operations": [
+                        {
+                            "op": "gap.open",
+                            "gap_id": "G1",
+                            "check": "live probe",
+                            "reason": "service down",
+                            "material": True,
+                        }
+                    ],
                 }
             ],
             terminal={
@@ -450,8 +508,8 @@ class ReviewRenderTest(unittest.TestCase):
 
     def test_note_in_history_sets_attention_line_and_notes_section(self) -> None:
         document = seven_event_lgtm_document()
-        document["history"][3]["replies"][0]["message"] += (
-            "\nNote to user: [decision] bump deferred to release"
+        document["history"][3]["operations"].append(
+            note("T2", "decision", "bump deferred to release")
         )
         report = review_render.render_report(document)
         self.assertIn("- **Attention: 1 note for you**", report)
@@ -465,7 +523,7 @@ class ReviewRenderTest(unittest.TestCase):
                 {
                     "kind": "review",
                     "occurred_at": "2026-08-14T01:00:00+00:00",
-                    "threads": [make_thread("T1", "P2", "Finding", "Risk text")],
+                    "operations": [make_thread("T1", "P2", "Finding", "Risk text")],
                 }
             ],
             workflow={
@@ -499,24 +557,20 @@ class ReviewRenderTest(unittest.TestCase):
             [
                 {
                     "kind": "review",
-                    "threads": [make_thread("T1", "P2", "Finding", "Risk")],
+                    "operations": [make_thread("T1", "P2", "Finding", "Risk")],
                 },
                 {
                     "kind": "owner_reply",
-                    "replies": [
-                        {
-                            "thread_id": "T1",
-                            "decision": "declined",
-                            "message": "Intentional behavior.",
-                        }
+                    "operations": [
+                        reply("T1", "declined", "Intentional behavior.")
                     ],
                 },
                 {
                     "kind": "reviewer_update",
-                    "decisions": [
+                    "operations": [
                         {
+                            "op": "thread.resolve",
                             "thread_id": "T1",
-                            "action": "resolve",
                             "message": "Independently verified.",
                         }
                     ],
@@ -529,11 +583,18 @@ class ReviewRenderTest(unittest.TestCase):
         self.assertIn("**Declined, independently verified.**", report)
         self.assertIn("Intentional behavior.", report)
 
-    def test_note_on_raised_thread_message_is_lifted(self) -> None:
-        thread = make_thread("T1", "P2", "Finding", "Risk")
-        thread["message"] = "Note to user: [decision] raised as a constraint"
+    def test_note_attached_at_raise_time_is_lifted(self) -> None:
         document = make_document(
-            [{"kind": "review", "threads": [thread]}], open_threads=["T1"]
+            [
+                {
+                    "kind": "review",
+                    "operations": [
+                        make_thread("T1", "P2", "Finding", "Risk"),
+                        note("T1", "decision", "raised as a constraint"),
+                    ],
+                }
+            ],
+            open_threads=["T1"],
         )
         notes = review_render.summary_notes(document)
         self.assertEqual(
@@ -551,27 +612,18 @@ class ReviewRenderTest(unittest.TestCase):
             [
                 {
                     "kind": "review",
-                    "validation": {
-                        "performed": [
-                            {"check": "suite: 46 tests", "result": "passed"},
-                            {"check": "live probe", "result": "failed"},
-                        ],
-                        "gaps": [],
-                    },
+                    "operations": [
+                        check("suite: 46 tests", "passed"),
+                        check("live probe", "failed"),
+                    ],
                 },
                 {
                     "kind": "owner_reply",
-                    "validation": {
-                        "performed": [{"check": "suite: 49 tests", "result": "passed"}],
-                        "gaps": [],
-                    },
+                    "operations": [check("suite: 49 tests", "passed")],
                 },
                 {
                     "kind": "final_review",
-                    "validation": {
-                        "performed": [{"check": "final suite: 68 tests", "result": "passed"}],
-                        "gaps": [],
-                    },
+                    "operations": [check("final suite: 68 tests", "passed")],
                 },
             ]
         )
@@ -593,12 +645,20 @@ class ReviewRenderTest(unittest.TestCase):
                 {
                     "kind": "review",
                     "occurred_at": "2026-08-14T01:00:00+00:00",
-                    "threads": [make_thread("T1", "P2", "Finding", "Risk")],
                     "source_snapshot": snapshot,
+                    "operations": [make_thread("T1", "P2", "Finding", "Risk")],
                 },
                 {
                     "kind": "owner_timeout",
                     "occurred_at": "2026-08-14T04:00:00+00:00",
+                    "operations": [
+                        {
+                            "op": "timeout.declare",
+                            "started_at": "2026-08-14T01:00:00+00:00",
+                            "deadline": "2026-08-14T03:00:00+00:00",
+                            "reason": "No response.",
+                        }
+                    ],
                 },
             ],
             terminal={
@@ -625,7 +685,7 @@ class ReviewRenderTest(unittest.TestCase):
             [
                 {
                     "kind": "review",
-                    "threads": [make_thread("T1", "P2", hostile, hostile)],
+                    "operations": [make_thread("T1", "P2", hostile, hostile)],
                 }
             ],
             open_threads=["T1"],
@@ -648,11 +708,17 @@ class StructureRenderTest(unittest.TestCase):
             [
                 {
                     "kind": "final_review",
-                    "structure_debt": {
-                        "disposition": disposition,
-                        "flagged_paths": ["src/reconciler.py"],
-                        "message": "Real accretion.",
-                    },
+                    "operations": [
+                        {
+                            "op": "review.approve",
+                            "decision": "LGTM",
+                            "structure_debt": {
+                                "disposition": disposition,
+                                "flagged_paths": ["src/reconciler.py"],
+                                "message": "Real accretion.",
+                            },
+                        }
+                    ],
                 }
             ]
         )

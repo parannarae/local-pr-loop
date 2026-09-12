@@ -63,22 +63,22 @@ def evidence() -> dict[str, Any]:
     }
 
 
-def validation(*, gap: bool = False) -> dict[str, Any]:
-    return {
-        "performed": [{"check": "focused test", "result": "passed"}],
-        "gaps": (
-            [
-                {
-                    "gap_id": "G1",
-                    "check": "live service",
-                    "reason": "The staging endpoint is unavailable.",
-                    "material": True,
-                }
-            ]
-            if gap
-            else []
-        ),
-    }
+def validation(*, gap: bool = False) -> list[dict[str, Any]]:
+    """Return the check and gap operations one transaction records."""
+    operations: list[dict[str, Any]] = [
+        {"op": "check.record", "check": "focused test", "result": "passed"}
+    ]
+    if gap:
+        operations.append(
+            {
+                "op": "gap.open",
+                "gap_id": "G1",
+                "check": "live service",
+                "reason": "The staging endpoint is unavailable.",
+                "material": True,
+            }
+        )
+    return operations
 
 
 def event(kind: str, sequence: int) -> dict[str, Any]:
@@ -93,8 +93,9 @@ def review_event(*, gap: bool = False) -> dict[str, Any]:
     value.update(
         {
             "source_snapshot": snapshot("1"),
-            "threads": [
+            "operations": [
                 {
+                    "op": "thread.open",
                     "id": "T1",
                     "priority": "P1",
                     "contract": "internal",
@@ -103,9 +104,9 @@ def review_event(*, gap: bool = False) -> dict[str, Any]:
                     "evidence": evidence(),
                     "required_behavior": "Return the documented result.",
                     "paths": ["example.txt"],
-                }
+                },
+                *validation(gap=gap),
             ],
-            "validation": validation(gap=gap),
         }
     )
     return value
@@ -116,20 +117,21 @@ def owner_event() -> dict[str, Any]:
     value.update(
         {
             "starting_source_snapshot": snapshot("1"),
-            "source_drift_assessment": "Only guarded source changed.",
             "completed_source_snapshot": snapshot("1"),
-            "replies": [
+            "source_drift_assessment": "Only guarded source changed.",
+            "guide_synchronization": "No guide change was needed.",
+            "changed_files": ["example.txt"],
+            "revisions": [],
+            "operations": [
                 {
+                    "op": "thread.reply",
                     "thread_id": "T1",
                     "decision": "applied",
                     "message": "Handled the finding.",
                     "evidence": evidence(),
-                }
+                },
+                *validation(),
             ],
-            "files_changed": ["example.txt"],
-            "guide_synchronization": "No guide change was needed.",
-            "validation": validation(),
-            "commits": [],
         }
     )
     return value
@@ -140,16 +142,16 @@ def final_event() -> dict[str, Any]:
     value.update(
         {
             "source_snapshot": snapshot("1"),
-            "resolutions": [
+            "operations": [
                 {
+                    "op": "thread.resolve",
                     "thread_id": "T1",
                     "message": "Verified the fix.",
                     "verification": {"independent": True, "evidence": evidence()},
-                }
+                },
+                *validation(),
+                {"op": "review.approve", "decision": "LGTM"},
             ],
-            "gap_resolutions": [],
-            "decision": "LGTM",
-            "validation": validation(),
         }
     )
     return value
@@ -232,9 +234,9 @@ def card_for(
 
 PUBLISH_TAIL = [
     "template_event",
-    "populate_draft_blanks",
+    "compose_operations",
     "record_validation_evidence",
-    "validate_event",
+    "review_draft",
     "inspect_before_publish",
     "publish",
     "read_publication_result",
@@ -302,6 +304,36 @@ class OperatingCardTest(unittest.TestCase):
         self.assertNotIn("acknowledge_structure_debt", without["must"])
         self.assertIn("acknowledge_structure_debt", with_flag["must"])
         self.assertEqual(with_flag["accretion_flagged_paths"], ["src/app.py"])
+
+    def test_the_structure_debt_obligation_skips_an_action_that_cannot_approve(
+        self,
+    ) -> None:
+        """The obligation is a field of `review.approve`, so only an approving action
+        can carry it.
+
+        A flagged ledger and a part-way publication coexist: the card would otherwise
+        tell an agent mid-recovery to run `draft approve`, off the only path that
+        repairs its artifacts.
+        """
+        for action in ("recover_publication", "abort_draft", "regenerate_report"):
+            with self.subTest(action=action):
+                card = self.card(
+                    action,
+                    flags=["accretion_flagged"],
+                    flagged_paths=["src/app.py"],
+                )
+
+                self.assertNotIn("acknowledge_structure_debt", card["must"])
+                # The flagged set is still reported; only the obligation is withheld.
+                self.assertEqual(card["accretion_flagged_paths"], ["src/app.py"])
+
+    def test_publishing_a_templated_draft_still_carries_the_obligation(self) -> None:
+        # The draft may be the final_review that must dispose of the flagged files.
+        card = self.card(
+            "publish_draft", flags=["accretion_flagged"], flagged_paths=["src/app.py"]
+        )
+
+        self.assertIn("acknowledge_structure_debt", card["must"])
 
     def test_every_action_the_ladder_can_choose_states_its_own_obligations(
         self,
@@ -375,6 +407,7 @@ class RoutineCardTest(unittest.TestCase):
             [
                 "transcribe_another_agents_findings",
                 "publish_lgtm_with_material_validation_gap",
+                "hand_edit_draft_json",
             ],
         )
 
@@ -391,7 +424,7 @@ class RoutineCardTest(unittest.TestCase):
                 "reply_to_every_open_thread",
                 "state_decision_on_every_reply",
                 "record_evidence_for_declined_work",
-                "flag_design_shift_with_add_note",
+                "flag_design_shift_with_a_note",
                 "await_handoff_if_not_primary_actor",
             ],
         )
@@ -402,6 +435,7 @@ class RoutineCardTest(unittest.TestCase):
                 "reopen_thread",
                 "open_new_thread",
                 "hand_edit_canonical_json",
+                "hand_edit_draft_json",
             ],
         )
         self.assertTrue(card["common_path_applies"])
@@ -422,7 +456,7 @@ class RoutineCardTest(unittest.TestCase):
                 "decide_every_open_thread",
                 "verify_declined_thread_independently_before_resolving",
                 "resolve_every_open_thread_in_final_review",
-                "flag_design_shift_with_add_note",
+                "flag_design_shift_with_a_note",
                 "await_handoff_if_not_primary_actor",
             ],
         )
@@ -542,7 +576,7 @@ class ExceptionalCardTest(unittest.TestCase):
         elapsed = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
         stale = review_event()
         stale["occurred_at"] = elapsed
-        stale["threads"][0]["evidence"]["observed_at"] = elapsed
+        stale["operations"][0]["evidence"]["observed_at"] = elapsed
 
         card = card_for(document_for(stale), current_snapshot=snapshot("1"))
 
@@ -601,7 +635,9 @@ class RenderCardTest(unittest.TestCase):
 
         self.assertIn("action: publish_owner_reply", rendered)
         self.assertIn("reply to every open thread", rendered)
+        self.assertIn("compose each act with the draft subcommands", rendered)
         self.assertIn("never: resolve a thread", rendered)
+        self.assertIn("hand-edit the draft JSON instead of composing it", rendered)
         self.assertIn("the guarded source moved since it was recorded", rendered)
         self.assertIn("references/source-state.md", rendered)
 

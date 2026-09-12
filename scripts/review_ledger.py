@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import review_scope
+from review_schema import operations_of, unsupported_revision_error
 
 # A file this many raised threads name is accretion-flagged.
 THREAD_FLAG_THRESHOLD = 5
@@ -32,12 +33,10 @@ def thread_counts(history: Any) -> dict[str, int]:
     if not isinstance(history, list):
         return counts
     for event in history:
-        if not isinstance(event, dict):
-            continue
-        for thread in [*event.get("threads", []), *event.get("new_threads", [])]:
-            if not isinstance(thread, dict):
+        for operation in operations_of(event):
+            if not isinstance(operation, dict) or operation.get("op") != "thread.open":
                 continue
-            paths = thread.get("paths")
+            paths = operation.get("paths")
             if not isinstance(paths, list):
                 continue
             for path in paths:
@@ -46,18 +45,32 @@ def thread_counts(history: Any) -> dict[str, int]:
     return counts
 
 
-def _in_scope(path: str, scope: list[str], exclusions: list[str]) -> bool:
-    """Report whether a repository-relative path is inside the guarded scope."""
+def _canonical_identities(repository_root: str, paths: list[str]) -> list[str]:
+    """Return the repository-relative identities of declared paths.
 
-    normalized = review_scope.normalize_path(path)
-    included = any(
-        review_scope.covers(review_scope.normalize_path(entry), normalized)
-        for entry in scope
-    )
-    excluded = any(
-        review_scope.covers(review_scope.normalize_path(entry), normalized)
-        for entry in exclusions
-    )
+    A path that resolves outside the worktree is skipped rather than compared, matching
+    `review_scope.overlapping_paths`: it can never bound a guarded scope.
+    """
+
+    identities: list[str] = []
+    for path in paths:
+        try:
+            identities.append(review_scope.canonical_path(repository_root, path))
+        except ValueError:
+            continue
+    return identities
+
+
+def _in_scope(identity: str, scope: list[str], exclusions: list[str]) -> bool:
+    """Report whether a canonical path identity is inside the guarded scope.
+
+    Every argument is already a canonical identity, so two spellings of one file compare
+    equal here; comparing the strings an agent typed would let an alias of a guarded file
+    escape the flagged set.
+    """
+
+    included = any(review_scope.covers(entry, identity) for entry in scope)
+    excluded = any(review_scope.covers(entry, identity) for entry in exclusions)
     return included and not excluded
 
 
@@ -80,9 +93,10 @@ def growth_by_file(
     """Measure per-file line growth from the comparison base to the working tree.
 
     Only net growth participates: a file that shrank or broke even can never cross a
-    positive growth threshold, so its base line count is not probed. Returns
-    `base_lines` as None for a file absent at the base. Binary files report no line
-    counts and are skipped. Renames are disabled so every path names itself.
+    positive growth threshold, so its base line count is not probed. `base_lines` is None
+    whenever the base content could not be read, which covers a file absent at the base
+    and every other `git show` failure alike. Binary files report no line counts and are
+    skipped. Renames are disabled so every path names itself.
     """
 
     pathspecs = [
@@ -139,22 +153,33 @@ def ledger(
     Both signals are confined to the guarded scope minus exclusions: only a guarded
     file can demand a `structure_debt` acknowledgment, so a thread naming an
     out-of-scope or mistyped path is dropped here rather than flagged.
+
+    Threads are counted against canonical path identities, so two spellings of one
+    guarded file — a `..` segment, an absolute path, a symlink alias — accumulate into
+    that file's single count and its single entry in `flagged`.
     """
 
-    counts = {
-        path: count
-        for path, count in thread_counts(document.get("history")).items()
-        if _in_scope(path, scope, exclusions)
-    }
+    scope_identities = _canonical_identities(repository_root, scope)
+    exclusion_identities = _canonical_identities(repository_root, exclusions)
+    counts: dict[str, int] = {}
+    for path, count in thread_counts(document.get("history")).items():
+        try:
+            identity = review_scope.canonical_path(repository_root, path)
+        # A thread naming a path outside the worktree can never name a guarded file.
+        except ValueError:
+            continue
+        if _in_scope(identity, scope_identities, exclusion_identities):
+            counts[identity] = counts.get(identity, 0) + count
     comparison_base = document.get("comparison_base")
     # A base this clone cannot reach degrades to the thread signal instead of failing:
     # blocking final_review over a missing baseline commit would brick the loop on any
     # machine that lacks it, and the dashboard reports the degradation instead.
-    base_reachable = isinstance(comparison_base, str) and bool(comparison_base)
+    base_reachable = False
     growth: dict[str, dict[str, Any]] = {}
-    if base_reachable:
+    if isinstance(comparison_base, str) and comparison_base:
         try:
             growth = growth_by_file(repository_root, comparison_base, scope, exclusions)
+            base_reachable = True
         except ValueError:
             base_reachable = False
     files: dict[str, dict[str, Any]] = {}
@@ -205,6 +230,17 @@ def flagged_paths(
     return ledger(repository_root, document, scope, exclusions)["flagged"]
 
 
+def recorded_structure_debt(event: Any) -> dict[str, Any] | None:
+    """Return the structure_debt one transaction's `review.approve` carries."""
+
+    for operation in operations_of(event):
+        if isinstance(operation, dict) and operation.get("op") == "review.approve":
+            debt = operation.get("structure_debt")
+            if debt is not None:
+                return debt
+    return None
+
+
 def acknowledgment_error(
     document: dict[str, Any], event: dict[str, Any], flagged: list[str]
 ) -> str | None:
@@ -217,10 +253,10 @@ def acknowledgment_error(
 
     if event.get("kind") != "final_review":
         return None
-    debt = event.get("structure_debt")
+    debt = recorded_structure_debt(event)
     if document.get("review_kind") == "structure":
         return (
-            "a structure round records no structure_debt; remove the field"
+            "a structure round records no structure_debt; remove it from review.approve"
             if debt is not None
             else None
         )
@@ -250,7 +286,7 @@ def deferred_structure_debt(document: dict[str, Any]) -> dict[str, Any] | None:
         return None
     for event in reversed(history):
         if isinstance(event, dict) and event.get("kind") == "final_review":
-            debt = event.get("structure_debt")
+            debt = recorded_structure_debt(event)
             if (
                 isinstance(debt, dict)
                 and debt.get("disposition") == "structure_deferred"
@@ -273,11 +309,17 @@ def has_structure_successor(reviews_directory: Path, review_id: str) -> bool:
             continue
         try:
             sibling = json.loads(canonical.read_text())
+        # An unreadable sibling cannot be shown to be the successor, so it counts
+        # as absent and the terminal keeps recommending the round.
         except (OSError, ValueError):
             continue
+        # A sibling written against another format revision carries a different
+        # field set, so its `review_kind` and `prior_review_id` are not this
+        # revision's fields to read.
+        if unsupported_revision_error(sibling) is not None:
+            continue
         if (
-            isinstance(sibling, dict)
-            and sibling.get("prior_review_id") == review_id
+            sibling.get("prior_review_id") == review_id
             and sibling.get("review_kind") == "structure"
         ):
             return True
@@ -293,4 +335,9 @@ def structure_follow_up_due(document: dict[str, Any], reviews_directory: Path) -
         return False
     if deferred_structure_debt(document) is None:
         return False
-    return not has_structure_successor(reviews_directory, document.get("review_id"))
+    review_id = document.get("review_id")
+    # Fail closed on a document with no usable identifier rather than matching
+    # successors against None.
+    return isinstance(review_id, str) and not has_structure_successor(
+        reviews_directory, review_id
+    )

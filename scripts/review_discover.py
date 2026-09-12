@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import review_scope
-from review_contract import SOURCE_FIELD_BY_KIND
+from review_contract import source_field_for
 from review_projection import validate_document
 from review_schema import REVIEW_ID_PATTERN, reject_duplicate_keys
 
@@ -39,25 +39,31 @@ def lock_status_arguments(root: Path, canonical: Path) -> list[str]:
     return ["status", "--repo", str(root), "--review-file", str(canonical)]
 
 
-def load_canonical_candidate(
-    path: Path, review_id: str
-) -> tuple[dict[str, Any] | None, list[str]]:
-    """Load one canonical review file; any returned error disqualifies it."""
+class CandidateError(ValueError):
+    """One canonical review file is disqualified; `errors` records every reason."""
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+def load_canonical_candidate(path: Path, review_id: str) -> dict[str, Any]:
+    """Load one canonical review file, raising `CandidateError` if disqualified."""
     if not path.is_file() or path.is_symlink():
-        return None, ["canonical review must be a regular non-symlink file"]
+        raise CandidateError(["canonical review must be a regular non-symlink file"])
     try:
         document = json.loads(
             path.read_text(),
             object_pairs_hook=reject_duplicate_keys,
         )
     except (OSError, ValueError) as error:
-        return None, [f"unreadable canonical JSON: {error}"]
+        raise CandidateError([f"unreadable canonical JSON: {error}"]) from error
     errors = validate_document(document)
     if isinstance(document, dict) and document.get("review_id") != review_id:
         errors.append("review_id does not match the artifact file name")
     if errors:
-        return None, errors
-    return document, []
+        raise CandidateError(errors)
+    return document
 
 
 def latest_guarded_snapshot(document: dict[str, Any]) -> dict[str, Any] | None:
@@ -66,17 +72,15 @@ def latest_guarded_snapshot(document: dict[str, Any]) -> dict[str, Any] | None:
     for event in document["history"]:
         if not isinstance(event, dict):
             continue
-        field = SOURCE_FIELD_BY_KIND.get(event.get("kind"))
+        field = source_field_for(event.get("kind"))
         value = event.get(field) if field else None
         if isinstance(value, dict):
             snapshot = value
     return snapshot
 
 
-def scope_summary(snapshot: dict[str, Any] | None) -> dict[str, list[str]] | None:
+def scope_summary(snapshot: dict[str, Any]) -> dict[str, list[str]]:
     """Summarize the guarded scope recorded by the latest snapshot."""
-    if snapshot is None:
-        return None
     return {
         "scope": list(snapshot.get("scope") or []),
         "exclusions": list(snapshot.get("exclusions") or []),
@@ -154,7 +158,7 @@ def candidate_summary(
         "latest_event": state["latest_event"],
         "open_threads": len(state["threads"]["open"]),
         "resolved_threads": len(state["threads"]["resolved"]),
-        "scope": scope_summary(snapshot),
+        "scope": scope_summary(snapshot) if snapshot is not None else None,
         "source_drift": snapshot_drift(root, snapshot),
         "lock": lock_summary(root, canonical),
     }
@@ -172,6 +176,9 @@ def declared_scope(canonical: Path, document: dict[str, Any]) -> dict[str, Any] 
     if guard.is_file() and not guard.is_symlink():
         try:
             stored = load_object_safely(guard)
+        # A guard truncated by a crash mid-write or written by an unsupported
+        # revision is treated as absent, so discovery still classifies the loop
+        # from its history instead of refusing to report it at all.
         except (OSError, ValueError):
             stored = None
         scope = stored.get("scope") if isinstance(stored, dict) else None
@@ -181,7 +188,8 @@ def declared_scope(canonical: Path, document: dict[str, Any]) -> dict[str, Any] 
                 "exclusions": list(scope.get("exclude") or []),
                 "additional_inputs": list(scope.get("additional_input") or []),
             }
-    return scope_summary(latest_guarded_snapshot(document))
+    snapshot = latest_guarded_snapshot(document)
+    return scope_summary(snapshot) if snapshot is not None else None
 
 
 def load_object_safely(path: Path) -> Any:
@@ -207,8 +215,9 @@ def all_live_successors(
         review_id = path.name[: -len(".json")]
         if not REVIEW_ID_PATTERN.fullmatch(review_id):
             continue
-        document, errors = load_canonical_candidate(path, review_id)
-        if errors:
+        try:
+            document = load_canonical_candidate(path, review_id)
+        except CandidateError:
             continue
         if document["state"]["workflow"]["phase"] == "terminal":
             continue
@@ -235,52 +244,6 @@ def all_live_successors(
     return found
 
 
-def find_live_successor(
-    reviews: Path, prior_review_id: str, review_kind: str
-) -> dict[str, Any] | None:
-    """Return the live successor already chained from a prior review, if one exists.
-
-    A chained follow-up is identified by the prior review it continues and the
-    kind of round it runs, both of which every canonical document records. At
-    most one such successor may be live at a time: two would mean two agents
-    doing the same round with separate thread histories.
-
-    Terminal successors are ignored, so a later round of the same kind from the
-    same prior is still possible once the first one closes.
-    """
-    entries = sorted(reviews.iterdir()) if reviews.is_dir() else []
-    for path in entries:
-        if not path.name.endswith(".json"):
-            continue
-        review_id = path.name[: -len(".json")]
-        if not REVIEW_ID_PATTERN.fullmatch(review_id):
-            continue
-        document, errors = load_canonical_candidate(path, review_id)
-        if errors:
-            continue
-        if document["state"]["workflow"]["phase"] == "terminal":
-            continue
-        if document.get("prior_review_id") != prior_review_id:
-            continue
-        if document.get("review_kind") != review_kind:
-            continue
-        workflow = document["state"]["workflow"]
-        return {
-            "review_id": review_id,
-            "name": document.get("name"),
-            "review_kind": document.get("review_kind"),
-            "prior_review_id": document.get("prior_review_id"),
-            "phase": workflow.get("phase"),
-            "primary_actor": workflow.get("primary_actor"),
-            # A successor that has neither a guard nor an event declares no
-            # scope yet, so whoever inspects it first decides what it covers.
-            # The caller is given the scope itself, which is what it must adopt,
-            # rather than a flag it would have to act on indirectly.
-            "scope": declared_scope(path, document),
-        }
-    return None
-
-
 def discover_loops(root: Path, reviews: Path) -> dict[str, Any]:
     """Classify every canonical loop and select the only resumable one, if any.
 
@@ -300,10 +263,11 @@ def discover_loops(root: Path, reviews: Path) -> dict[str, Any]:
         review_id = path.name[: -len(".json")]
         if not REVIEW_ID_PATTERN.fullmatch(review_id):
             continue
-        document, errors = load_canonical_candidate(path, review_id)
-        if errors:
+        try:
+            document = load_canonical_candidate(path, review_id)
+        except CandidateError as error:
             invalid.append(
-                {"review_id": review_id, "path": str(path), "errors": errors}
+                {"review_id": review_id, "path": str(path), "errors": error.errors}
             )
             continue
         if document["state"]["workflow"]["phase"] == "terminal":
