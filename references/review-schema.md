@@ -507,9 +507,3 @@ valid draft is still `ready_to_publish`. None of this is canonical, and
 wall-clock eligibility never changes canonical state.
 [source-state.md](source-state.md) covers snapshots, publication, and
 recovery.
-
-## Moving from the compound format
-
-[operation-format-parity.md](operation-format-parity.md) records what each
-compound field became, which behavioral tests carry over to the operation
-format, and in which step each one is ported.

@@ -306,7 +306,7 @@ def current_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         check=False,
     )
     if completed.returncode != 0:
-        raise RuntimeError("source snapshot failed")
+        raise RuntimeError(f"source snapshot failed: {completed.stderr.strip()}")
     value = json.loads(completed.stdout)
     if not isinstance(value, dict):
         raise TypeError("source snapshot must be a JSON object")
@@ -616,11 +616,12 @@ def recover_without_receipt(
 
 
 def recover(args: argparse.Namespace) -> int:
-    """Finish the cleanup a publication receipt shows is still outstanding.
+    """Settle whatever a publication left outstanding, without ever committing.
 
-    Recovery never re-commits: it completes the report, draft, and receipt work
-    that follows a commit, so a receipt for an event already in canonical history
-    settles as a successful no-op.
+    A receipt whose event reached canonical history has only the report, draft,
+    and receipt cleanup left, so a publication already finished settles as a
+    successful no-op. A receipt still in preparation is discarded instead, which
+    leaves canonical history untouched and the draft in place to publish again.
     """
     review = Path(args.review)
     event_path = Path(args.event)

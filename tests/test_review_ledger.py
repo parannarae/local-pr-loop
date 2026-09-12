@@ -372,6 +372,31 @@ class FollowUpTest(unittest.TestCase):
             )
         )
 
+    def test_successor_of_another_format_revision_does_not_consume_the_flag_set(
+        self,
+    ) -> None:
+        successor = successor_document()
+        successor["format_revision"] = "2026-01-01.1"
+        (self.reviews / "zzzzzzzz.json").write_text(json.dumps(successor))
+        self.assertTrue(
+            review_ledger.structure_follow_up_due(
+                self.deferred_document(), self.reviews
+            )
+        )
+
+    def test_successor_without_a_storage_contract_does_not_consume_the_flag_set(
+        self,
+    ) -> None:
+        successor = successor_document()
+        del successor["format"]
+        del successor["format_revision"]
+        (self.reviews / "zzzzzzzz.json").write_text(json.dumps(successor))
+        self.assertTrue(
+            review_ledger.structure_follow_up_due(
+                self.deferred_document(), self.reviews
+            )
+        )
+
     def test_non_canonical_artifacts_are_ignored_in_the_successor_scan(self) -> None:
         (self.reviews / "zzzzzzzz.guard.json").write_text(
             json.dumps(successor_document())

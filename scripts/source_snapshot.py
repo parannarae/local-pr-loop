@@ -43,6 +43,20 @@ def digest_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def stderr_text(error: subprocess.CalledProcessError) -> str:
+    """Return a failed child's stderr as text, or empty when it captured none.
+
+    `git` here runs in text mode for some calls and binary mode for others, so the
+    captured stream is `str` or `bytes` depending on which call failed.
+    """
+    stderr = error.stderr
+    if isinstance(stderr, bytes):
+        return stderr.decode(errors="replace").strip()
+    if isinstance(stderr, str):
+        return stderr.strip()
+    return ""
+
+
 def untracked_manifest(repo: Path, pathspecs: list[str]) -> list[dict[str, str]]:
     output = git(
         repo,
@@ -174,8 +188,9 @@ def main() -> int:
     except subprocess.CalledProcessError as error:
         # `git` reports the actionable reason on stderr, which the captured run
         # keeps out of the exception text.
-        detail = error.stderr.decode(errors="replace").strip() if error.stderr else ""
-        print(f"source snapshot failed: {error}. {detail}".strip(), file=sys.stderr)
+        message = f"source snapshot failed: {error}"
+        detail = stderr_text(error)
+        print(f"{message} {detail}" if detail else message, file=sys.stderr)
         return 1
     except (OSError, ValueError) as error:
         print(f"source snapshot failed: {error}", file=sys.stderr)
