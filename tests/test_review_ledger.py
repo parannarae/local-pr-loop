@@ -129,6 +129,64 @@ class ThreadCountTest(unittest.TestCase):
         self.assertEqual(ledger["flagged"], [])
 
 
+class CanonicalScopeTest(unittest.TestCase):
+    """One guarded file has one identity, however a thread spells its path.
+
+    `thread.open.paths` is agent-authored, so a `..` segment or a symlink alias used to
+    miss the guarded file entirely: its threads were dropped as out of scope, and the
+    flagged set the final_review had to acknowledge was short by that file.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.repo = Path(self.temporary.name).resolve()
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.py").write_text("value\n")
+        (self.repo / "alias.py").symlink_to(self.repo / "src" / "app.py")
+
+    def ledger_over(self, paths: list[str], count: int) -> dict[str, Any]:
+        history = [{"kind": "review", "operations": [thread(paths)] * count}]
+        return review_ledger.ledger(str(self.repo), document(history), ["src"], [])
+
+    def test_a_dot_dot_path_counts_toward_the_file_it_names(self) -> None:
+        ledger = self.ledger_over(["src/../src/app.py"], 5)
+
+        self.assertEqual(ledger["flagged"], ["src/app.py"])
+        self.assertEqual(ledger["files"]["src/app.py"]["threads"], 5)
+
+    def test_a_symlink_alias_merges_into_the_guarded_files_single_count(self) -> None:
+        history = [
+            {
+                "kind": "review",
+                "operations": [thread(["alias.py"])] * 3 + [thread(["src/app.py"])] * 2,
+            }
+        ]
+
+        ledger = review_ledger.ledger(str(self.repo), document(history), ["src"], [])
+
+        # One entry, not two spellings: `structure_debt.flagged_paths` must not have to
+        # repeat the alias verbatim to satisfy the acknowledgment gate.
+        self.assertEqual(ledger["flagged"], ["src/app.py"])
+        self.assertEqual(ledger["files"]["src/app.py"]["threads"], 5)
+        self.assertNotIn("alias.py", ledger["files"])
+
+    def test_a_thread_path_outside_the_repository_is_dropped(self) -> None:
+        ledger = self.ledger_over(["../elsewhere.py"], 9)
+
+        self.assertEqual(ledger["flagged"], [])
+        self.assertEqual(ledger["files"], {})
+
+    def test_an_exclusion_spelled_as_an_alias_still_excludes(self) -> None:
+        history = [{"kind": "review", "operations": [thread(["src/app.py"])] * 5}]
+
+        ledger = review_ledger.ledger(
+            str(self.repo), document(history), ["src"], ["alias.py"]
+        )
+
+        self.assertEqual(ledger["flagged"], [])
+
+
 class GrowthTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

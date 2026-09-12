@@ -24,7 +24,7 @@ __all__ = [
     "SHA256_PATTERN",
     "STRUCTURE_DEBT_DISPOSITIONS",
     "STRUCTURE_POLICIES",
-    "load_json",
+    "load_json_from_stdin",
     "operations_of",
     "reject_duplicate_keys",
     "unsupported_revision_error",
@@ -204,7 +204,14 @@ def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
-def load_json() -> Any:
+def load_json_from_stdin() -> Any:
+    """Read one JSON value from standard input.
+
+    Raises:
+        ValueError: An object repeats a key, which would silently discard one of two
+            conflicting values; `json.JSONDecodeError` for malformed input is a subclass.
+    """
+
     return json.load(sys.stdin, object_pairs_hook=reject_duplicate_keys)
 
 
@@ -284,6 +291,61 @@ def validate_string_list(
     require(errors, valid, f"{prefix} must be a list of {suffix}")
 
 
+def validate_digested_entries(errors: list[str], entries: Any, prefix: str) -> None:
+    """Validate one list of digested snapshot entries, rejecting duplicate paths.
+
+    `additional_inputs` and `untracked` carry the same entry shape from
+    `source_snapshot.py`, so both are held to it: an entry that names a kind this
+    format does not record, or a digest that is not SHA-256, never reaches canonical
+    history.
+    """
+
+    require(errors, isinstance(entries, list), f"{prefix} must be a list")
+    if not isinstance(entries, list):
+        return
+    paths: list[str] = []
+    for index, item in enumerate(entries):
+        item_prefix = f"{prefix}[{index}]"
+        require(errors, isinstance(item, dict), f"{item_prefix} must be a mapping")
+        if not isinstance(item, dict):
+            continue
+        reject_unknown(
+            errors, item, {"path", "kind", "mode", "sha256", "link_target"}, item_prefix
+        )
+        path = item.get("path")
+        require(
+            errors,
+            isinstance(path, str) and bool(path),
+            f"{item_prefix}.path must be a non-empty string",
+        )
+        if isinstance(path, str):
+            paths.append(path)
+        require(
+            errors,
+            item.get("kind") in {"file", "symlink"},
+            f"{item_prefix}.kind is invalid",
+        )
+        require(
+            errors,
+            isinstance(item.get("mode"), str)
+            and bool(MODE_PATTERN.fullmatch(item["mode"])),
+            f"{item_prefix}.mode must be four octal digits",
+        )
+        require(
+            errors,
+            isinstance(item.get("sha256"), str)
+            and bool(SHA256_PATTERN.fullmatch(item["sha256"])),
+            f"{item_prefix}.sha256 must be lowercase SHA-256",
+        )
+        if item.get("kind") == "symlink":
+            require(
+                errors,
+                isinstance(item.get("link_target"), str) and bool(item["link_target"]),
+                f"{item_prefix}.link_target is required for a symlink",
+            )
+    require(errors, len(paths) == len(set(paths)), f"{prefix} paths must be unique")
+
+
 def validate_snapshot(errors: list[str], snapshot: Any, prefix: str) -> None:
     require(errors, isinstance(snapshot, dict), f"{prefix} must be a mapping")
     if not isinstance(snapshot, dict):
@@ -314,60 +376,9 @@ def validate_snapshot(errors: list[str], snapshot: Any, prefix: str) -> None:
     validate_string_list(
         errors, snapshot.get("exclusions"), f"{prefix}.exclusions", unique=True
     )
-    inputs = snapshot.get("additional_inputs")
-    require(
-        errors, isinstance(inputs, list), f"{prefix}.additional_inputs must be a list"
+    validate_digested_entries(
+        errors, snapshot.get("additional_inputs"), f"{prefix}.additional_inputs"
     )
-    paths: list[str] = []
-    if isinstance(inputs, list):
-        for index, item in enumerate(inputs):
-            item_prefix = f"{prefix}.additional_inputs[{index}]"
-            require(errors, isinstance(item, dict), f"{item_prefix} must be a mapping")
-            if not isinstance(item, dict):
-                continue
-            reject_unknown(
-                errors,
-                item,
-                {"path", "kind", "mode", "sha256", "link_target"},
-                item_prefix,
-            )
-            path = item.get("path")
-            require(
-                errors,
-                isinstance(path, str) and bool(path),
-                f"{item_prefix}.path must be a non-empty string",
-            )
-            if isinstance(path, str):
-                paths.append(path)
-            require(
-                errors,
-                item.get("kind") in {"file", "symlink"},
-                f"{item_prefix}.kind is invalid",
-            )
-            require(
-                errors,
-                isinstance(item.get("mode"), str)
-                and bool(MODE_PATTERN.fullmatch(item["mode"])),
-                f"{item_prefix}.mode must be four octal digits",
-            )
-            require(
-                errors,
-                isinstance(item.get("sha256"), str)
-                and bool(SHA256_PATTERN.fullmatch(item["sha256"])),
-                f"{item_prefix}.sha256 must be lowercase SHA-256",
-            )
-            if item.get("kind") == "symlink":
-                require(
-                    errors,
-                    isinstance(item.get("link_target"), str)
-                    and bool(item["link_target"]),
-                    f"{item_prefix}.link_target is required for a symlink",
-                )
-        require(
-            errors,
-            len(paths) == len(set(paths)),
-            f"{prefix}.additional_inputs paths must be unique",
-        )
     require(
         errors,
         isinstance(snapshot.get("fingerprint"), str)
@@ -381,26 +392,7 @@ def validate_snapshot(errors: list[str], snapshot: Any, prefix: str) -> None:
             and bool(SHA256_PATTERN.fullmatch(snapshot[key])),
             f"{prefix}.{key} must be lowercase SHA-256",
         )
-    untracked = snapshot.get("untracked")
-    require(errors, isinstance(untracked, list), f"{prefix}.untracked must be a list")
-    if isinstance(untracked, list):
-        for index, item in enumerate(untracked):
-            item_prefix = f"{prefix}.untracked[{index}]"
-            require(errors, isinstance(item, dict), f"{item_prefix} must be a mapping")
-            if not isinstance(item, dict):
-                continue
-            reject_unknown(
-                errors,
-                item,
-                {"path", "kind", "mode", "sha256", "link_target"},
-                item_prefix,
-            )
-            for key in ("path", "kind", "mode", "sha256"):
-                require(
-                    errors,
-                    isinstance(item.get(key), str) and bool(item[key]),
-                    f"{item_prefix}.{key} must be a non-empty string",
-                )
+    validate_digested_entries(errors, snapshot.get("untracked"), f"{prefix}.untracked")
 
 
 def snapshot_identity(snapshot: Any) -> dict[str, Any] | None:
@@ -470,7 +462,15 @@ def validate_gap_justification(errors: list[str], resolution: Any, prefix: str) 
         )
 
 
-def validate_evidence(errors: list[str], value: Any, prefix: str) -> None:
+def validate_evidence(
+    errors: list[str], value: Any, prefix: str, occurred: datetime | None
+) -> None:
+    """Validate one evidence record against the instant of the transaction carrying it.
+
+    `occurred` is the transaction's `occurred_at`, or None when it could not be parsed;
+    the ordering check is then skipped rather than compared against nothing.
+    """
+
     require(errors, isinstance(value, dict), f"{prefix} must be a mapping")
     if not isinstance(value, dict):
         return
@@ -487,7 +487,15 @@ def validate_evidence(errors: list[str], value: Any, prefix: str) -> None:
     )
     for key in ("provenance", "sanitized_result"):
         require_text(errors, value, key, prefix)
-    parse_timestamp(errors, value.get("observed_at"), f"{prefix}.observed_at")
+    observed = parse_timestamp(
+        errors, value.get("observed_at"), f"{prefix}.observed_at"
+    )
+    if observed and occurred:
+        require(
+            errors,
+            observed <= occurred,
+            f"{prefix}.observed_at must not follow event.occurred_at",
+        )
     digest = value.get("artifact_digest")
     require(
         errors,
@@ -597,7 +605,7 @@ def validate_anchors(errors: list[str], operation: dict[str, Any], prefix: str) 
 
 
 def validate_thread_open(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     validate_thread_reference(errors, operation.get("id"), f"{prefix}.id")
     require(
@@ -619,7 +627,7 @@ def validate_thread_open(
         message is None or (isinstance(message, str) and bool(message)),
         f"{prefix}.message must be a non-empty string when present",
     )
-    validate_evidence(errors, operation.get("evidence"), f"{prefix}.evidence")
+    validate_evidence(errors, operation.get("evidence"), f"{prefix}.evidence", occurred)
     evidence = operation.get("evidence")
     if (
         operation.get("priority") in {"P1", "P2"}
@@ -637,7 +645,7 @@ def validate_thread_open(
 
 
 def validate_thread_reply(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     validate_thread_reference(errors, operation.get("thread_id"), f"{prefix}.thread_id")
     require_text(errors, operation, "message", prefix)
@@ -646,14 +654,14 @@ def validate_thread_reply(
         operation.get("decision") in THREAD_DECISIONS,
         f"{prefix}.decision is invalid",
     )
-    validate_evidence(errors, operation.get("evidence"), f"{prefix}.evidence")
+    validate_evidence(errors, operation.get("evidence"), f"{prefix}.evidence", occurred)
     if operation.get("decision") == "deferred/blocked":
         for key in ("blocker", "completed_work", "remaining_work", "validation_gap"):
             require_text(errors, operation, key, prefix)
 
 
 def validate_thread_resolve(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     validate_thread_reference(errors, operation.get("thread_id"), f"{prefix}.thread_id")
     require_text(errors, operation, "message", prefix)
@@ -676,12 +684,15 @@ def validate_thread_resolve(
         f"{prefix}.verification.independent must be true",
     )
     validate_evidence(
-        errors, verification.get("evidence"), f"{prefix}.verification.evidence"
+        errors,
+        verification.get("evidence"),
+        f"{prefix}.verification.evidence",
+        occurred,
     )
 
 
 def validate_gap_open(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     require(
         errors,
@@ -699,7 +710,7 @@ def validate_gap_open(
 
 
 def validate_gap_resolve(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     require(
         errors,
@@ -716,11 +727,11 @@ def validate_gap_resolve(
         f"{prefix}.gap_id must match G<N>",
     )
     require_text(errors, operation, "message", prefix)
-    validate_evidence(errors, operation.get("evidence"), f"{prefix}.evidence")
+    validate_evidence(errors, operation.get("evidence"), f"{prefix}.evidence", occurred)
 
 
 def validate_check_record(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     require_text(errors, operation, "check", prefix)
     require(
@@ -729,11 +740,11 @@ def validate_check_record(
         f"{prefix}.result must be passed or failed",
     )
     if "evidence" in operation:
-        validate_evidence(errors, operation["evidence"], f"{prefix}.evidence")
+        validate_evidence(errors, operation["evidence"], f"{prefix}.evidence", occurred)
 
 
 def validate_note_attach(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     target = operation.get("target")
     require(errors, isinstance(target, dict), f"{prefix}.target must be a mapping")
@@ -754,14 +765,14 @@ def validate_note_attach(
 
 
 def validate_source_replace(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     validate_snapshot(errors, operation.get("snapshot"), f"{prefix}.snapshot")
     require_text(errors, operation, "reason", prefix)
 
 
 def validate_review_approve(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     require_text(errors, operation, "decision", prefix)
     if "structure_debt" in operation:
@@ -789,7 +800,7 @@ def validate_timeout_declare(
 
 
 def validate_thread_message(
-    errors: list[str], operation: dict[str, Any], prefix: str
+    errors: list[str], operation: dict[str, Any], prefix: str, occurred: datetime | None
 ) -> None:
     """Validate a comment or reopen: one thread reference and one prose body."""
 
@@ -797,6 +808,9 @@ def validate_thread_message(
     require_text(errors, operation, "message", prefix)
 
 
+# Every validator receives the transaction's parsed `occurred_at`, because evidence is
+# only valid relative to the handoff recording it; the operations that carry no evidence
+# accept the argument and ignore it, so the dispatch below has one signature.
 OPERATION_VALIDATORS = {
     "thread.open": validate_thread_open,
     "thread.reply": validate_thread_reply,
@@ -865,7 +879,7 @@ def validate_operation(
         if kind in TIMEOUT_DURATION_BY_KIND:
             validate_timeout_declare(errors, operation, prefix, kind, occurred)
         return
-    OPERATION_VALIDATORS[name](errors, operation, prefix)
+    OPERATION_VALIDATORS[name](errors, operation, prefix, occurred)
 
 
 def validate_failed_check_gaps(errors: list[str], operations: list[Any]) -> None:
@@ -1010,24 +1024,4 @@ def validate_event(event: Any) -> list[str]:
             )
         validate_failed_check_gaps(errors, operations)
         validate_transaction_shape(errors, event, kind, operations)
-
-    def check_evidence_times(value: Any, prefix: str) -> None:
-        if isinstance(value, dict):
-            if {"basis", "provenance", "observed_at", "sanitized_result"} <= set(value):
-                observed = parse_timestamp(
-                    errors, value.get("observed_at"), f"{prefix}.observed_at"
-                )
-                if observed and occurred:
-                    require(
-                        errors,
-                        observed <= occurred,
-                        f"{prefix}.observed_at must not follow event.occurred_at",
-                    )
-            for key, item in value.items():
-                check_evidence_times(item, f"{prefix}.{key}")
-        elif isinstance(value, list):
-            for index, item in enumerate(value):
-                check_evidence_times(item, f"{prefix}[{index}]")
-
-    check_evidence_times(event, "event")
     return errors

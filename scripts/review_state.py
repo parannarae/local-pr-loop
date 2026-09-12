@@ -32,7 +32,7 @@ FORMAT_REVISION = review_schema.FORMAT_REVISION
 OPERATION_FIELDS = review_schema.OPERATION_FIELDS
 OPERATIONS_BY_KIND = review_schema.OPERATIONS_BY_KIND
 SHA256_PATTERN = review_schema.SHA256_PATTERN
-load_json = review_schema.load_json
+load_json_from_stdin = review_schema.load_json_from_stdin
 operations_of = review_schema.operations_of
 reject_duplicate_keys = review_schema.reject_duplicate_keys
 snapshot_identity = review_schema.snapshot_identity
@@ -116,7 +116,7 @@ def append_event(document: Any, event: Any) -> dict[str, Any]:
     if not isinstance(event, dict):
         raise TypeError("event must be a JSON object")
     next_history = [*document["history"], event]
-    errors, state, _ = project_history(next_history, document.get("created_at"))
+    errors, state = project_history(next_history, document.get("created_at"))
     if errors:
         raise ValueError("; ".join(errors))
     document["history"] = next_history
@@ -201,7 +201,7 @@ def main() -> int:
         print(json.dumps(document, indent=2))
         return 0
     try:
-        value = load_json()
+        value = load_json_from_stdin()
     except (ValueError, json.JSONDecodeError) as error:
         print(f"invalid JSON: {error}", file=sys.stderr)
         return 1
@@ -225,6 +225,14 @@ def main() -> int:
             else "null"
         )
         return 0
+    # `report` and `threads` render schema-required fields directly, so they refuse a
+    # document the format cannot vouch for rather than print one with substituted
+    # values. The diagnostic `state` and `eligible-timeout` commands stay ungated so a
+    # stale or invalid projection is still inspectable during recovery.
+    if args.command in {"report", "threads"}:
+        errors = validate_document(value)
+        if errors:
+            return emit_validation(errors)
     if args.command == "report":
         print(render_report(value), end="")
         return 0

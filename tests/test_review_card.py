@@ -305,6 +305,36 @@ class OperatingCardTest(unittest.TestCase):
         self.assertIn("acknowledge_structure_debt", with_flag["must"])
         self.assertEqual(with_flag["accretion_flagged_paths"], ["src/app.py"])
 
+    def test_the_structure_debt_obligation_skips_an_action_that_cannot_approve(
+        self,
+    ) -> None:
+        """The obligation is a field of `review.approve`, so only an approving action
+        can carry it.
+
+        A flagged ledger and a part-way publication coexist: the card would otherwise
+        tell an agent mid-recovery to run `draft approve`, off the only path that
+        repairs its artifacts.
+        """
+        for action in ("recover_publication", "abort_draft", "regenerate_report"):
+            with self.subTest(action=action):
+                card = self.card(
+                    action,
+                    flags=["accretion_flagged"],
+                    flagged_paths=["src/app.py"],
+                )
+
+                self.assertNotIn("acknowledge_structure_debt", card["must"])
+                # The flagged set is still reported; only the obligation is withheld.
+                self.assertEqual(card["accretion_flagged_paths"], ["src/app.py"])
+
+    def test_publishing_a_templated_draft_still_carries_the_obligation(self) -> None:
+        # The draft may be the final_review that must dispose of the flagged files.
+        card = self.card(
+            "publish_draft", flags=["accretion_flagged"], flagged_paths=["src/app.py"]
+        )
+
+        self.assertIn("acknowledge_structure_debt", card["must"])
+
     def test_every_action_the_ladder_can_choose_states_its_own_obligations(
         self,
     ) -> None:

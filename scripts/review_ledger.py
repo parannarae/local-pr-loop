@@ -45,18 +45,32 @@ def thread_counts(history: Any) -> dict[str, int]:
     return counts
 
 
-def _in_scope(path: str, scope: list[str], exclusions: list[str]) -> bool:
-    """Report whether a repository-relative path is inside the guarded scope."""
+def _canonical_identities(repository_root: str, paths: list[str]) -> list[str]:
+    """Return the repository-relative identities of declared paths.
 
-    normalized = review_scope.normalize_path(path)
-    included = any(
-        review_scope.covers(review_scope.normalize_path(entry), normalized)
-        for entry in scope
-    )
-    excluded = any(
-        review_scope.covers(review_scope.normalize_path(entry), normalized)
-        for entry in exclusions
-    )
+    A path that resolves outside the worktree is skipped rather than compared, matching
+    `review_scope.overlapping_paths`: it can never bound a guarded scope.
+    """
+
+    identities: list[str] = []
+    for path in paths:
+        try:
+            identities.append(review_scope.canonical_path(repository_root, path))
+        except ValueError:
+            continue
+    return identities
+
+
+def _in_scope(identity: str, scope: list[str], exclusions: list[str]) -> bool:
+    """Report whether a canonical path identity is inside the guarded scope.
+
+    Every argument is already a canonical identity, so two spellings of one file compare
+    equal here; comparing the strings an agent typed would let an alias of a guarded file
+    escape the flagged set.
+    """
+
+    included = any(review_scope.covers(entry, identity) for entry in scope)
+    excluded = any(review_scope.covers(entry, identity) for entry in exclusions)
     return included and not excluded
 
 
@@ -79,9 +93,10 @@ def growth_by_file(
     """Measure per-file line growth from the comparison base to the working tree.
 
     Only net growth participates: a file that shrank or broke even can never cross a
-    positive growth threshold, so its base line count is not probed. Returns
-    `base_lines` as None for a file absent at the base. Binary files report no line
-    counts and are skipped. Renames are disabled so every path names itself.
+    positive growth threshold, so its base line count is not probed. `base_lines` is None
+    whenever the base content could not be read, which covers a file absent at the base
+    and every other `git show` failure alike. Binary files report no line counts and are
+    skipped. Renames are disabled so every path names itself.
     """
 
     pathspecs = [
@@ -138,13 +153,23 @@ def ledger(
     Both signals are confined to the guarded scope minus exclusions: only a guarded
     file can demand a `structure_debt` acknowledgment, so a thread naming an
     out-of-scope or mistyped path is dropped here rather than flagged.
+
+    Threads are counted against canonical path identities, so two spellings of one
+    guarded file — a `..` segment, an absolute path, a symlink alias — accumulate into
+    that file's single count and its single entry in `flagged`.
     """
 
-    counts = {
-        path: count
-        for path, count in thread_counts(document.get("history")).items()
-        if _in_scope(path, scope, exclusions)
-    }
+    scope_identities = _canonical_identities(repository_root, scope)
+    exclusion_identities = _canonical_identities(repository_root, exclusions)
+    counts: dict[str, int] = {}
+    for path, count in thread_counts(document.get("history")).items():
+        try:
+            identity = review_scope.canonical_path(repository_root, path)
+        # A thread naming a path outside the worktree can never name a guarded file.
+        except ValueError:
+            continue
+        if _in_scope(identity, scope_identities, exclusion_identities):
+            counts[identity] = counts.get(identity, 0) + count
     comparison_base = document.get("comparison_base")
     # A base this clone cannot reach degrades to the thread signal instead of failing:
     # blocking final_review over a missing baseline commit would brick the loop on any

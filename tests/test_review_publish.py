@@ -359,5 +359,56 @@ class LeaseTokenTest(unittest.TestCase):
             publisher.lease_token({"token": 123})
 
 
+# --- review_publish.guard_digest ---
+
+
+class GuardDigestTest(unittest.TestCase):
+    """A corrupt guard is named as such, rather than blamed on canonical history.
+
+    A guard missing `review_sha256` used to compare as None and fail later as
+    "canonical SHA does not match expected review SHA", pointing the reader at the
+    one file that was fine.
+    """
+
+    def test_returns_a_recorded_digest(self) -> None:
+        self.assertEqual(
+            publisher.guard_digest(state, "a" * 64, "review_sha256"), "a" * 64
+        )
+
+    def test_refuses_a_missing_digest_by_naming_the_guard(self) -> None:
+        with self.assertRaisesRegex(ValueError, "inspection guard review_sha256"):
+            publisher.guard_digest(state, None, "review_sha256")
+
+    def test_refuses_a_digest_that_is_not_sha256(self) -> None:
+        with self.assertRaisesRegex(ValueError, "source_snapshot.fingerprint"):
+            publisher.guard_digest(state, "not-a-digest", "source_snapshot.fingerprint")
+
+
+# --- review_publish.snapshot_path_list ---
+
+
+class SnapshotPathListTest(unittest.TestCase):
+    """The ledger's two inputs are validated rather than defaulted to empty.
+
+    An absent scope is not neutral: `_in_scope` then matches no thread while
+    `growth_by_file` builds empty pathspecs and diffs the whole repository, so one
+    corrupt snapshot moved the flagged set in both directions at once.
+    """
+
+    def test_returns_the_recorded_list(self) -> None:
+        snapshot = {"scope": ["src"], "exclusions": []}
+
+        self.assertEqual(publisher.snapshot_path_list(snapshot, "scope"), ["src"])
+        self.assertEqual(publisher.snapshot_path_list(snapshot, "exclusions"), [])
+
+    def test_refuses_an_absent_scope(self) -> None:
+        with self.assertRaisesRegex(ValueError, "scope must be a list of strings"):
+            publisher.snapshot_path_list({}, "scope")
+
+    def test_refuses_a_non_string_entry(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exclusions must be a list of strings"):
+            publisher.snapshot_path_list({"exclusions": ["src", 7]}, "exclusions")
+
+
 if __name__ == "__main__":
     unittest.main()

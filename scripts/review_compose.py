@@ -250,15 +250,52 @@ class Draft:
     stamped: datetime
 
 
+@dataclass(frozen=True)
+class Composition:
+    """What one composer contributed to the draft, and how to name it afterwards.
+
+    `target` is the identifier `show` prints beside this act's first operation, so the
+    acknowledgment can be passed straight back to `drop`; it is None for an act that
+    names nothing, such as an approval. `gap_id` names a gap the composer opened
+    alongside its own operation, which `record-check` does for a failed check.
+    """
+
+    operations: list[dict[str, Any]]
+    target: str | None
+    gap_id: str | None = None
+
+
 def identifier_list(state: dict[str, Any], group: str, status: str) -> tuple:
-    value = (state.get(group) or {}).get(status)
-    return tuple(item for item in (value or []) if isinstance(item, str))
+    """Return one canonical identifier set, refusing a projection it cannot read.
+
+    `next_identifier` mints from these sets, so a malformed group read as empty would
+    restart at `T1` and mint an identifier that collides with history — caught only at
+    publish, after the whole draft was composed against it.
+
+    Raises:
+        TypeError: The group is absent or is not a mapping. That is a shape failure,
+            reported the way `open_draft` reports the same failure one level up.
+        ValueError: The group is a mapping, but its status list is not a list of
+            identifier strings.
+    """
+
+    group_value = state.get(group)
+    if not isinstance(group_value, dict):
+        raise TypeError(
+            f"canonical state records no {group} mapping; the projection is unusable"
+        )
+    items = group_value.get(status)
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        raise ValueError(
+            f"canonical state {group}.{status} must be a list of identifier strings"
+        )
+    return tuple(items)
 
 
 def open_draft(args: argparse.Namespace) -> Draft:
     """Verify the lease and load the draft it protects, with its canonical document."""
 
-    review_workflow.verify_lease(args)
+    review_workflow.verify_lease(review_workflow.lease_context(args))
     path = Path(args.event)
     require_secure_regular(path, "draft")
     value = load_object(path)
@@ -604,9 +641,7 @@ def require_open_thread(draft: Draft, thread_id: str) -> None:
 # --- composition commands ---
 
 
-def compose_open_thread(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str]:
+def compose_open_thread(draft: Draft, args: argparse.Namespace) -> Composition:
     if not args.paths:
         raise ValueError("a thread must name the files it concerns: pass --paths")
     paths = tuple(args.paths)
@@ -631,12 +666,10 @@ def compose_open_thread(
         message=read_prose(args.message, args.message_file),
         anchors=parse_anchors(args.anchor, paths) or None,
     )
-    return [operation.as_operation()], thread_id
+    return Composition(operations=[operation.as_operation()], target=thread_id)
 
 
-def compose_reply(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str]:
+def compose_reply(draft: Draft, args: argparse.Namespace) -> Composition:
     require_open_thread(draft, args.thread_id)
     blocked = args.decision == "deferred/blocked"
     for name, value in (
@@ -662,22 +695,18 @@ def compose_reply(
         remaining_work=args.remaining_work,
         validation_gap=args.validation_gap,
     )
-    return [operation.as_operation()], args.thread_id
+    return Composition(operations=[operation.as_operation()], target=args.thread_id)
 
 
-def compose_comment(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str]:
+def compose_comment(draft: Draft, args: argparse.Namespace) -> Composition:
     require_open_thread(draft, args.thread_id)
     operation = ThreadComment(
         thread_id=args.thread_id, message=demand_message(args)
     )
-    return [operation.as_operation()], args.thread_id
+    return Composition(operations=[operation.as_operation()], target=args.thread_id)
 
 
-def compose_reopen(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str]:
+def compose_reopen(draft: Draft, args: argparse.Namespace) -> Composition:
     if args.thread_id not in draft.resolved_threads:
         raise ValueError(
             f"{args.thread_id} is not a resolved thread; resolved threads are "
@@ -686,7 +715,7 @@ def compose_reopen(
     operation = ThreadReopen(
         thread_id=args.thread_id, message=demand_message(args)
     )
-    return [operation.as_operation()], args.thread_id
+    return Composition(operations=[operation.as_operation()], target=args.thread_id)
 
 
 def remaining_open_after_resolve(draft: Draft, thread_id: str) -> set[str]:
@@ -718,9 +747,7 @@ def remaining_open_after_resolve(draft: Draft, thread_id: str) -> set[str]:
     return ((set(draft.open_threads) | opened) - resolved) | reopened
 
 
-def compose_resolve(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str]:
+def compose_resolve(draft: Draft, args: argparse.Namespace) -> Composition:
     require_open_thread(draft, args.thread_id)
     if draft.kind == "reviewer_update" and not remaining_open_after_resolve(
         draft, args.thread_id
@@ -755,19 +782,19 @@ def compose_resolve(
         message=demand_message(args),
         verification=verification,
     )
-    return [operation.as_operation()], args.thread_id
+    return Composition(operations=[operation.as_operation()], target=args.thread_id)
 
 
-def compose_open_gap(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str]:
+def compose_open_gap(draft: Draft, args: argparse.Namespace) -> Composition:
     if args.check in passed_checks(draft.operations):
         raise ValueError(
             f"the draft records {args.check} as passed, so it cannot also record "
             "that the check went unvalidated; correct the record with record-check"
         )
+    # The gap is this act's own operation, so it is the drop target rather than a
+    # second identifier reported beside one.
     operation = gap_open_for(draft, args.check, args.reason, args.material)
-    return [operation.as_operation()], operation.gap_id
+    return Composition(operations=[operation.as_operation()], target=operation.gap_id)
 
 
 def gap_open_for(draft: Draft, check: str, reason: str, material: bool) -> GapOpen:
@@ -798,9 +825,7 @@ def gap_open_for(draft: Draft, check: str, reason: str, material: bool) -> GapOp
     return GapOpen(gap_id=gap_id, check=check, reason=reason, material=material)
 
 
-def compose_resolve_gap(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str]:
+def compose_resolve_gap(draft: Draft, args: argparse.Namespace) -> Composition:
     if args.gap_id not in draft.open_gaps:
         raise ValueError(
             f"{args.gap_id} is not an open validation gap; open gaps are "
@@ -831,12 +856,17 @@ def compose_resolve_gap(
             else None
         ),
     )
-    return [operation.as_operation()], args.gap_id
+    return Composition(operations=[operation.as_operation()], target=args.gap_id)
 
 
-def compose_record_check(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str | None]:
+def compose_record_check(draft: Draft, args: argparse.Namespace) -> Composition:
+    """Record one check, opening the material gap a failure owes in the same act.
+
+    The act is named by the check, not by the gap it may have opened: `show` prints and
+    `drop` accepts `check.record <check>`, so reporting the gap ID as the target would
+    print an acknowledgment no `drop` could act on. The gap is reported as `gap_id`.
+    """
+
     reason = args.gap_reason
     failed = args.result == "failed"
     if failed and not reason:
@@ -852,15 +882,17 @@ def compose_record_check(
         evidence=build_evidence(args, draft.stamped),
     )
     if not failed:
-        return [check.as_operation()], None
+        return Composition(operations=[check.as_operation()], target=args.check)
     # The guards above make a failed result and a gap reason inseparable.
     gap = gap_open_for(draft, args.check, reason, True)
-    return [check.as_operation(), gap.as_operation()], gap.gap_id
+    return Composition(
+        operations=[check.as_operation(), gap.as_operation()],
+        target=args.check,
+        gap_id=gap.gap_id,
+    )
 
 
-def compose_note(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str]:
+def compose_note(draft: Draft, args: argparse.Namespace) -> Composition:
     if args.thread_id not in acted_thread_ids(draft.operations):
         raise ValueError(
             f"draft has no entry for thread {args.thread_id}; compose the act this "
@@ -871,12 +903,10 @@ def compose_note(
         tag=args.tag,
         message=demand_message(args),
     )
-    return [operation.as_operation()], args.thread_id
+    return Composition(operations=[operation.as_operation()], target=args.thread_id)
 
 
-def compose_replace_source(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], None]:
+def compose_replace_source(draft: Draft, args: argparse.Namespace) -> Composition:
     snapshot = draft.value.get("source_snapshot")
     if not isinstance(snapshot, dict):
         raise TypeError(
@@ -886,12 +916,10 @@ def compose_replace_source(
     # The replacement basis is the snapshot the guard pinned, never one an agent
     # supplies, so the transaction cannot claim a basis the tools did not observe.
     operation = SourceReplace(snapshot=snapshot, reason=args.reason)
-    return [operation.as_operation()], None
+    return Composition(operations=[operation.as_operation()], target=None)
 
 
-def compose_approve(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], None]:
+def compose_approve(draft: Draft, args: argparse.Namespace) -> Composition:
     prefilled = next(
         (
             item.get("structure_debt")
@@ -923,7 +951,7 @@ def compose_approve(
             )
         debt = None
     operation = ReviewApprove(decision=args.decision, structure_debt=debt)
-    return [operation.as_operation()], None
+    return Composition(operations=[operation.as_operation()], target=None)
 
 
 COMPOSERS = {
@@ -1036,18 +1064,16 @@ def show(args: argparse.Namespace) -> int:
     return 0
 
 
-def composed_operations(
-    draft: Draft, args: argparse.Namespace
-) -> tuple[list[dict[str, Any]], str | None]:
+def composed_operations(draft: Draft, args: argparse.Namespace) -> Composition:
     """Build and check the operations one subcommand contributes to the draft.
 
     Everything a command refuses is refused here, before the draft is touched, so
     a rejected act leaves the draft exactly as it was.
     """
 
-    operations, target = COMPOSERS[args.command](draft, args)
-    require_valid(operations, draft.kind, draft.stamped)
-    return operations, target
+    composition = COMPOSERS[args.command](draft, args)
+    require_valid(composition.operations, draft.kind, draft.stamped)
+    return composition
 
 
 def selection(draft: Draft, name: str, target: str) -> set[int]:
@@ -1077,14 +1103,24 @@ def selection(draft: Draft, name: str, target: str) -> set[int]:
 
 
 def acknowledge(
-    draft: Draft, name: str, target: str | None, status: str, dropped: int
+    draft: Draft,
+    name: str,
+    target: str | None,
+    status: str,
+    dropped: int,
+    gap_id: str | None = None,
 ) -> None:
-    """Print what one act changed, in the fixed shape every subcommand reports."""
+    """Print what one act changed, in the fixed shape every subcommand reports.
+
+    `op` and `target` together are what `drop` accepts, so an acknowledgment can be
+    handed straight back. `gap_id` is null unless the act also opened a gap.
+    """
 
     print(
         json.dumps(
             {
                 "dropped": dropped,
+                "gap_id": gap_id,
                 "op": name,
                 "outstanding": len(review_schema.validate_event(draft.value)),
                 "status": status,
@@ -1118,18 +1154,19 @@ def compose(args: argparse.Namespace) -> int:
     """Compose one act into the draft under the lease and acknowledge it compactly."""
 
     draft = open_draft(args)
-    operations, target = composed_operations(draft, args)
+    composition = composed_operations(draft, args)
     replaced = False
-    for operation in operations:
+    for operation in composition.operations:
         replaced = place(draft.operations, operation) or replaced
     removed = remove(draft, unsupported(draft.operations))
     record(draft)
     acknowledge(
         draft,
-        operations[0]["op"],
-        target,
+        composition.operations[0]["op"],
+        composition.target,
         "replaced" if replaced else "recorded",
         len(removed),
+        gap_id=composition.gap_id,
     )
     return 0
 

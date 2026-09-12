@@ -538,7 +538,8 @@ class ReviewJsonCliTest(unittest.TestCase):
                 "The focused test fails against the guarded tree.",
             ).stdout
         )
-        self.assertEqual(failed["target"], "G1")
+        self.assertEqual(failed["target"], "focused tests")
+        self.assertEqual(failed["gap_id"], "G1")
         self.assertEqual(failed["dropped"], 0)
 
         corrected = json.loads(
@@ -563,6 +564,50 @@ class ReviewJsonCliTest(unittest.TestCase):
         refused = self.draft("drop", "thread.open", "T2", check=False)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("thread.open T1", refused.stderr)
+
+    def test_a_record_checks_acknowledged_target_is_what_drop_accepts(self) -> None:
+        """The one two-operation composer must still name itself, not the gap it opened.
+
+        Reporting the gap ID here printed an acknowledgment no `drop` could act on, so
+        the only way to take the check back was to abort the whole draft.
+        """
+        self.guarded_template("review")
+        # The fixture already records one passing check, so the draft carries two
+        # `check.record` operations and the drop below has to select by the target it
+        # was handed rather than by the operation name alone.
+        self.compose_threads(1)
+        recorded = json.loads(
+            self.draft(
+                "record-check",
+                "--check",
+                "focused tests",
+                "--result",
+                "failed",
+                "--gap-reason",
+                "The focused test fails against the guarded tree.",
+            ).stdout
+        )
+        self.assertEqual(recorded["target"], "focused tests")
+        self.assertEqual(recorded["gap_id"], "G1")
+
+        dropped = json.loads(
+            self.draft("drop", recorded["op"], recorded["target"]).stdout
+        )
+
+        self.assertEqual(dropped["status"], "dropped")
+        # Exactly the named check, and nothing else: its gap is not stranded by the
+        # removal, and the unrelated passing check is untouched.
+        self.assertEqual(dropped["dropped"], 1)
+        operations = json.loads(self.event.read_text())["operations"]
+        self.assertEqual(
+            [item["check"] for item in operations if item["op"] == "check.record"],
+            ["source inspection"],
+        )
+        # A validation gap outlives the check that revealed it until that check is
+        # recorded as passing.
+        self.assertEqual(
+            [item["gap_id"] for item in operations if item["op"] == "gap.open"], ["G1"]
+        )
 
     # --- await-handoff ---
 

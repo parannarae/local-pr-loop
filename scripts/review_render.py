@@ -1,4 +1,10 @@
-"""Render review conversations and the skim-first summary report."""
+"""Render review conversations and the skim-first summary report.
+
+Every renderer here reads a document its caller has already put through
+`review_projection.validate_document`, so schema-required fields are indexed rather than
+defaulted: substituting a plausible value for a corrupt one would print a page that looks
+authoritative and is not.
+"""
 
 from __future__ import annotations
 
@@ -23,10 +29,14 @@ THREAD_ENTRY_LABELS = {
 
 
 def evidence_summary(value: Any) -> str:
-    """Summarize structured evidence without exposing its full payload."""
+    """Summarize structured evidence without exposing its full payload.
+
+    "Unavailable" covers the operations whose evidence is optional and absent, never a
+    validated record missing a field.
+    """
     if not isinstance(value, dict):
         return "Unavailable"
-    return f"{value.get('basis', 'unknown')}: {value.get('sanitized_result', '')}"
+    return f"{value['basis']}: {value['sanitized_result']}"
 
 
 def entry_label(operation: dict[str, Any]) -> str:
@@ -226,7 +236,12 @@ def attached_notes(event: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def gap_records(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Collect every gap definition and resolution message by gap ID."""
+    """Collect every gap definition and resolution by gap ID.
+
+    Each record has the same four keys whether or not the gap was resolved:
+    `{"gap": <gap.open>, "resolution": str | None, "disposition": str | None,
+    "justification": dict | None}`.
+    """
     records: dict[str, dict[str, Any]] = {}
     for event in history:
         for operation in operations_of(event):
@@ -234,7 +249,12 @@ def gap_records(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                 continue
             name = operation.get("op")
             if name == "gap.open" and isinstance(operation.get("gap_id"), str):
-                records[operation["gap_id"]] = {"gap": operation, "resolution": None}
+                records[operation["gap_id"]] = {
+                    "gap": operation,
+                    "resolution": None,
+                    "disposition": None,
+                    "justification": None,
+                }
             elif name == "gap.resolve":
                 gap_id = operation.get("gap_id")
                 record = records.get(gap_id) if isinstance(gap_id, str) else None
@@ -343,8 +363,9 @@ def render_note_item(note: dict[str, str]) -> str:
 
 
 def thread_sort_key(item: dict[str, Any]) -> tuple[str, int]:
+    """Order threads by priority, then by the number in their validated `T<N>` ID."""
     thread = item["thread"]
-    return (thread.get("priority", "P3"), int(thread["id"][1:]))
+    return (thread["priority"], int(thread["id"][1:]))
 
 
 def end_picture(item: dict[str, Any], workflow: dict[str, Any]) -> str:
@@ -455,10 +476,8 @@ def render_issue_summary(document: dict[str, Any]) -> list[str]:
     )
     for item in threads:
         thread = item["thread"]
-        identity = f"{thread['id']} `{thread.get('priority', '')}`"
-        raised = escape_cell(
-            f"{thread.get('title', '')} — {thread.get('risk', '')}"
-        )
+        identity = f"{thread['id']} `{thread['priority']}`"
+        raised = escape_cell(f"{thread['title']} — {thread['risk']}")
         lines.append(
             f"| {identity} | {raised} | {escape_cell(end_picture(item, workflow))} |"
             f" {escape_cell(rejection_cell(item))} |"
@@ -495,6 +514,26 @@ def render_issue_summary(document: dict[str, Any]) -> list[str]:
             f"| {gap_id} `{badge}` | {raised} | {escape_cell(picture)} | — |"
         )
     return lines
+
+
+def find_snapshot_for_fingerprint(
+    history: list[dict[str, Any]], fingerprint: str
+) -> dict[str, Any] | None:
+    """Find the most recent recorded snapshot carrying this guarded fingerprint.
+
+    Timeout events carry no snapshot, so history is walked backward rather than read
+    from its last event. None when no event recorded this fingerprint.
+    """
+
+    for event in reversed(history):
+        for key in ("completed_source_snapshot", "source_snapshot"):
+            candidate = event.get(key)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("fingerprint") == fingerprint
+            ):
+                return candidate
+    return None
 
 
 def render_verification(document: dict[str, Any]) -> list[str]:
@@ -537,21 +576,10 @@ def render_verification(document: dict[str, Any]) -> list[str]:
         lines.append("- No validation checks recorded")
     fingerprint = state.get("source_fingerprint")
     if fingerprint and history:
-        # Timeout events carry no snapshot, so walk history backward for the
-        # snapshot that recorded the current guarded fingerprint.
-        snapshot: dict[str, Any] | None = None
-        for event in reversed(history):
-            for key in ("completed_source_snapshot", "source_snapshot"):
-                candidate = event.get(key)
-                if (
-                    isinstance(candidate, dict)
-                    and candidate.get("fingerprint") == fingerprint
-                ):
-                    snapshot = candidate
-                    break
-            if snapshot is not None:
-                break
-        scope = snapshot.get("scope", []) if isinstance(snapshot, dict) else []
+        snapshot = find_snapshot_for_fingerprint(history, fingerprint)
+        # None when the backward search reached the start of history without a match,
+        # which leaves the guarded scope unrecorded rather than empty.
+        scope = snapshot["scope"] if snapshot is not None else []
         scope_text = ", ".join(f"`{path}`" for path in scope) or "unrecorded scope"
         count = f"{len(scope)} file{'s' if len(scope) != 1 else ''}"
         terminal = state.get("terminal")
@@ -579,7 +607,11 @@ def render_verification(document: dict[str, Any]) -> list[str]:
 
 
 def render_report(document: dict[str, Any]) -> str:
-    """Render the skim-first summary page from canonical history."""
+    """Render the skim-first summary page from canonical history.
+
+    The caller supplies a document that passed `validate_document`; this renderer
+    indexes schema-required fields and raises rather than substituting a default.
+    """
     notes = summary_notes(document)
     lines = render_header(document, len(notes))
     lines.extend(["", "## Notes for You", ""])

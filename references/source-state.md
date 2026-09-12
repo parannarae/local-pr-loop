@@ -110,8 +110,11 @@ ordinary agent read, and `--json` returns the full stable dashboard. The
 dashboard carries the accretion ledger only where a `final_review` is allowed;
 add `--accretion` to include it in any other phase. The snapshot covers scoped
 staged and unstaged diffs, non-ignored untracked contents, and additional-input
-metadata. A symlink digest covers its resolved regular-file content and records
-its link target.
+metadata. Both digested listings record a symlink's link target, but they digest
+different things: an additional input's digest covers the regular file it resolves
+to, because the input is declared to be read, while an untracked symlink's digest
+covers the link target string, so repointing it reads as drift even when the file
+it now names is byte-identical.
 
 Use the same repository, scope, exclusions, and additional inputs for a
 publication. If the reviewed source basis changes after review begins, the

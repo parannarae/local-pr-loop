@@ -103,7 +103,13 @@ def draft_for(
 
 
 def compose(draft: review_compose.Draft, args: argparse.Namespace):
-    return review_compose.composed_operations(draft, args)
+    """Return a composition's operations and drop target, the pair most tests read.
+
+    A test that also asserts the gap a composer opened alongside its own operation
+    calls `composed_operations` directly for the whole `Composition`.
+    """
+    composition = review_compose.composed_operations(draft, args)
+    return composition.operations, composition.target
 
 
 class DraftReaderTest(unittest.TestCase):
@@ -115,7 +121,14 @@ class DraftReaderTest(unittest.TestCase):
             "format": "local-pr-loop",
             "format_revision": "2027-01-01.1",
         }
-        args = argparse.Namespace(event="draft.json", review="review.json")
+        args = argparse.Namespace(
+            event="draft.json",
+            review="review.json",
+            repo="repo",
+            lease="review.lease.json",
+            guard="review.guard.json",
+            lock_script="review_lock.py",
+        )
 
         with (
             patch.object(review_compose.review_workflow, "verify_lease"),
@@ -124,6 +137,45 @@ class DraftReaderTest(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "unsupported storage contract"),
         ):
             review_compose.open_draft(args)
+
+
+# --- review_compose.identifier_list ---
+
+
+class IdentifierListTest(unittest.TestCase):
+    """A malformed projection is refused, not read as an empty identifier set.
+
+    Reading it as empty restarted `next_identifier` at `T1`, so the draft minted an
+    identifier that collides with history — caught only at publish, after every act had
+    already been composed against it.
+    """
+
+    def test_returns_the_recorded_identifiers(self) -> None:
+        state = {"threads": {"open": ["T1", "T2"], "resolved": []}}
+
+        self.assertEqual(
+            review_compose.identifier_list(state, "threads", "open"), ("T1", "T2")
+        )
+
+    def test_a_missing_group_is_refused_as_a_type_error(self) -> None:
+        # TypeError for a shape failure, ValueError for malformed content inside a
+        # well-shaped mapping: the same split `review_scope.validate` documents.
+        with self.assertRaisesRegex(TypeError, "no validation_gaps mapping"):
+            review_compose.identifier_list({}, "validation_gaps", "open")
+
+    def test_a_group_that_is_not_a_mapping_is_refused_as_a_type_error(self) -> None:
+        with self.assertRaisesRegex(TypeError, "no threads mapping"):
+            review_compose.identifier_list({"threads": ["T1"]}, "threads", "open")
+
+    def test_a_status_list_that_is_not_a_list_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"threads\.open must be a list"):
+            review_compose.identifier_list({"threads": {"open": "T1"}}, "threads", "open")
+
+    def test_a_non_string_entry_is_refused_rather_than_filtered_out(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"threads\.resolved must be a list"):
+            review_compose.identifier_list(
+                {"threads": {"resolved": ["T1", 2]}}, "threads", "resolved"
+            )
 
 
 class EvidenceRefusalTest(unittest.TestCase):
@@ -341,7 +393,7 @@ class ValidationRecordTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--gap-reason"):
             compose(draft, arguments("record-check", result="failed"))
 
-        operations, target = compose(
+        composition = review_compose.composed_operations(
             draft,
             arguments(
                 "record-check",
@@ -349,10 +401,22 @@ class ValidationRecordTest(unittest.TestCase):
                 gap_reason="The focused test fails against the guarded tree.",
             ),
         )
+        operations = composition.operations
         self.assertEqual([item["op"] for item in operations], ["check.record", "gap.open"])
-        self.assertEqual(target, "G1")
+        # The act is named by the check `drop` would take back, not by the gap it
+        # opened; the gap is reported beside it.
+        self.assertEqual(composition.target, "focused test")
+        self.assertEqual(composition.gap_id, "G1")
         self.assertTrue(operations[1]["material"])
         self.assertEqual(operations[1]["check"], operations[0]["check"])
+
+    def test_a_passed_check_is_named_by_the_check_and_opens_no_gap(self) -> None:
+        composition = review_compose.composed_operations(
+            draft_for("review"), arguments("record-check", result="passed")
+        )
+
+        self.assertEqual(composition.target, "focused test")
+        self.assertIsNone(composition.gap_id)
 
     def test_a_gap_reason_without_a_failure_is_refused(self) -> None:
         with self.assertRaisesRegex(ValueError, "only to a failed check"):
@@ -599,7 +663,7 @@ class RemovalTest(unittest.TestCase):
 
     def test_a_corrected_check_drops_the_gap_its_failure_opened(self) -> None:
         draft = draft_for("review")
-        failed, gap_id = compose(
+        failed = review_compose.composed_operations(
             draft,
             arguments(
                 "record-check",
@@ -607,9 +671,9 @@ class RemovalTest(unittest.TestCase):
                 gap_reason="The focused test fails against the guarded tree.",
             ),
         )
-        for operation in failed:
+        for operation in failed.operations:
             review_compose.place(draft.operations, operation)
-        self.assertEqual(gap_id, "G1")
+        self.assertEqual(failed.gap_id, "G1")
 
         corrected, _ = compose(draft, arguments("record-check", result="passed"))
         for operation in corrected:

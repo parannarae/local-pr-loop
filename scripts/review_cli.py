@@ -31,6 +31,11 @@ SNAPSHOT_SCRIPT = SCRIPT_DIRECTORY / "source_snapshot.py"
 STATE_SCRIPT = SCRIPT_DIRECTORY / "review_state.py"
 WORKFLOW_SCRIPT = SCRIPT_DIRECTORY / "review_workflow.py"
 REVIEW_ID_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+# How long a freshly created successor waits before deciding which loop won. Covers the
+# skew between two agents writing their canonical files; it is not a correctness bound,
+# and a competitor slower than this still converges on the next command that scans
+# successors.
+SUCCESSOR_SETTLE_SECONDS = 0.4
 
 
 @dataclass(frozen=True)
@@ -363,65 +368,72 @@ def command_scope_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_inspect(args: argparse.Namespace) -> int:
-    paths = review_paths(args.repo, args.review_id)
-    validate_review(paths)
-    lock_json = captured_helper(
-        LOCK_SCRIPT,
-        review_discover.lock_status_arguments(paths.repository.root, paths.canonical),
-    )
-    # One declaration serves both branches. Transporting it as structured data keeps the
-    # guarded and unguarded snapshots identical for an identical request, which an argument
-    # tail re-parsed by a second process cannot guarantee.
-    declaration = scope_declaration(args)
-    lease_present = paths.lease.is_file() and not paths.lease.is_symlink()
-    if lease_present:
-        snapshot_json = captured_helper(
-            WORKFLOW_SCRIPT,
-            [
-                "guard",
-                "--repo",
-                str(paths.repository.root),
-                "--review",
-                str(paths.canonical),
-                "--lease",
-                str(paths.lease),
-                "--guard",
-                str(paths.guard),
-                "--lock-script",
-                str(LOCK_SCRIPT),
-                "--snapshot-script",
-                str(SNAPSHOT_SCRIPT),
-                "--scope-json",
-                json.dumps(declaration, sort_keys=True),
-            ],
-        )
-        # The guard command reports the whole guard document, which carries the
-        # snapshot it recorded alongside the scope and the canonical SHA.
-        source = json.loads(snapshot_json)["source_snapshot"]
-    else:
-        snapshot_json = captured_helper(
+def workflow_arguments(paths: ReviewPaths) -> list[str]:
+    """Build the repository, review, and lock artifacts every leased helper needs."""
+    return [
+        "--repo",
+        str(paths.repository.root),
+        "--review",
+        str(paths.canonical),
+        "--lease",
+        str(paths.lease),
+        "--guard",
+        str(paths.guard),
+        "--lock-script",
+        str(LOCK_SCRIPT),
+    ]
+
+
+@dataclass(frozen=True)
+class InspectedSource:
+    """One inspection's source snapshot, with the helper output that produced it."""
+
+    snapshot: dict[str, Any]
+    # Printed verbatim by the human view: the guarded branch reports the whole guard
+    # document, which carries more than the snapshot alone.
+    helper_output: bytes
+
+
+def inspected_source(
+    paths: ReviewPaths, declaration: dict[str, list[str]], lease_present: bool
+) -> InspectedSource:
+    """Snapshot the declared source, refreshing the inspection guard under a lease.
+
+    One declaration serves both branches. Transporting it as structured data keeps the
+    guarded and unguarded snapshots identical for an identical request, which an argument
+    tail re-parsed by a second process cannot guarantee.
+    """
+
+    if not lease_present:
+        output = captured_helper(
             SNAPSHOT_SCRIPT,
             review_scope.snapshot_arguments(str(paths.repository.root), declaration),
         )
-        source = json.loads(snapshot_json)
-    # Both machine views replace the human report rather than decorating it, so neither
-    # carries the state dump, the artifact paths, or the raw snapshot.
-    compact = args.json or args.agent
-    if not compact:
-        print("workflow:")
-        completed = run_helper(
-            STATE_SCRIPT,
-            ["state"],
-            input_bytes=paths.canonical.read_bytes(),
-        )
-        if completed.returncode != 0:
-            return completed.returncode
-        print("operation:")
-    command_prefix = (
-        f"python3 {shlex.quote(str(SCRIPT_DIRECTORY / 'review_cli.py'))}"
+        return InspectedSource(snapshot=json.loads(output), helper_output=output)
+    output = captured_helper(
+        WORKFLOW_SCRIPT,
+        [
+            "guard",
+            *workflow_arguments(paths),
+            "--snapshot-script",
+            str(SNAPSHOT_SCRIPT),
+            "--scope-json",
+            json.dumps(declaration, sort_keys=True),
+        ],
     )
-    operation_args = [
+    # The guard command reports the whole guard document, which carries the
+    # snapshot it recorded alongside the scope and the canonical SHA.
+    return InspectedSource(
+        snapshot=json.loads(output)["source_snapshot"], helper_output=output
+    )
+
+
+def operation_arguments(
+    paths: ReviewPaths, lock_json: bytes, source: dict[str, Any]
+) -> list[str]:
+    """Build the `operation` argument vector describing this review's artifacts."""
+
+    return [
         "operation",
         "--review",
         str(paths.canonical),
@@ -446,8 +458,33 @@ def command_inspect(args: argparse.Namespace) -> int:
         "--current-source-json",
         json.dumps(source, sort_keys=True),
         "--command-prefix",
-        command_prefix,
+        f"python3 {shlex.quote(str(SCRIPT_DIRECTORY / 'review_cli.py'))}",
     ]
+
+
+def command_inspect(args: argparse.Namespace) -> int:
+    paths = review_paths(args.repo, args.review_id)
+    validate_review(paths)
+    lock_json = captured_helper(
+        LOCK_SCRIPT,
+        review_discover.lock_status_arguments(paths.repository.root, paths.canonical),
+    )
+    lease_present = paths.lease.is_file() and not paths.lease.is_symlink()
+    source = inspected_source(paths, scope_declaration(args), lease_present)
+    # Both machine views replace the human report rather than decorating it, so neither
+    # carries the state dump, the artifact paths, or the raw snapshot.
+    compact = args.json or args.agent
+    if not compact:
+        print("workflow:")
+        completed = run_helper(
+            STATE_SCRIPT,
+            ["state"],
+            input_bytes=paths.canonical.read_bytes(),
+        )
+        if completed.returncode != 0:
+            return completed.returncode
+        print("operation:")
+    operation_args = operation_arguments(paths, lock_json, source.snapshot)
     if lease_present:
         operation_args.append("--lease-present")
     if args.json:
@@ -466,7 +503,7 @@ def command_inspect(args: argparse.Namespace) -> int:
     digest = hashlib.sha256(paths.canonical.read_bytes()).hexdigest()
     print(f"review_sha256: {digest}")
     print("source_snapshot:")
-    sys.stdout.buffer.write(snapshot_json)
+    sys.stdout.buffer.write(source.helper_output)
     return 0
 
 
@@ -524,21 +561,6 @@ def command_template(args: argparse.Namespace) -> int:
     atomic_bytes(paths.event, event, mode=0o600)
     print(paths.event)
     return 0
-
-
-def workflow_arguments(paths: ReviewPaths) -> list[str]:
-    return [
-        "--repo",
-        str(paths.repository.root),
-        "--review",
-        str(paths.canonical),
-        "--lease",
-        str(paths.lease),
-        "--guard",
-        str(paths.guard),
-        "--lock-script",
-        str(LOCK_SCRIPT),
-    ]
 
 
 def command_lock(args: argparse.Namespace) -> int:
@@ -978,13 +1000,6 @@ def report_existing_successor(
     print(f"review_json: {paths.canonical}")
     print(f"latest_report: {paths.report}")
     return 0
-
-
-# How long a freshly created successor waits before deciding which loop won.
-# Covers the skew between two agents writing their canonical files; it is not a
-# correctness bound, and a competitor slower than this still converges on the
-# next command that scans successors.
-SUCCESSOR_SETTLE_SECONDS = 0.4
 
 
 def command_start_follow_up(args: argparse.Namespace) -> int:

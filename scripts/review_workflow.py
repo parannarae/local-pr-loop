@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,21 +23,49 @@ from review_io import (
 )
 
 
-def verify_lease(args: argparse.Namespace) -> dict[str, Any]:
-    lease_path = Path(args.lease)
-    require_secure_regular(lease_path, "lease")
-    lease = load_object(lease_path)
+@dataclass(frozen=True)
+class ReviewLeaseContext:
+    """The repository, review, and lock artifacts one leased operation acts on.
+
+    Built once from the parsed command line, so each operation below declares the
+    artifacts it needs instead of reaching into a namespace for them.
+    """
+
+    repo: Path
+    review: Path
+    lease: Path
+    guard: Path
+    lock_script: Path
+
+
+def lease_context(args: argparse.Namespace) -> ReviewLeaseContext:
+    """Build the lease context one leased subcommand's arguments describe."""
+
+    return ReviewLeaseContext(
+        repo=Path(args.repo),
+        review=Path(args.review),
+        lease=Path(args.lease),
+        guard=Path(args.guard),
+        lock_script=Path(args.lock_script),
+    )
+
+
+def verify_lease(context: ReviewLeaseContext) -> dict[str, Any]:
+    """Return the local lease, refusing one that does not own the active lock."""
+
+    require_secure_regular(context.lease, "lease")
+    lease = load_object(context.lease)
     if set(lease) != {"review_file", "token", "acquired_at"}:
         raise ValueError("lease fields are invalid")
     completed = subprocess.run(
         [
             sys.executable,
-            args.lock_script,
+            str(context.lock_script),
             "verify",
             "--repo",
-            args.repo,
+            str(context.repo),
             "--review-file",
-            args.review,
+            str(context.review),
             "--token",
             lease["token"],
         ],
@@ -52,16 +81,16 @@ def verify_lease(args: argparse.Namespace) -> dict[str, Any]:
     return lease
 
 
-def acquire_lease(args: argparse.Namespace) -> int:
+def acquire_lease(context: ReviewLeaseContext) -> int:
     completed = subprocess.run(
         [
             sys.executable,
-            args.lock_script,
+            str(context.lock_script),
             "acquire",
             "--repo",
-            args.repo,
+            str(context.repo),
             "--review-file",
-            args.review,
+            str(context.review),
         ],
         capture_output=True,
         text=True,
@@ -72,26 +101,28 @@ def acquire_lease(args: argparse.Namespace) -> int:
         return completed.returncode
     lock = json.loads(completed.stdout)
     lease = {
-        "review_file": str(Path(args.review).resolve()),
+        "review_file": str(context.review.resolve()),
         "token": lock["token"],
         "acquired_at": datetime.now(timezone.utc).isoformat(),
     }
-    secure_json(Path(args.lease), lease)
-    print(json.dumps({"status": "acquired", "lease": args.lease}, sort_keys=True))
+    secure_json(context.lease, lease)
+    print(
+        json.dumps({"status": "acquired", "lease": str(context.lease)}, sort_keys=True)
+    )
     return 0
 
 
-def release_lease(args: argparse.Namespace) -> int:
-    lease = verify_lease(args)
+def release_lease(context: ReviewLeaseContext) -> int:
+    lease = verify_lease(context)
     completed = subprocess.run(
         [
             sys.executable,
-            args.lock_script,
+            str(context.lock_script),
             "release",
             "--repo",
-            args.repo,
+            str(context.repo),
             "--review-file",
-            args.review,
+            str(context.review),
             "--token",
             lease["token"],
         ],
@@ -102,16 +133,20 @@ def release_lease(args: argparse.Namespace) -> int:
     if completed.returncode != 0:
         print(f"review lock release failed: {completed.stderr.strip()}", file=sys.stderr)
         return completed.returncode
-    Path(args.lease).unlink()
-    Path(args.guard).unlink(missing_ok=True)
+    context.lease.unlink()
+    context.guard.unlink(missing_ok=True)
     print(json.dumps({"status": "released"}, sort_keys=True))
     return 0
 
 
-def candidate_declared_paths(canonical: Path, guard: Path) -> list[str] | None:
-    """Return the paths another review guards, or None when it declares none yet.
+def find_declared_paths(canonical: Path, guard: Path) -> list[str] | None:
+    """Return the paths another review guards, or None when none can be read.
 
-    Only normalized scope metadata is read. A guard also carries an opaque lock
+    None collapses "this loop has declared nothing yet" with "its canonical file is
+    unreadable", deliberately: the only caller skips an unreadable loop anyway, and a
+    loop that declares nothing cannot overlap a scope either way.
+
+    Only the structured scope metadata is read. A guard also carries an opaque lock
     capability, which is never read here and never leaves its own file.
     """
 
@@ -172,7 +207,7 @@ def scope_conflicts(
         if workflow.get("phase") == "terminal":
             continue
         guard = canonical.with_suffix(".guard.json")
-        declared = candidate_declared_paths(canonical, guard)
+        declared = find_declared_paths(canonical, guard)
         if not declared:
             continue
         shared = review_scope.overlapping_paths(proposed, declared, repository_root)
@@ -188,16 +223,21 @@ def scope_conflicts(
     return conflicts
 
 
-def refresh_guard(args: argparse.Namespace) -> int:
-    verify_lease(args)
+def refresh_guard(
+    context: ReviewLeaseContext, scope_json: str, snapshot_script: str
+) -> int:
+    """Record the inspection guard for a declared scope, under the verified lease."""
+
+    verify_lease(context)
+    repository_root = str(context.repo)
     # Canonicalized against the repository first: comparing the strings a caller typed
     # would let an alias of one path pass as two different declarations.
     declaration = review_scope.require_distinct_declarations(
-        args.repo, json.loads(args.scope_json)
+        repository_root, json.loads(scope_json)
     )
     # Checked here, inside the lease-verified critical section that creates the guard, so
     # two first inspections cannot both observe no conflict and then both create one.
-    conflicts = scope_conflicts(Path(args.review), declaration, args.repo)
+    conflicts = scope_conflicts(context.review, declaration, repository_root)
     if conflicts:
         described = "; ".join(
             f"{conflict['review_id']} ({conflict['phase']}) over "
@@ -215,8 +255,8 @@ def refresh_guard(args: argparse.Namespace) -> int:
     snapshot = subprocess.run(
         [
             sys.executable,
-            args.snapshot_script,
-            *review_scope.snapshot_arguments(args.repo, declaration),
+            snapshot_script,
+            *review_scope.snapshot_arguments(repository_root, declaration),
         ],
         capture_output=True,
         text=True,
@@ -227,21 +267,22 @@ def refresh_guard(args: argparse.Namespace) -> int:
         return snapshot.returncode
     snapshot_value = json.loads(snapshot.stdout)
     guard = {
-        "review_sha256": hashlib.sha256(Path(args.review).read_bytes()).hexdigest(),
+        "review_sha256": hashlib.sha256(context.review.read_bytes()).hexdigest(),
         "source_snapshot": snapshot_value,
         # Stored structured so a later publication rebuilds the same arguments through the
         # same builder instead of replaying an argument tail.
         "scope": declaration,
         "inspected_at": datetime.now(timezone.utc).isoformat(),
     }
-    secure_json(Path(args.guard), guard)
+    secure_json(context.guard, guard)
     print(json.dumps(guard, sort_keys=True))
     return 0
 
 
-def abort_draft(args: argparse.Namespace) -> int:
-    verify_lease(args)
-    event = Path(args.event)
+def abort_draft(context: ReviewLeaseContext, event: Path) -> int:
+    """Remove the leased draft, reporting plainly when there is none."""
+
+    verify_lease(context)
     if not event.exists():
         print(json.dumps({"status": "no_draft"}, sort_keys=True))
         return 0
@@ -321,25 +362,24 @@ def poll_for_change(
     return {"status": status, "canonical_sha256": initial}
 
 
-def wait_for_change(args: argparse.Namespace) -> int:
+def wait_for_change(review: Path, timeout: int) -> int:
     """Run one bounded poll and print its result.
 
     Exit codes: 0 when canonical state changed, 3 for every other outcome, which
     the printed `status` distinguishes.
     """
-    result = poll_for_change(Path(args.review), args.timeout)
+    result = poll_for_change(review, timeout)
     print(json.dumps(result))
     return 0 if result["status"] == "changed" else 3
 
 
-def await_handoff(args: argparse.Namespace) -> int:
+def await_handoff(review: Path, round_seconds: int, max_rounds: int) -> int:
     """Span one handoff by re-arming bounded polls until a structured outcome.
 
     Exit codes: 0 for `changed` or `terminal`, 4 for `timeout_eligible`, and
     5 for `exhausted`. The round bound is mandatory so the total wait stays
     finite even when it lapses before the phase's handoff deadline.
     """
-    review = Path(args.review)
     # Capture the baseline before reading the workflow: a publication landing
     # between these two statements then reports as changed on the first poll
     # instead of being absorbed into a later baseline.
@@ -353,8 +393,8 @@ def await_handoff(args: argparse.Namespace) -> int:
         f" to {workflow['primary_action']['kind']} (a handoff deadline applies)",
         flush=True,
     )
-    for round_number in range(1, args.max_rounds + 1):
-        result = poll_for_change(review, args.round_seconds, baseline)
+    for round_number in range(1, max_rounds + 1):
+        result = poll_for_change(review, round_seconds, baseline)
         outcome = {
             "rounds_used": round_number,
             "canonical_sha256": result["canonical_sha256"],
@@ -369,9 +409,7 @@ def await_handoff(args: argparse.Namespace) -> int:
             print(json.dumps(outcome, sort_keys=True))
             return 4
     print(
-        json.dumps(
-            {"status": "exhausted", "rounds_used": args.max_rounds}, sort_keys=True
-        )
+        json.dumps({"status": "exhausted", "rounds_used": max_rounds}, sort_keys=True)
     )
     return 5
 
@@ -399,28 +437,29 @@ def main() -> int:
     await_parser.add_argument("--round-seconds", type=int, default=300)
     await_parser.add_argument("--max-rounds", type=int, default=24)
     args = parser.parse_args()
-    if args.command == "acquire":
-        return acquire_lease(args)
-    if args.command == "verify":
-        verify_lease(args)
-        print(json.dumps({"status": "verified"}, sort_keys=True))
-        return 0
-    if args.command == "release":
-        return release_lease(args)
-    if args.command == "guard":
-        return refresh_guard(args)
-    if args.command == "abort-draft":
-        return abort_draft(args)
     if args.command == "await-handoff":
         if not 1 <= args.round_seconds <= 86400:
             parser.error("--round-seconds must be between 1 and 86400 seconds")
         if args.max_rounds < 1:
             parser.error("--max-rounds must be at least 1")
-        return await_handoff(args)
+        return await_handoff(Path(args.review), args.round_seconds, args.max_rounds)
     if args.command == "wait":
         if not 1 <= args.timeout <= 86400:
             parser.error("--timeout must be between 1 and 86400 seconds")
-        return wait_for_change(args)
+        return wait_for_change(Path(args.review), args.timeout)
+    context = lease_context(args)
+    if args.command == "acquire":
+        return acquire_lease(context)
+    if args.command == "verify":
+        verify_lease(context)
+        print(json.dumps({"status": "verified"}, sort_keys=True))
+        return 0
+    if args.command == "release":
+        return release_lease(context)
+    if args.command == "guard":
+        return refresh_guard(context, args.scope_json, args.snapshot_script)
+    if args.command == "abort-draft":
+        return abort_draft(context, Path(args.event))
     return 2
 
 

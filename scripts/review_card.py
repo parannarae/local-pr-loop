@@ -27,6 +27,14 @@ ACTION_BY_OPERATION_STATUS = {
     "ready_to_publish": "publish_draft",
 }
 
+# The actions whose sequence can reach a `review.approve`: publishing the phase's own
+# reviewer event, or publishing a draft already templated as one. Every other action —
+# a recovery, a draft abort, a report regeneration — carries no approval to hang the
+# structure-debt acknowledgment on.
+ACTIONS_CARRYING_APPROVAL = frozenset(
+    {"publish_initial_review", "publish_reviewer_update", "publish_draft"}
+)
+
 ACTION_BY_PHASE = {
     "awaiting_initial_review": "publish_initial_review",
     "owner_response": "publish_owner_reply",
@@ -329,7 +337,10 @@ def operating_card(
             else IDLE_OBLIGATIONS
         )
     must = list(obligations["must"])
-    if "accretion_flagged" in flags:
+    # The obligation is a field of `review.approve`, so it is charged only where this
+    # action's sequence can publish one; telling an agent mid-publication-recovery to
+    # run `draft approve` would send it off the only path that repairs its artifacts.
+    if "accretion_flagged" in flags and action in ACTIONS_CARRYING_APPROVAL:
         must.append("acknowledge_structure_debt")
     steps = STEPS_BY_ACTION[action]
     sequence = [*LOCK_STEPS, *steps] if lock_first else list(steps)

@@ -15,8 +15,9 @@ part instead, and they keep holding as the fixture grows.
 
 Composer acknowledgments are bounded by their own shape: each one carries an
 operation name, an outstanding count, a status, a count of what the act dropped,
-and at most one identifier. The ceiling is what forbids an acknowledgment from
-growing into a draft path or an echo of the operation it recorded.
+the identifier `drop` would name the act by, and the gap the act opened alongside
+it. The ceiling is what forbids an acknowledgment from growing into a draft path
+or an echo of the operation it recorded.
 """
 
 from __future__ import annotations
@@ -95,13 +96,14 @@ BUDGET_BY_CASE = {
     f"inspect --json ({TERMINAL})": (2_000, 1_339),
     # One line of fixed fields, whatever the operation recorded: an operation
     # name, an outstanding count, a status, a count of the operations the act
-    # dropped, and at most one identifier. The second number here is that shape's
-    # own length rather than a reading off a run, because the shape is what bounds
-    # it; the ceiling is roughly twice it, so an acknowledgment that started
-    # carrying a draft path or an echo of its operation fails here.
-    "draft open-thread (acknowledgment)": (160, 92),
-    "draft reply (acknowledgment)": (160, 92),
-    "draft record-check (acknowledgment)": (160, 92),
+    # dropped, the identifier `drop` names it by, and the gap it opened. The second
+    # number here is that shape's own length rather than a reading off a run,
+    # because the shape is what bounds it; the ceiling is roughly twice it, so an
+    # acknowledgment that started carrying a draft path or an echo of its operation
+    # fails here.
+    "draft open-thread (acknowledgment)": (160, 109),
+    "draft reply (acknowledgment)": (160, 109),
+    "draft record-check (acknowledgment)": (160, 124),
 }
 
 # A compact view must stay a small fraction of the full one it replaces. Unlike an

@@ -58,6 +58,12 @@ def stderr_text(error: subprocess.CalledProcessError) -> str:
 
 
 def untracked_manifest(repo: Path, pathspecs: list[str]) -> list[dict[str, str]]:
+    """Digest every untracked file inside the scope, as Git itself sees it.
+
+    A symlink's `sha256` covers its target string rather than the target's content, so
+    repointing a link is drift even when the file it now names is byte-identical.
+    """
+
     output = git(
         repo,
         "ls-files",
@@ -94,6 +100,13 @@ def untracked_manifest(repo: Path, pathspecs: list[str]) -> list[dict[str, str]]
 
 
 def additional_input_manifest(repo: Path, values: list[str]) -> list[dict[str, str]]:
+    """Digest each declared additional input, following a symlink to its content.
+
+    A symlink's `sha256` covers the resolved file's bytes, unlike `untracked_manifest`,
+    which digests the target string: an input is declared to be read, so its content is
+    what the guard must pin. `link_target` still records where it pointed.
+    """
+
     entries = []
     for relative in normalize_scope(repo, values):
         path = repo / relative

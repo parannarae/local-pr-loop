@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -98,8 +99,10 @@ def default_state() -> dict[str, Any]:
     }
 
 
-def sorted_thread_ids(values: set[str]) -> list[str]:
-    # Validated IDs match T<N>, so the number is everything after the prefix.
+def sorted_prefixed_ids(values: Iterable[str]) -> list[str]:
+    """Sort `T<N>` and `G<N>` identifiers by number, so T10 follows T9 rather than T1."""
+
+    # Validated IDs carry one prefix letter, so the number is everything after it.
     return sorted(values, key=lambda value: int(value[1:]))
 
 
@@ -121,9 +124,12 @@ def act_on_thread(
 ) -> bool:
     """Record one lifecycle act on a known thread; report whether it stands.
 
-    Acting twice on one thread in one transaction is rejected rather than
-    resolved last-writer-wins, because the handoff would otherwise record two
-    conflicting answers with no way to tell which the agent meant.
+    Acting twice on one thread in one transaction records an error rather than
+    resolving last-writer-wins, because the handoff would otherwise carry two
+    conflicting answers with no way to tell which the agent meant. The second act
+    still reaches the projected state, which is safe because both consumers —
+    `append_event` and `validate_document` — refuse a history that accumulated any
+    error before reading that state.
     """
 
     require(errors, thread_id in threads, f"{prefix} references unknown thread")
@@ -141,12 +147,15 @@ def act_on_thread(
 def project_history(
     history: list[Any],
     created_at: str | None = None,
-) -> tuple[list[str], dict[str, Any], dict[str, dict[str, Any]]]:
-    """Validate immutable history and derive canonical state and thread records.
+) -> tuple[list[str], dict[str, Any]]:
+    """Validate immutable history and derive canonical state.
 
     `created_at` is the document creation timestamp; it anchors the
     `initial_review_timeout` clock, the only handoff that starts before any
     event exists.
+
+    The returned state is meaningful only when the error list is empty: rules are
+    accumulated rather than raised, so a rejected history still projects.
     """
     errors: list[str] = []
     threads: dict[str, dict[str, Any]] = {}
@@ -440,24 +449,21 @@ def project_history(
         "workflow": workflow_for(latest_kind, terminal),
         "source_fingerprint": fingerprint,
         "threads": {
-            "open": sorted_thread_ids(open_ids),
-            "resolved": sorted_thread_ids(set(threads) - open_ids),
+            "open": sorted_prefixed_ids(open_ids),
+            "resolved": sorted_prefixed_ids(set(threads) - open_ids),
         },
         "validation_gaps": {
-            # Validated IDs match G<N>, so the number is everything after the prefix.
-            "open": sorted(
-                (gap_id for gap_id, gap in gaps.items() if gap["status"] == "open"),
-                key=lambda value: int(value[1:]),
+            "open": sorted_prefixed_ids(
+                gap_id for gap_id, gap in gaps.items() if gap["status"] == "open"
             ),
-            "resolved": sorted(
-                (gap_id for gap_id, gap in gaps.items() if gap["status"] == "resolved"),
-                key=lambda value: int(value[1:]),
+            "resolved": sorted_prefixed_ids(
+                gap_id for gap_id, gap in gaps.items() if gap["status"] == "resolved"
             ),
         },
         "latest_event": latest_event,
         "terminal": terminal,
     }
-    return errors, state, threads
+    return errors, state
 
 
 def structure_debt_acknowledgments(history: Any) -> list[dict[str, Any]]:
@@ -573,9 +579,7 @@ def validate_document(document: Any) -> list[str]:
     require(errors, isinstance(history, list), "history must be a list")
     require(errors, isinstance(state, dict), "state must be a mapping")
     if isinstance(history, list) and isinstance(state, dict):
-        history_errors, expected, _ = project_history(
-            history, document.get("created_at")
-        )
+        history_errors, expected = project_history(history, document.get("created_at"))
         errors.extend(history_errors)
         require(errors, state == expected, "state projection is stale")
     return errors

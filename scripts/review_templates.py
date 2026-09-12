@@ -133,6 +133,61 @@ def _gap_resolution_skeletons(open_gaps: list[str]) -> list[dict[str, Any]]:
     ]
 
 
+def _reviewer_update_operations(
+    open_threads: list[str], open_gaps: list[str]
+) -> list[dict[str, Any]]:
+    """Build a reviewer_update's skeletons: a comment per open thread, then the gaps."""
+
+    return [
+        *(
+            {"op": "thread.comment", "thread_id": thread_id, "message": ""}
+            for thread_id in open_threads
+        ),
+        *_gap_resolution_skeletons(open_gaps),
+    ]
+
+
+def _final_review_operations(
+    document: dict[str, Any],
+    open_threads: list[str],
+    open_gaps: list[str],
+    flagged_paths: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Build a final_review's skeletons: every thread resolved, the gaps, the approval.
+
+    A thread the owner declined carries a `verification` skeleton, because resolving it
+    demands independent verification against that reply.
+    """
+
+    replies = latest_owner_replies(document)
+    operations: list[dict[str, Any]] = []
+    for thread_id in open_threads:
+        resolution: dict[str, Any] = {
+            "op": "thread.resolve",
+            "thread_id": thread_id,
+            "message": "",
+        }
+        if replies.get(thread_id, {}).get("decision") == "declined":
+            resolution["verification"] = {
+                "independent": True,
+                "evidence": blank_evidence(),
+            }
+        operations.append(resolution)
+    operations.extend(_gap_resolution_skeletons(open_gaps))
+    approval: dict[str, Any] = {"op": "review.approve", "decision": ""}
+    if flagged_paths:
+        approval["structure_debt"] = {
+            # "structure_reviewed" when the flagged growth is not accretion or a
+            # structure round already covered it; "structure_deferred" when the debt is
+            # real and left for a later structure round. The message records why.
+            "disposition": "",
+            "flagged_paths": sorted(flagged_paths),
+            "message": "",
+        }
+    operations.append(approval)
+    return operations
+
+
 def contextual_event_template(
     document: dict[str, Any],
     kind: str,
@@ -166,41 +221,12 @@ def contextual_event_template(
             }
             for thread_id in open_threads
         ]
-    elif kind in {"reviewer_update", "final_review"}:
-        replies = latest_owner_replies(document)
-        operations: list[dict[str, Any]] = []
-        for thread_id in open_threads:
-            if kind == "reviewer_update":
-                operations.append(
-                    {"op": "thread.comment", "thread_id": thread_id, "message": ""}
-                )
-                continue
-            resolution: dict[str, Any] = {
-                "op": "thread.resolve",
-                "thread_id": thread_id,
-                "message": "",
-            }
-            if replies.get(thread_id, {}).get("decision") == "declined":
-                resolution["verification"] = {
-                    "independent": True,
-                    "evidence": blank_evidence(),
-                }
-            operations.append(resolution)
-        operations.extend(_gap_resolution_skeletons(open_gaps))
-        if kind == "final_review":
-            approval: dict[str, Any] = {"op": "review.approve", "decision": ""}
-            if flagged_paths:
-                approval["structure_debt"] = {
-                    # "structure_reviewed" when the flagged growth is not accretion or a
-                    # structure round already covered it; "structure_deferred" when the
-                    # debt is real and left for a later structure round. The message
-                    # records why.
-                    "disposition": "",
-                    "flagged_paths": sorted(flagged_paths),
-                    "message": "",
-                }
-            operations.append(approval)
-        template["operations"] = operations
+    elif kind == "reviewer_update":
+        template["operations"] = _reviewer_update_operations(open_threads, open_gaps)
+    elif kind == "final_review":
+        template["operations"] = _final_review_operations(
+            document, open_threads, open_gaps, flagged_paths
+        )
     elif kind in TIMEOUT_DURATION_BY_KIND:
         declaration = template["operations"][0]
         latest = document["state"].get("latest_event")

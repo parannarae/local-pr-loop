@@ -34,23 +34,33 @@ def run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProces
 
 
 class OverlappingPathsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # The comparison is a safety decision, so it always resolves against a root.
+        self.temporary = tempfile.TemporaryDirectory()
+        self.repo = str(Path(self.temporary.name).resolve())
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def overlap(self, first: list[str], second: list[str]) -> list[str]:
+        return review_scope.overlapping_paths(first, second, self.repo)
+
     def test_a_directory_overlaps_a_file_inside_it(self) -> None:
-        self.assertEqual(
-            review_scope.overlapping_paths(["src"], ["src/app.py"]), ["src/app.py"]
-        )
+        self.assertEqual(self.overlap(["src"], ["src/app.py"]), ["src/app.py"])
 
     def test_overlap_is_detected_in_either_direction(self) -> None:
-        self.assertEqual(
-            review_scope.overlapping_paths(["src/app.py"], ["src"]), ["src/app.py"]
-        )
+        self.assertEqual(self.overlap(["src/app.py"], ["src"]), ["src/app.py"])
 
     def test_sibling_paths_do_not_overlap(self) -> None:
-        self.assertEqual(review_scope.overlapping_paths(["src"], ["docs"]), [])
+        self.assertEqual(self.overlap(["src"], ["docs"]), [])
 
     def test_a_shared_prefix_that_is_not_a_directory_boundary_does_not_overlap(
         self,
     ) -> None:
-        self.assertEqual(review_scope.overlapping_paths(["src"], ["srcextra"]), [])
+        self.assertEqual(self.overlap(["src"], ["srcextra"]), [])
+
+    def test_a_path_outside_the_repository_is_skipped_rather_than_compared(self) -> None:
+        self.assertEqual(self.overlap(["../elsewhere"], ["src"]), [])
 
     def test_additional_inputs_participate_in_the_comparison(self) -> None:
         declaration = review_scope.declaration([], ["notes.md"], ["src"])

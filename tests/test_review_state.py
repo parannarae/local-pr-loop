@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import subprocess
 import sys
 import unittest
 from copy import deepcopy
@@ -522,6 +525,79 @@ class ReviewStateTest(unittest.TestCase):
         )
 
 
+# --- review_state.py report and threads commands ---
+
+
+class RenderingCommandGateTest(unittest.TestCase):
+    """The rendering commands validate before they render; the diagnostics do not.
+
+    `report` and `threads` index schema-required fields, so a corrupt document would
+    crash mid-render or, worse, emit a page with a substituted priority and an empty
+    evidence line that reads as authoritative. The `state` and `eligible-timeout`
+    commands stay ungated so an invalid projection is still inspectable during recovery.
+    """
+
+    def state_command(self, command: str, document: Any) -> Any:
+        return subprocess.run(
+            [sys.executable, str(MODULE), command],
+            input=json.dumps(document),
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+
+    def valid_document(self) -> dict[str, Any]:
+        document = review_state.new_document("abcdefgh", "review")
+        initial = review_event()
+        initial["operations"] = [thread()]
+        return review_state.append_event(document, initial)
+
+    def test_report_renders_a_validated_document(self) -> None:
+        completed = self.state_command("report", self.valid_document())
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("# Review Summary", completed.stdout)
+
+    def test_report_refuses_a_thread_missing_its_priority(self) -> None:
+        # The old renderer substituted P3 here and silently changed the sort order.
+        document = self.valid_document()
+        del document["history"][0]["operations"][0]["priority"]
+
+        completed = self.state_command("report", document)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("priority", completed.stderr)
+        self.assertNotIn("Review Summary", completed.stdout)
+
+    def test_report_refuses_an_unsupported_storage_revision(self) -> None:
+        document = self.valid_document()
+        document["format_revision"] = "2027-01-01.1"
+
+        completed = self.state_command("report", document)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("unsupported storage contract", completed.stderr)
+
+    def test_threads_refuses_the_same_malformed_thread_fields(self) -> None:
+        document = self.valid_document()
+        del document["history"][0]["operations"][0]["priority"]
+
+        completed = self.state_command("threads", document)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("priority", completed.stderr)
+
+    def test_state_stays_inspectable_while_the_projection_is_invalid(self) -> None:
+        document = self.valid_document()
+        document["state"]["threads"]["open"] = []
+
+        completed = self.state_command("state", document)
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(json.loads(completed.stdout)["threads"]["open"], [])
+
+
 class RevisionBoundaryTest(unittest.TestCase):
     """The reader must refuse a storage contract it does not implement in full."""
 
@@ -593,6 +669,114 @@ class RevisionBoundaryTest(unittest.TestCase):
 
         self.assertIsNone(review_state.unsupported_revision_error(document))
         self.assertEqual(document["format_revision"], "2026-09-11.1")
+
+
+# --- review_schema.validate_snapshot ---
+
+
+def digested_entry(path: str = "notes.md", **overrides: Any) -> dict[str, Any]:
+    """Build the entry shape `source_snapshot.py` emits into both digested lists."""
+    return {
+        "path": path,
+        "kind": "file",
+        "mode": "0644",
+        "sha256": "b" * 64,
+        **overrides,
+    }
+
+
+class SnapshotEntryShapeTest(unittest.TestCase):
+    """Both digested lists carry one entry shape, so both are held to it.
+
+    `untracked` used to accept any non-empty strings, so a persisted snapshot could
+    record `kind: "socket"` or a `sha256` of "nope" and still validate into canonical
+    history, where every later drift comparison reads it as a digest.
+    """
+
+    def errors_for(self, entry: dict[str, Any]) -> list[str]:
+        value = snapshot("1")
+        value["untracked"] = [entry]
+        errors: list[str] = []
+        review_state.review_schema.validate_snapshot(errors, value, "source_snapshot")
+        return errors
+
+    def test_a_well_formed_untracked_entry_is_accepted(self) -> None:
+        self.assertEqual(self.errors_for(digested_entry()), [])
+
+    def test_an_untracked_entry_of_an_unrecorded_kind_is_refused(self) -> None:
+        errors = self.errors_for(digested_entry(kind="socket"))
+
+        self.assertIn("source_snapshot.untracked[0].kind is invalid", errors)
+
+    def test_an_untracked_digest_that_is_not_sha256_is_refused(self) -> None:
+        errors = self.errors_for(digested_entry(sha256="nope"))
+
+        self.assertIn(
+            "source_snapshot.untracked[0].sha256 must be lowercase SHA-256", errors
+        )
+
+    def test_an_untracked_symlink_must_record_its_target(self) -> None:
+        errors = self.errors_for(digested_entry(kind="symlink"))
+
+        self.assertIn(
+            "source_snapshot.untracked[0].link_target is required for a symlink", errors
+        )
+
+    def test_untracked_paths_must_be_unique(self) -> None:
+        value = snapshot("1")
+        value["untracked"] = [digested_entry(), digested_entry()]
+        errors: list[str] = []
+        review_state.review_schema.validate_snapshot(errors, value, "source_snapshot")
+
+        self.assertIn("source_snapshot.untracked paths must be unique", errors)
+
+    def test_additional_inputs_keep_the_same_messages(self) -> None:
+        value = snapshot("1")
+        value["additional_inputs"] = [digested_entry(mode="rwx")]
+        errors: list[str] = []
+        review_state.review_schema.validate_snapshot(errors, value, "source_snapshot")
+
+        self.assertIn(
+            "source_snapshot.additional_inputs[0].mode must be four octal digits", errors
+        )
+
+
+class EvidenceTimeOwnershipTest(unittest.TestCase):
+    """Evidence times are checked where evidence is validated, and only there.
+
+    The duck-typed recursive walk that used to do it reported a malformed `observed_at`
+    twice under two prefixes, and let evidence missing any one of four keys escape the
+    ordering check entirely.
+    """
+
+    def test_evidence_observed_after_the_handoff_is_refused_once(self) -> None:
+        candidate = review_event()
+        candidate["operations"][0]["evidence"]["observed_at"] = at(9000)
+
+        ordering = [
+            error
+            for error in review_state.validate_event(candidate)
+            if "must not follow event.occurred_at" in error
+        ]
+
+        self.assertEqual(
+            ordering,
+            ["operations[0].evidence.observed_at must not follow event.occurred_at"],
+        )
+
+    def test_a_malformed_observed_at_is_reported_once(self) -> None:
+        candidate = review_event()
+        candidate["operations"][0]["evidence"]["observed_at"] = "yesterday"
+
+        malformed = [
+            error
+            for error in review_state.validate_event(candidate)
+            if "observed_at" in error
+        ]
+
+        self.assertEqual(
+            malformed, ["operations[0].evidence.observed_at must be ISO 8601"]
+        )
 
 
 class OperationVocabularyTest(unittest.TestCase):
