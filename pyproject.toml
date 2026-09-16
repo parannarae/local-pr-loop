@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "Repository-local review loop for an owner agent and a reviewer agent"
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
 # Empty by design. The skill's helpers run on the standard library alone so a
 # user needs nothing but Git and Python; every dependency below is development
 # tooling and never reaches the code the skill executes.
